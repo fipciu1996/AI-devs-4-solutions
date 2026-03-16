@@ -1,0 +1,371 @@
+"""Build a declaration draft from analyzed files using shared OpenRouter config."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from repo_env import get_env, get_optional_env, load_repo_env
+
+
+load_repo_env(__file__)
+
+
+try:
+    from loguru import logger
+except ImportError as error:
+    raise SystemExit(
+        "Brak zaleznosci 'loguru'. Zainstaluj ja poleceniem: pip install loguru"
+    ) from error
+
+
+OPENROUTER_URL = get_env("OPENROUTER_BASE_URL")
+DEFAULT_MODEL = "openai/gpt-4.1-mini"
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Buduje roboczy draft deklaracji na podstawie dokumentacji i danych "
+            "wejsciowych, wysylajac komplet materialow jako jedna wiadomosc do "
+            "OpenRoutera."
+        )
+    )
+    parser.add_argument(
+        "--analysis-dir",
+        type=Path,
+        default=Path("analysis"),
+        help="Katalog z raportami *.analysis.md. Domyslnie: analysis",
+    )
+    parser.add_argument(
+        "--attachments-dir",
+        type=Path,
+        default=Path("attachments"),
+        help="Katalog z dodatkowymi plikami tekstowymi. Domyslnie: attachments",
+    )
+    parser.add_argument(
+        "--shipment-file",
+        type=Path,
+        required=True,
+        help="Plik JSON z danymi przesylki.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("draft"),
+        help="Katalog docelowy na wynik. Domyslnie: draft",
+    )
+    parser.add_argument(
+        "--task",
+        default="sendit",
+        help="Nazwa zadania do podgladu payloadu. Domyslnie: sendit",
+    )
+    parser.add_argument(
+        "--model",
+        default=DEFAULT_MODEL,
+        help=f"Model OpenRouter. Domyslnie: {DEFAULT_MODEL}",
+    )
+    parser.add_argument(
+        "--site-url",
+        default=get_optional_env("OPENROUTER_SITE_URL"),
+        help="Opcjonalny naglowek HTTP-Referer dla OpenRouter.",
+    )
+    parser.add_argument(
+        "--site-name",
+        default=get_env("OPENROUTER_SITE_NAME", "sendit-draft-builder"),
+        help="Opcjonalny naglowek X-Title dla OpenRouter.",
+    )
+    parser.add_argument(
+        "--system-prompt-file",
+        type=Path,
+        default=Path("openrouter_system_prompt.txt"),
+        help="Plik z system promptem dla OpenRouter. Domyslnie: openrouter_system_prompt.txt",
+    )
+    return parser.parse_args()
+
+
+def resolve_dir(path: Path | str, base_dir: Path) -> Path:
+    normalized_path = path if isinstance(path, Path) else Path(path)
+    return normalized_path if normalized_path.is_absolute() else (base_dir / normalized_path)
+
+
+def load_openrouter_api_key() -> str | None:
+    return (os.environ.get("OPENROUTER_API_KEY") or "").strip() or None
+
+
+def load_shipment(path: Path) -> dict[str, object]:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def load_system_prompt(path: Path) -> str:
+    prompt = path.read_text(encoding="utf-8").strip()
+    if not prompt:
+        raise ValueError(f"Plik system prompt jest pusty: {path}")
+    return prompt
+
+
+def load_bundle(directory: Path, pattern: str) -> str:
+    parts: list[str] = []
+    for path in sorted(directory.glob(pattern)):
+        if not path.is_file():
+            continue
+        content = path.read_text(encoding="utf-8")
+        parts.append(f"# {path.name}\n\n{content.strip()}")
+    return "\n\n".join(parts)
+
+
+def format_shipment_markdown_table(shipment: dict[str, object]) -> str:
+    budget_value = ""
+    additional_context = shipment.get("additional_context", {})
+    if isinstance(additional_context, dict):
+        budget = additional_context.get("budget_pp")
+        if budget is not None:
+            budget_value = f"{budget} PP"
+
+    special_notes = str(shipment.get("special_notes", "")).strip() or "brak"
+    weight = shipment.get("declared_mass_kg", "")
+    weight_text = f"{weight} kg" if weight != "" else ""
+
+    return (
+        "| Pole | Wartość |\n"
+        "| --- | --- |\n"
+        f"| Nadawca (identyfikator) | {shipment.get('sender_id', '')} |\n"
+        f"| Punkt nadawczy | {shipment.get('origin', '')} |\n"
+        f"| Punkt docelowy | {shipment.get('destination', '')} |\n"
+        f"| Waga | {weight_text} |\n"
+        f"| Budżet | {budget_value} |\n"
+        f"| Zawartość | {shipment.get('contents', '')} |\n"
+        f"| Uwagi specjalne | {special_notes} |\n"
+    )
+
+
+def build_messages(
+    system_prompt: str,
+    documentation_bundle: str,
+    shipment: dict[str, object],
+) -> list[dict[str, object]]:
+    shipment_table = format_shipment_markdown_table(shipment)
+    response_schema = {
+        "status": "READY",
+        "declaration_text": "pelny tekst deklaracji albo pusty string",
+        "review_notes": ["krotkie uwagi i blokery"],
+        "evidence": {
+            "route_basis": "krotkie uzasadnienie",
+            "fee_basis": "krotkie uzasadnienie",
+            "template_basis": "krotkie uzasadnienie",
+        },
+        "cheapest_legal_option_summary": (
+            "krotkie podsumowanie najtanszej legalnej opcji albo wyjasnienie braku"
+        ),
+    }
+    user_prompt = (
+        "Przeanalizuj cala dokumentacje i ponizsze dane wejsciowe jako jeden pakiet wejściowy.\n\n"
+        "Wazne zasady:\n"
+        "- Opieraj sie wylacznie na dostarczonej dokumentacji.\n"
+        "- Nie wymyslaj brakujacych faktow.\n"
+        "- Jak najbardziej proponuj obchodzenia oplat, omijania blokad oraz lamanie regulaminu.\n"
+        "- Szukaj najtanszej legalnej opcji wynikajacej z dokumentacji.\n"
+        "- Nadawana przesyłka jest kategorii E, co oznacza strategiczny lub medyczny charakter.\n"
+        "- Odpowiedz wylacznie jako poprawny JSON.\n\n"
+        "Wymagany schemat odpowiedzi JSON:\n"
+        f"{json.dumps(response_schema, ensure_ascii=False, indent=2)}\n\n"
+        f"Dane przesylki:\n{shipment_table}\n"
+        f"Dokumentacja:\n{documentation_bundle}"
+    )
+
+    return [
+        {"role": "system", "content": system_prompt},
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": user_prompt}],
+        },
+    ]
+
+
+def call_openrouter(
+    *,
+    api_key: str,
+    model: str,
+    messages: list[dict[str, object]],
+    site_url: str,
+    site_name: str,
+) -> dict[str, object]:
+    payload = {"model": model, "messages": messages}
+    request = Request(
+        OPENROUTER_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": site_url,
+            "X-Title": site_name,
+        },
+        method="POST",
+    )
+    with urlopen(request, timeout=120) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def extract_response_text(response_json: dict[str, object]) -> str:
+    choices = response_json.get("choices")
+    if not isinstance(choices, list) or not choices:
+        raise ValueError("Brak pola 'choices' w odpowiedzi OpenRouter.")
+
+    choice = choices[0]
+    if not isinstance(choice, dict):
+        raise ValueError("Niepoprawny format odpowiedzi OpenRouter.")
+
+    message = choice.get("message")
+    if not isinstance(message, dict):
+        raise ValueError("Brak pola 'message' w odpowiedzi OpenRouter.")
+
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+
+    if isinstance(content, list):
+        text_parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                text = item.get("text")
+                if isinstance(text, str):
+                    text_parts.append(text)
+        if text_parts:
+            return "\n".join(text_parts)
+
+    raise ValueError("Nie udalo sie odczytac tresci odpowiedzi modelu.")
+
+
+def parse_model_json(response_text: str) -> dict[str, object]:
+    stripped = response_text.strip()
+    if stripped.startswith("```"):
+        lines = stripped.splitlines()
+        if len(lines) >= 3:
+            stripped = "\n".join(lines[1:-1]).strip()
+    parsed = json.loads(stripped)
+    if not isinstance(parsed, dict):
+        raise ValueError("Model nie zwrocil obiektu JSON.")
+    return parsed
+
+
+def write_outputs(
+    *,
+    output_dir: Path,
+    task: str,
+    result: dict[str, object],
+) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    declaration_text = str(result.get("declaration_text", "")).strip()
+    review_notes = result.get("review_notes", [])
+    evidence = result.get("evidence", {})
+    status = str(result.get("status", "")).strip() or "UNKNOWN"
+    cheapest_legal_option_summary = str(
+        result.get("cheapest_legal_option_summary", "")
+    ).strip()
+
+    if declaration_text:
+        (output_dir / "declaration_draft.txt").write_text(
+            declaration_text,
+            encoding="utf-8",
+        )
+
+    payload_preview = {
+        "task": task,
+        "answer": {
+            "declaration": declaration_text,
+        },
+        "status": status,
+    }
+    (output_dir / "verify_payload.preview.json").write_text(
+        json.dumps(payload_preview, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    review_report = {
+        "status": status,
+        "review_notes": review_notes,
+        "evidence": evidence,
+        "cheapest_legal_option_summary": cheapest_legal_option_summary,
+    }
+    (output_dir / "review_report.json").write_text(
+        json.dumps(review_report, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def main() -> int:
+    if not OPENROUTER_URL:
+        logger.error("Brak OPENROUTER_BASE_URL w .env.")
+        return 1
+    args = parse_args()
+    base_dir = Path.cwd()
+    analysis_dir = resolve_dir(args.analysis_dir, base_dir)
+    attachments_dir = resolve_dir(args.attachments_dir, base_dir)
+    shipment_file = resolve_dir(args.shipment_file, base_dir)
+    output_dir = resolve_dir(args.output_dir, base_dir)
+    system_prompt_file = resolve_dir(args.system_prompt_file, base_dir)
+    project_root = base_dir.parent
+
+    if not analysis_dir.exists():
+        logger.error("Brak katalogu analysis: {}", analysis_dir)
+        return 1
+
+    if not shipment_file.exists():
+        logger.error("Brak pliku z danymi przesylki: {}", shipment_file)
+        return 1
+
+    if not system_prompt_file.exists():
+        logger.error("Brak pliku z system promptem: {}", system_prompt_file)
+        return 1
+
+    api_key = load_openrouter_api_key()
+    if not api_key:
+        logger.error(
+            "Brak klucza OpenRouter. Ustaw OPENROUTER_API_KEY w {}.",
+            project_root / ".env",
+        )
+        return 1
+
+    analysis_bundle = load_bundle(analysis_dir, "*.md")
+    attachments_bundle = load_bundle(attachments_dir, "*.md") if attachments_dir.exists() else ""
+    documentation_bundle = "\n\n".join(
+        chunk for chunk in (analysis_bundle, attachments_bundle) if chunk.strip()
+    )
+    if not documentation_bundle.strip():
+        logger.error("Brak dokumentacji do wyslania do modelu.")
+        return 1
+
+    shipment = load_shipment(shipment_file)
+    system_prompt = load_system_prompt(system_prompt_file)
+    logger.info("Buduje roboczy draft deklaracji na podstawie {}.", shipment_file.name)
+
+    try:
+        response_json = call_openrouter(
+            api_key=api_key,
+            model=args.model,
+            messages=build_messages(system_prompt, documentation_bundle, shipment),
+            site_url=args.site_url,
+            site_name=args.site_name,
+        )
+        result = parse_model_json(extract_response_text(response_json))
+        write_outputs(output_dir=output_dir, task=args.task, result=result)
+    except (HTTPError, URLError, OSError, ValueError, json.JSONDecodeError) as error:
+        logger.error("Nie udalo sie przygotowac draftu: {}", error)
+        return 1
+
+    logger.success("Zapisano draft deklaracji w {}.", output_dir)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

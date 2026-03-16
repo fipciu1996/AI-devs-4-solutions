@@ -1,0 +1,20 @@
+[project]
+name = "proxy-api-server"
+version = "0.1.0"
+description = "Simple HTTP API server for operator messages with conversation logging"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.package-data]
+proxy_api_server = ["prompts/*.txt"]
+
+[tool.setuptools.packages.find]
+where = ["src"]

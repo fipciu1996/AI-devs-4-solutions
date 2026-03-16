@@ -1,0 +1,5 @@
+.env
+/sendit/analysis/
+/sendit/attachments/
+/sendit/draft/
+/sendit/legal_output/
