@@ -8,14 +8,16 @@ from dataclasses import dataclass
 from importlib.resources import files
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parents[3]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+REPO_ROOT_HINT = Path(__file__).resolve().parents[3]
+if str(REPO_ROOT_HINT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT_HINT))
 
+from devs_utilities.bootstrap import bootstrap_repo
 from repo_env import get_env, load_repo_env
 
 
 DEFAULT_SYSTEM_PROMPT_RESOURCE = "prompts/system_prompt.txt"
+REPO_ROOT = bootstrap_repo(__file__)
 
 
 def _normalize_api_path(raw_path: str | None) -> str:

@@ -12,16 +12,24 @@ import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib import error, parse, request
+from urllib import parse
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+REPO_ROOT_HINT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT_HINT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT_HINT))
 
-from repo_env import get_env, get_optional_env, load_repo_env
+from devs_utilities.ag3nts import submit_task_answer
+from devs_utilities.bootstrap import bootstrap_repo
+from devs_utilities.files import resolve_path, write_json
+from devs_utilities.http import get_json as http_get_json
+from devs_utilities.http import post_json as http_post_json
+from devs_utilities.logging import configure_logging, logger as shared_logger
+from devs_utilities.openrouter import OpenRouterClient, OpenRouterConfig, extract_completion_result
+from repo_env import get_env, get_optional_env
 
 
-load_repo_env(__file__)
+REPO_ROOT = bootstrap_repo(__file__)
+logger = shared_logger.bind(component="people.find")
 
 
 OPENROUTER_API_URL = get_env("OPENROUTER_BASE_URL")
@@ -168,43 +176,6 @@ def load_config(path: Path, args: argparse.Namespace) -> AppConfig:
     )
 
 
-def post_json(url: str, payload: dict[str, Any], headers: dict[str, str]) -> dict[str, Any]:
-    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    req = request.Request(url=url, data=body, headers=headers, method="POST")
-    try:
-        with request.urlopen(req, timeout=120) as response:
-            raw = response.read().decode("utf-8")
-    except error.HTTPError as exc:
-        details = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"HTTP {exc.code} dla {url}: {details}") from exc
-    except error.URLError as exc:
-        raise RuntimeError(f"Błąd połączenia z {url}: {exc.reason}") from exc
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"Odpowiedź z {url} nie jest JSON-em: {raw}") from exc
-
-
-def get_json(url: str) -> dict[str, Any]:
-    req = request.Request(url=url, method="GET")
-    try:
-        with request.urlopen(req, timeout=120) as response:
-            raw = response.read().decode("utf-8")
-    except error.HTTPError as exc:
-        details = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"HTTP {exc.code} dla {url}: {details}") from exc
-    except error.URLError as exc:
-        raise RuntimeError(f"Błąd połączenia z {url}: {exc.reason}") from exc
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"Odpowiedź z {url} nie jest JSON-em: {raw}") from exc
-
-
-def write_json(path: Path, payload: dict[str, Any]) -> None:
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-
-
 def normalize_name(value: str) -> str:
     decomposed = unicodedata.normalize("NFKD", value)
     ascii_only = "".join(char for char in decomposed if not unicodedata.combining(char))
@@ -241,7 +212,7 @@ def fetch_power_plants(config: AppConfig, path: Path, refresh: bool) -> dict[str
         f"{AG3NTS_DATA_BASE_URL.rstrip('/')}/"
         f"{parse.quote(config.hub_api_key)}/findhim_locations.json"
     )
-    payload = get_json(url)
+    payload = http_get_json(url, timeout_seconds=120)
     write_json(path, payload)
     return payload
 
@@ -273,7 +244,11 @@ def build_geocode_schema() -> dict[str, Any]:
     }
 
 
-def geocode_power_plants(raw_plants: dict[str, Any], config: AppConfig) -> list[PowerPlant]:
+def geocode_power_plants(
+    raw_plants: dict[str, Any],
+    config: AppConfig,
+    openrouter_client: OpenRouterClient,
+) -> list[PowerPlant]:
     plants_section = raw_plants["power_plants"]
     city_names = list(plants_section.keys())
     prompt = (
@@ -281,9 +256,8 @@ def geocode_power_plants(raw_plants: dict[str, Any], config: AppConfig) -> list[
         "centrów tych miejscowości. Nie podawaj objaśnień. Miasta:\n"
         + "\n".join(f"- {city}" for city in city_names)
     )
-    payload = {
-        "model": config.openrouter_model,
-        "messages": [
+    response = openrouter_client.create_raw_completion(
+        [
             {
                 "role": "system",
                 "content": (
@@ -296,24 +270,15 @@ def geocode_power_plants(raw_plants: dict[str, Any], config: AppConfig) -> list[
                 "content": prompt,
             },
         ],
-        "response_format": {
-            "type": "json_schema",
-            "json_schema": build_geocode_schema(),
+        extra_payload={
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": build_geocode_schema(),
+            }
         },
-    }
-    headers = {
-        "Authorization": f"Bearer {config.openrouter_api_key}",
-        "Content-Type": "application/json",
-    }
-    if config.site_url:
-        headers["HTTP-Referer"] = config.site_url
-    if config.site_name:
-        headers["X-Title"] = config.site_name
-
-    response = post_json(OPENROUTER_API_URL, payload, headers)
-    choices = response.get("choices") or []
-    message = choices[0].get("message", {}) if choices else {}
-    content = str(message.get("content") or "").strip()
+    )
+    completion = extract_completion_result(response)
+    content = str(completion.content or "").strip()
     if not content:
         raise RuntimeError(f"Brak treści w odpowiedzi geokodowania: {response}")
 
@@ -363,7 +328,11 @@ def fetch_person_locations(config: AppConfig, suspect: Suspect) -> list[Coordina
         "name": suspect.name,
         "surname": suspect.surname,
     }
-    response = post_json(HUB_LOCATION_URL, payload, {"Content-Type": "application/json"})
+    response = http_post_json(
+        HUB_LOCATION_URL,
+        payload,
+        timeout_seconds=120,
+    )
     if isinstance(response, dict):
         raw_locations = (
             response.get("locations")
@@ -395,7 +364,11 @@ def fetch_access_level(config: AppConfig, suspect: Suspect) -> int:
         "surname": suspect.surname,
         "birthYear": suspect.birth_year,
     }
-    response = post_json(HUB_ACCESS_URL, payload, {"Content-Type": "application/json"})
+    response = http_post_json(
+        HUB_ACCESS_URL,
+        payload,
+        timeout_seconds=120,
+    )
     access_level = response.get("accessLevel") if isinstance(response, dict) else None
     if access_level is None:
         raise RuntimeError(
@@ -455,6 +428,7 @@ def build_verify_payload(match: CandidateMatch, config: AppConfig) -> dict[str, 
 
 
 def main() -> None:
+    configure_logging(name="people.find")
     required_urls = (
         OPENROUTER_API_URL,
         HUB_VERIFY_URL,
@@ -466,15 +440,30 @@ def main() -> None:
             "Missing OPENROUTER_BASE_URL or AG3NTS_* URLs in .env."
         )
     args = parse_args()
-    config = load_config(Path(args.config), args)
-    birth_years = load_birth_years(Path(args.csv))
-    suspects = load_suspects(Path(args.suspects), birth_years)
-    raw_plants = fetch_power_plants(config, Path(args.plants), args.refresh_plants)
-    plants = geocode_power_plants(raw_plants, config)
+    people_dir = REPO_ROOT / "people"
+    config = load_config(resolve_path(args.config, people_dir), args)
+    birth_years = load_birth_years(resolve_path(args.csv, people_dir))
+    suspects = load_suspects(resolve_path(args.suspects, people_dir), birth_years)
+    raw_plants = fetch_power_plants(
+        config,
+        resolve_path(args.plants, people_dir),
+        args.refresh_plants,
+    )
+    openrouter_client = OpenRouterClient(
+        OpenRouterConfig(
+            api_key=config.openrouter_api_key,
+            base_url=OPENROUTER_API_URL,
+            model=config.openrouter_model,
+            timeout_seconds=120,
+            site_url=config.site_url,
+            site_name=config.site_name,
+        )
+    )
+    plants = geocode_power_plants(raw_plants, config, openrouter_client)
     best_match = find_best_match(suspects, plants, config)
     payload = build_verify_payload(best_match, config)
 
-    write_json(Path(args.output), payload)
+    write_json(resolve_path(args.output, people_dir), payload)
     preview = {
         "bestMatch": {
             "name": best_match.suspect.name,
@@ -487,12 +476,17 @@ def main() -> None:
         },
         "payload": payload,
     }
-    print(json.dumps(preview, ensure_ascii=False, indent=2))
+    logger.info("Preview:\n{}", json.dumps(preview, ensure_ascii=False, indent=2))
 
     if args.verify and not args.dry_run:
-        response = post_json(HUB_VERIFY_URL, payload, {"Content-Type": "application/json"})
-        print("\nVerify response:")
-        print(json.dumps(response, ensure_ascii=False, indent=2))
+        response = submit_task_answer(
+            HUB_VERIFY_URL,
+            api_key=config.hub_api_key,
+            task=TASK_NAME,
+            answer=payload["answer"],
+            timeout_seconds=120,
+        )
+        logger.info("Verify response:\n{}", json.dumps(response, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":

@@ -4,32 +4,26 @@ from __future__ import annotations
 
 import argparse
 import base64
-import json
 import mimetypes
 import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+REPO_ROOT_HINT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT_HINT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT_HINT))
 
-from repo_env import get_env, get_optional_env, load_repo_env
+from devs_utilities.bootstrap import bootstrap_repo
+from devs_utilities.files import read_text_with_fallback, resolve_path, write_json
+from devs_utilities.logging import configure_logging, logger as shared_logger
+from devs_utilities.openrouter import OpenRouterClient, OpenRouterConfig, extract_completion_result
+from repo_env import get_env, get_optional_env
 
 
-load_repo_env(__file__)
-
-
-try:
-    from loguru import logger
-except ImportError as error:
-    raise SystemExit(
-        "Brak zaleznosci 'loguru'. Zainstaluj ja poleceniem: pip install loguru"
-    ) from error
+REPO_ROOT = bootstrap_repo(__file__)
+logger = shared_logger.bind(component="sendit.analyze")
 
 
 OPENROUTER_URL = get_env("OPENROUTER_BASE_URL")
@@ -107,10 +101,6 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def resolve_dir(path: Path, base_dir: Path) -> Path:
-    return path if path.is_absolute() else (base_dir / path)
-
-
 def collect_targets(input_dir: Path, pattern: str) -> list[AnalysisTarget]:
     targets: list[AnalysisTarget] = []
     for path in sorted(input_dir.glob(pattern)):
@@ -127,11 +117,7 @@ def collect_targets(input_dir: Path, pattern: str) -> list[AnalysisTarget]:
 
 
 def load_text(path: Path, max_chars: int) -> str:
-    try:
-        content = path.read_text(encoding="utf-8")
-    except UnicodeDecodeError:
-        content = path.read_text(encoding="utf-8-sig")
-    return content[:max_chars]
+    return read_text_with_fallback(path)[:max_chars]
 
 
 def encode_image_as_data_url(path: Path) -> str:
@@ -190,73 +176,12 @@ def build_messages(
     ]
 
 
-def call_openrouter(
-    *,
-    api_key: str,
-    model: str,
-    messages: list[dict[str, object]],
-    site_url: str,
-    site_name: str,
-) -> dict[str, object]:
-    payload = {
-        "model": model,
-        "messages": messages,
-    }
-    request = Request(
-        OPENROUTER_URL,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "HTTP-Referer": site_url,
-            "X-Title": site_name,
-        },
-        method="POST",
-    )
-
-    with urlopen(request, timeout=120) as response:
-        response_body = response.read().decode("utf-8")
-    return json.loads(response_body)
-
-
-def extract_text_response(response_json: dict[str, object]) -> str:
-    choices = response_json.get("choices")
-    if not isinstance(choices, list) or not choices:
-        raise ValueError("Brak pola 'choices' w odpowiedzi OpenRouter.")
-
-    first_choice = choices[0]
-    if not isinstance(first_choice, dict):
-        raise ValueError("Niepoprawny format elementu 'choices'.")
-
-    message = first_choice.get("message")
-    if not isinstance(message, dict):
-        raise ValueError("Brak pola 'message' w odpowiedzi OpenRouter.")
-
-    content = message.get("content")
-    if isinstance(content, str):
-        return content
-
-    if isinstance(content, list):
-        text_parts: list[str] = []
-        for item in content:
-            if isinstance(item, dict) and item.get("type") == "text":
-                text = item.get("text")
-                if isinstance(text, str):
-                    text_parts.append(text)
-        return "\n".join(part for part in text_parts if part)
-
-    raise ValueError("Nie udalo sie odczytac tresci odpowiedzi modelu.")
-
-
 def write_text_report(output_path: Path, response_text: str) -> None:
     output_path.write_text(response_text, encoding="utf-8")
 
 
 def write_json_report(output_path: Path, response_json: dict[str, object]) -> None:
-    output_path.write_text(
-        json.dumps(response_json, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    write_json(output_path, response_json, trailing_newline=False)
 
 
 def output_path_for(target: AnalysisTarget, output_dir: Path, output_format: str) -> Path:
@@ -265,13 +190,14 @@ def output_path_for(target: AnalysisTarget, output_dir: Path, output_format: str
 
 
 def main() -> int:
+    configure_logging(name="sendit.analyze")
     if not OPENROUTER_URL:
         logger.error("Brak OPENROUTER_BASE_URL w .env.")
         return 1
     args = parse_args()
     base_dir = Path.cwd()
-    input_dir = resolve_dir(args.input_dir, base_dir)
-    output_dir = resolve_dir(args.output_dir, base_dir)
+    input_dir = resolve_path(args.input_dir, base_dir)
+    output_dir = resolve_path(args.output_dir, base_dir)
     project_root = base_dir.parent
 
     if not input_dir.exists():
@@ -288,6 +214,17 @@ def main() -> int:
         )
         return 1
 
+    openrouter_client = OpenRouterClient(
+        OpenRouterConfig(
+            api_key=api_key,
+            base_url=OPENROUTER_URL,
+            model=args.model,
+            timeout_seconds=120,
+            site_url=args.site_url,
+            site_name=args.site_name,
+        )
+    )
+
     targets = collect_targets(input_dir, args.glob)
     if not targets:
         logger.warning("Nie znaleziono plikow do analizy w {}.", input_dir)
@@ -301,20 +238,17 @@ def main() -> int:
         logger.info("Analizuje: {}", target.path.name)
         try:
             messages = build_messages(target, args.question, args.max_text_chars)
-            response_json = call_openrouter(
-                api_key=api_key,
-                model=args.model,
-                messages=messages,
-                site_url=args.site_url,
-                site_name=args.site_name,
-            )
+            response_json = openrouter_client.create_raw_completion(messages)
             destination = output_path_for(target, output_dir, args.format)
             if args.format == "json":
                 write_json_report(destination, response_json)
             else:
-                write_text_report(destination, extract_text_response(response_json))
+                completion = extract_completion_result(response_json)
+                if not completion.content:
+                    raise ValueError("Nie udalo sie odczytac tresci odpowiedzi modelu.")
+                write_text_report(destination, completion.content)
             logger.success("Zapisano wynik do {}", destination)
-        except (HTTPError, URLError, TimeoutError, ValueError, OSError) as error:
+        except (RuntimeError, ValueError, OSError) as error:
             failures += 1
             logger.error("Nie udalo sie przeanalizowac {}: {}", target.path.name, error)
 

@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import json
 from typing import Any
-from urllib import error, request
+
+from devs_utilities.http import HttpRequestError, JsonResponseError, post_json
 
 from proxy_api_server.config import Settings
 
@@ -45,30 +45,14 @@ class PackagesApiClient:
         )
 
     def _post(self, payload: dict[str, Any]) -> dict[str, Any]:
-        req = request.Request(
-            self._settings.packages_api_url,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-
         try:
-            with request.urlopen(req, timeout=self._settings.packages_timeout_seconds) as response:
-                raw_response = response.read().decode("utf-8")
-        except error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace").strip()
-            raise PackagesApiError(
-                f"Packages API returned HTTP {exc.code}: {detail or exc.reason}"
-            ) from exc
-        except error.URLError as exc:
-            raise PackagesApiError(f"Packages API request failed: {exc.reason}") from exc
-        except TimeoutError as exc:
-            raise PackagesApiError("Packages API request timed out.") from exc
-
-        try:
-            parsed = json.loads(raw_response)
-        except json.JSONDecodeError as exc:
-            raise PackagesApiError("Packages API returned invalid JSON.") from exc
+            parsed = post_json(
+                self._settings.packages_api_url,
+                payload,
+                timeout_seconds=self._settings.packages_timeout_seconds,
+            )
+        except (HttpRequestError, JsonResponseError) as exc:
+            raise PackagesApiError(str(exc)) from exc
 
         if not isinstance(parsed, dict):
             raise PackagesApiError("Packages API returned a non-object JSON response.")

@@ -3,3 +3,5 @@
 /sendit/attachments/
 /sendit/draft/
 /sendit/legal_output/
+__pycache__/
+*.pyc

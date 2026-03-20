@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import html
 import json
-import logging
 from datetime import UTC, datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -13,6 +12,7 @@ from threading import Lock
 from typing import Any
 from urllib.parse import urlparse
 
+from devs_utilities.logging import configure_logging, logger as shared_logger
 from proxy_api_server.config import Settings, load_settings
 from proxy_api_server.models import (
     ConversationRequest,
@@ -22,11 +22,7 @@ from proxy_api_server.models import (
 from proxy_api_server.openrouter import OpenRouterClient, OpenRouterError, ToolCall
 from proxy_api_server.packages_api import PackagesApiClient, PackagesApiError
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s %(message)s",
-)
-logger = logging.getLogger("proxy_api_server")
+logger = shared_logger.bind(component="proxy_api_server")
 LOG_FILE_LOCK = Lock()
 SESSION_LOCKS_GUARD = Lock()
 SESSION_LOCKS: dict[str, Lock] = {}
@@ -116,7 +112,7 @@ def load_session_messages(
                         record = json.loads(raw_line)
                     except json.JSONDecodeError:
                         logger.warning(
-                            "Skipping malformed conversation log entry at line %s",
+                            "Skipping malformed conversation log entry at line {}",
                             line_number,
                         )
                         continue
@@ -847,7 +843,7 @@ def build_handler(
                     )
                 except OpenRouterError as exc:
                     logger.warning(
-                        "OpenRouter request failed for session %s: %s",
+                        "OpenRouter request failed for session {}: {}",
                         request_data.session_id,
                         exc,
                     )
@@ -865,14 +861,14 @@ def build_handler(
                     return
 
             logger.info(
-                "Handled session %s with model %s",
+                "Handled session {} with model {}",
                 request_data.session_id,
                 settings.openrouter_model,
             )
             self._write_json(HTTPStatus.OK, response_data.to_api_dict())
 
         def log_message(self, format: str, *args: object) -> None:
-            logger.info("%s - %s", self.address_string(), format % args)
+            logger.info("{} - {}", self.address_string(), format % args)
 
         def _read_json_payload(self) -> object:
             content_length_header = self.headers.get("Content-Length")
@@ -919,13 +915,14 @@ def build_handler(
 
 
 def main() -> None:
+    configure_logging(name="proxy_api_server")
     settings = load_settings()
     openrouter_client = OpenRouterClient(settings)
     packages_client = PackagesApiClient(settings)
     handler_class = build_handler(settings, openrouter_client, packages_client)
     server = ThreadingHTTPServer((settings.api_host, settings.api_port), handler_class)
     logger.info(
-        "Starting proxy API server on %s:%s%s using model %s",
+        "Starting proxy API server on {}:{}{} using model {}",
         settings.api_host,
         settings.api_port,
         settings.api_path,

@@ -9,18 +9,22 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+
+REPO_ROOT_HINT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT_HINT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT_HINT))
+
+from devs_utilities.ag3nts import submit_task_answer
+from devs_utilities.bootstrap import bootstrap_repo
+from devs_utilities.files import write_json
+from devs_utilities.flags import extract_flag
+from devs_utilities.http import HttpRequestError, get_text
+from devs_utilities.logging import configure_logging, logger as shared_logger
+from repo_env import get_env
 
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
-
-from repo_env import get_env, load_repo_env
-
-
-load_repo_env(__file__)
+REPO_ROOT = bootstrap_repo(__file__)
+logger = shared_logger.bind(component="failure")
 
 
 TASK_NAME = "failure"
@@ -325,41 +329,25 @@ def build_log_url(api_key: str) -> str:
 
 
 def http_get_text(url: str) -> str:
-    request = Request(url, headers={"Accept": "text/plain,*/*;q=0.8"})
-    try:
-        with urlopen(request, timeout=60) as response:
-            return response.read().decode("utf-8")
-    except HTTPError as exc:
-        details = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"HTTP {exc.code} while fetching {url}: {details}") from exc
-    except URLError as exc:
-        raise RuntimeError(f"Network error while fetching {url}: {exc.reason}") from exc
+    return get_text(
+        url,
+        headers={"Accept": "text/plain,*/*;q=0.8"},
+        timeout_seconds=60,
+        errors="strict",
+    )
 
 
 def http_post_json(url: str, payload: dict[str, Any]) -> dict[str, Any]:
-    body = json.dumps(payload).encode("utf-8")
-    request = Request(
-        url,
-        data=body,
-        headers={"Content-Type": "application/json", "Accept": "application/json"},
-        method="POST",
-    )
     try:
-        with urlopen(request, timeout=60) as response:
-            raw = response.read().decode("utf-8")
-    except HTTPError as exc:
-        raw = exc.read().decode("utf-8", errors="replace")
-        try:
-            payload = json.loads(raw)
-        except json.JSONDecodeError:
-            payload = {"raw": raw}
-        payload["http_status"] = exc.code
-        raise RuntimeError(json.dumps(payload, ensure_ascii=False, indent=2)) from exc
-
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        return {"raw": raw}
+        return submit_task_answer(
+            url,
+            api_key=str(payload["apikey"]),
+            task=str(payload["task"]),
+            answer=dict(payload["answer"]),
+            timeout_seconds=60,
+        )
+    except HttpRequestError as exc:
+        raise RuntimeError(json.dumps(exc.to_response_dict(), ensure_ascii=False, indent=2)) from exc
 
 
 def parse_entries(raw_text: str) -> list[LogEntry]:
@@ -438,27 +426,8 @@ def summarize_source(entries: list[LogEntry], raw_text: str, condensed_logs: str
     return json.dumps(summary, ensure_ascii=False, indent=2)
 
 
-def extract_flag(payload: Any) -> str | None:
-    if isinstance(payload, str):
-        return payload if payload.startswith("{FLG:") else None
-
-    if isinstance(payload, dict):
-        for value in payload.values():
-            flag = extract_flag(value)
-            if flag:
-                return flag
-        return None
-
-    if isinstance(payload, list):
-        for item in payload:
-            flag = extract_flag(item)
-            if flag:
-                return flag
-
-    return None
-
-
 def main() -> int:
+    configure_logging(name="failure")
     args = parse_args()
     api_key = get_api_key()
     raw_text = http_get_text(build_log_url(api_key))
@@ -469,11 +438,10 @@ def main() -> int:
         RAW_LOG_PATH.write_text(raw_text, encoding="utf-8")
 
     CONDENSED_LOG_PATH.write_text(condensed_logs + "\n", encoding="utf-8")
-    print(summarize_source(entries, raw_text, condensed_logs))
+    logger.info("Summary:\n{}", summarize_source(entries, raw_text, condensed_logs))
 
     if args.print_logs:
-        print("\n--- condensed logs ---")
-        print(condensed_logs)
+        logger.info("Condensed logs:\n{}", condensed_logs)
 
     if not args.verify:
         return 0
@@ -487,16 +455,12 @@ def main() -> int:
         "answer": {"logs": condensed_logs},
     }
     response = http_post_json(VERIFY_URL, payload)
-    RESPONSE_PATH.write_text(
-        json.dumps(response, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    print("\n--- verify response ---")
-    print(json.dumps(response, ensure_ascii=False, indent=2))
+    write_json(RESPONSE_PATH, response)
+    logger.info("Verify response:\n{}", json.dumps(response, ensure_ascii=False, indent=2))
 
     flag = extract_flag(response)
     if flag:
-        print(f"\nFlag: {flag}")
+        logger.success("Flag: {}", flag)
         return 0
 
     return 1

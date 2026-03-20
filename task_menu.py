@@ -8,12 +8,14 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+from devs_utilities.logging import configure_logging, logger as shared_logger
 from repo_env import load_repo_env
 
 
 REPO_ROOT = Path(__file__).resolve().parent
 PYTHON = sys.executable
 DEFAULT_CATEGORIZE_ORDER = "J-D-I-B-A-C-G-E-H-F"
+logger = shared_logger.bind(component="task_menu")
 
 load_repo_env(__file__)
 
@@ -54,15 +56,15 @@ def pause() -> None:
 def run_commands(commands: list[CommandSpec]) -> int:
     last_return_code = 0
     for command in commands:
-        print(f"\nRunning in {command.cwd}: {' '.join(command.command)}\n")
+        logger.info("Running in {}: {}", command.cwd, " ".join(command.command))
         try:
             result = subprocess.run(command.command, cwd=command.cwd, check=False)
         except FileNotFoundError as exc:
-            print(f"Could not start command: {exc}")
+            logger.error("Could not start command: {}", exc)
             return 1
         last_return_code = result.returncode
         if last_return_code != 0:
-            print(f"\nCommand finished with exit code {last_return_code}.")
+            logger.warning("Command finished with exit code {}.", last_return_code)
             return last_return_code
     return last_return_code
 
@@ -154,7 +156,7 @@ def people_full_pipeline() -> list[CommandSpec]:
 def railway_run_prompt() -> list[CommandSpec] | None:
     prompt = prompt_text("Railway prompt")
     if not prompt:
-        print("Prompt is required.")
+        logger.error("Prompt is required.")
         return None
     args = ["railway\\route_agent.py"]
     if prompt_yes_no("Show tool results?", False):
@@ -301,11 +303,11 @@ TASK_MENUS: dict[str, list[MenuAction]] = {
 
 
 def show_main_menu() -> str:
-    print("\nInteractive Task Menu\n")
+    logger.info("Interactive Task Menu")
     task_names = list(TASK_MENUS)
     for index, task_name in enumerate(task_names, start=1):
-        print(f"{index}. {task_name}")
-    print("q. Quit")
+        logger.info("{}. {}", index, task_name)
+    logger.info("q. Quit")
     choice = input("\nSelect task: ").strip().lower()
     if choice == "q":
         return choice
@@ -313,29 +315,29 @@ def show_main_menu() -> str:
         selected_index = int(choice) - 1
         if 0 <= selected_index < len(task_names):
             return task_names[selected_index]
-    print("Invalid choice.")
+    logger.warning("Invalid choice.")
     return ""
 
 
 def show_task_menu(task_name: str, actions: list[MenuAction]) -> bool:
     while True:
-        print(f"\n{task_name}\n")
+        logger.info("{}", task_name)
         for index, action in enumerate(actions, start=1):
-            print(f"{index}. {action.label} - {action.description}")
-        print("b. Back")
-        print("q. Quit")
+            logger.info("{}. {} - {}", index, action.label, action.description)
+        logger.info("b. Back")
+        logger.info("q. Quit")
         choice = input("\nSelect action: ").strip().lower()
         if choice == "b":
             return True
         if choice == "q":
             return False
         if not choice.isdigit():
-            print("Invalid choice.")
+            logger.warning("Invalid choice.")
             continue
 
         selected_index = int(choice) - 1
         if not 0 <= selected_index < len(actions):
-            print("Invalid choice.")
+            logger.warning("Invalid choice.")
             continue
 
         commands = actions[selected_index].builder()
@@ -343,21 +345,22 @@ def show_task_menu(task_name: str, actions: list[MenuAction]) -> bool:
             pause()
             continue
         exit_code = run_commands(commands)
-        print(f"\nFinished with exit code {exit_code}.")
+        logger.info("Finished with exit code {}.", exit_code)
         pause()
 
 
 def main() -> int:
+    configure_logging(name="task_menu")
     while True:
         selected_task = show_main_menu()
         if not selected_task:
             continue
         if selected_task == "q":
-            print("Goodbye.")
+            logger.info("Goodbye.")
             return 0
         should_continue = show_task_menu(selected_task, TASK_MENUS[selected_task])
         if not should_continue:
-            print("Goodbye.")
+            logger.info("Goodbye.")
             return 0
 
 

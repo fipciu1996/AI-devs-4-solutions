@@ -11,16 +11,20 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
-from urllib import error, request
+REPO_ROOT_HINT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT_HINT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT_HINT))
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+from devs_utilities.ag3nts import submit_task_answer
+from devs_utilities.bootstrap import bootstrap_repo
+from devs_utilities.files import resolve_path, write_json
+from devs_utilities.logging import configure_logging, logger as shared_logger
+from devs_utilities.openrouter import OpenRouterClient, OpenRouterConfig, extract_completion_result
+from repo_env import get_env, get_optional_env
 
-from repo_env import get_env, get_optional_env, load_repo_env
 
-
-load_repo_env(__file__)
+REPO_ROOT = bootstrap_repo(__file__)
+logger = shared_logger.bind(component="people.filter")
 
 
 OPENROUTER_API_URL = get_env("OPENROUTER_BASE_URL")
@@ -264,32 +268,18 @@ def build_llm_prompt(batch: list[Person]) -> str:
     )
 
 
-def post_json(url: str, payload: dict[str, Any], headers: dict[str, str]) -> dict[str, Any]:
-    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    req = request.Request(url=url, data=body, headers=headers, method="POST")
-    try:
-        with request.urlopen(req, timeout=120) as response:
-            raw = response.read().decode("utf-8")
-    except error.HTTPError as exc:
-        details = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"HTTP {exc.code} dla {url}: {details}") from exc
-    except error.URLError as exc:
-        raise RuntimeError(f"Błąd połączenia z {url}: {exc.reason}") from exc
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError(f"Odpowiedź z {url} nie jest JSON-em: {raw}") from exc
-
-
-def classify_jobs(batch: list[Person], config: AppConfig) -> dict[int, list[str]]:
+def classify_jobs(
+    batch: list[Person],
+    config: AppConfig,
+    openrouter_client: OpenRouterClient,
+) -> dict[int, list[str]]:
     if not config.openrouter_api_key:
         raise ValueError(
             "Brakuje OPENROUTER_API_KEY lub openrouter_api_key w configu."
         )
 
-    payload = {
-        "model": config.openrouter_model,
-        "messages": [
+    response = openrouter_client.create_raw_completion(
+        [
             {
                 "role": "system",
                 "content": (
@@ -302,28 +292,15 @@ def classify_jobs(batch: list[Person], config: AppConfig) -> dict[int, list[str]
                 "content": build_llm_prompt(batch),
             },
         ],
-        "response_format": {
-            "type": "json_schema",
-            "json_schema": build_llm_schema(),
+        extra_payload={
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": build_llm_schema(),
+            }
         },
-    }
-    headers = {
-        "Authorization": f"Bearer {config.openrouter_api_key}",
-        "Content-Type": "application/json",
-    }
-    if config.site_url:
-        headers["HTTP-Referer"] = config.site_url
-    if config.site_name:
-        headers["X-Title"] = config.site_name
-
-    response = post_json(
-        OPENROUTER_API_URL,
-        payload,
-        headers,
     )
-    choices = response.get("choices") or []
-    message = choices[0].get("message", {}) if choices else {}
-    raw_text = str(message.get("content") or "").strip()
+    completion = extract_completion_result(response)
+    raw_text = str(completion.content or "").strip()
     if not raw_text:
         raise RuntimeError(f"Brak treści w odpowiedzi modelu: {response}")
 
@@ -336,10 +313,14 @@ def classify_jobs(batch: list[Person], config: AppConfig) -> dict[int, list[str]
     return tags_by_row_id
 
 
-def classify_all(candidates: list[Person], config: AppConfig) -> dict[int, list[str]]:
+def classify_all(
+    candidates: list[Person],
+    config: AppConfig,
+    openrouter_client: OpenRouterClient,
+) -> dict[int, list[str]]:
     tags_by_row_id: dict[int, list[str]] = {}
     for batch in chunked(candidates, config.batch_size):
-        tags_by_row_id.update(classify_jobs(batch, config))
+        tags_by_row_id.update(classify_jobs(batch, config, openrouter_client))
     missing_ids = {person.row_id for person in candidates} - set(tags_by_row_id)
     if missing_ids:
         missing_display = ", ".join(str(item) for item in sorted(missing_ids))
@@ -376,17 +357,26 @@ def build_verify_payload(answer: list[dict[str, Any]], hub_api_key: str) -> dict
     }
 
 
-def write_json(path: Path, payload: dict[str, Any]) -> None:
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-
-
 def main() -> None:
+    configure_logging(name="people.filter")
     if not OPENROUTER_API_URL or not VERIFY_URL:
         raise ValueError("Missing OPENROUTER_BASE_URL or AG3NTS_VERIFY_URL in .env.")
     args = parse_args()
-    config = load_config(Path(args.config), args)
-    people = read_people(Path(args.csv))
+    config_path = resolve_path(args.config, REPO_ROOT / "people")
+    csv_path = resolve_path(args.csv, REPO_ROOT / "people")
+    config = load_config(config_path, args)
+    people = read_people(csv_path)
     candidates = filter_candidates(people)
+    openrouter_client = OpenRouterClient(
+        OpenRouterConfig(
+            api_key=config.openrouter_api_key,
+            base_url=OPENROUTER_API_URL,
+            model=config.openrouter_model,
+            timeout_seconds=120,
+            site_url=config.site_url,
+            site_name=config.site_name,
+        )
+    )
 
     if args.dry_run:
         preview = {
@@ -405,24 +395,28 @@ def main() -> None:
                 for person in candidates
             ],
         }
-        print(json.dumps(preview, ensure_ascii=False, indent=2))
+        logger.info("Preview:\n{}", json.dumps(preview, ensure_ascii=False, indent=2))
         return
 
-    tags_by_row_id = classify_all(candidates, config)
+    tags_by_row_id = classify_all(candidates, config, openrouter_client)
     answer = build_answer(candidates, tags_by_row_id)
     payload = build_verify_payload(answer, config.hub_api_key)
-    output_path = Path(args.output)
+    output_path = resolve_path(args.output, REPO_ROOT / "people")
     write_json(output_path, payload)
-    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    logger.info("Payload:\n{}", json.dumps(payload, ensure_ascii=False, indent=2))
 
     if args.verify:
-        verify_response = post_json(
+        verify_response = submit_task_answer(
             VERIFY_URL,
-            payload,
-            {"Content-Type": "application/json"},
+            api_key=config.hub_api_key,
+            task=TASK_NAME,
+            answer=answer,
+            timeout_seconds=120,
         )
-        print("\nVerify response:")
-        print(json.dumps(verify_response, ensure_ascii=False, indent=2))
+        logger.info(
+            "Verify response:\n{}",
+            json.dumps(verify_response, ensure_ascii=False, indent=2),
+        )
 
 
 if __name__ == "__main__":

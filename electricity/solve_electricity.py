@@ -7,18 +7,21 @@ import json
 import sys
 from pathlib import Path
 from typing import Any
-from urllib.error import HTTPError
-from urllib.request import Request, urlopen
+
+REPO_ROOT_HINT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT_HINT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT_HINT))
+
+from devs_utilities.ag3nts import submit_task_answer
+from devs_utilities.bootstrap import bootstrap_repo
+from devs_utilities.flags import extract_flag
+from devs_utilities.http import HttpRequestError, get_bytes
+from devs_utilities.logging import configure_logging, logger as shared_logger
+from repo_env import get_env
 
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
-
-from repo_env import get_env, load_repo_env
-
-
-load_repo_env(__file__)
+REPO_ROOT = bootstrap_repo(__file__)
+logger = shared_logger.bind(component="electricity")
 
 
 TASK_NAME = "electricity"
@@ -55,68 +58,39 @@ def build_board_url(api_key: str, *, reset: bool = False) -> str:
 
 
 def http_get(url: str) -> bytes:
-    request = Request(url, headers={"Accept": "image/png,*/*;q=0.8"})
-    with urlopen(request, timeout=30) as response:
-        return response.read()
-
-
-def http_post_json(url: str, payload: dict[str, Any]) -> dict[str, Any]:
-    body = json.dumps(payload).encode("utf-8")
-    request = Request(
+    return get_bytes(
         url,
-        data=body,
-        headers={"Content-Type": "application/json", "Accept": "application/json"},
-        method="POST",
+        headers={"Accept": "image/png,*/*;q=0.8"},
+        timeout_seconds=30,
     )
+
+
+def http_post_json(url: str, payload: dict[str, object]) -> object:
     try:
-        with urlopen(request, timeout=30) as response:
-            raw = response.read().decode("utf-8")
-    except HTTPError as exc:
-        raw = exc.read().decode("utf-8", errors="replace")
-        try:
-            data = json.loads(raw)
-        except json.JSONDecodeError:
-            data = {"raw": raw}
-        data["http_status"] = exc.code
-        raise RuntimeError(json.dumps(data, ensure_ascii=False)) from exc
-
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        return {"raw": raw}
-
-
-def maybe_extract_flag(payload: Any) -> str | None:
-    if isinstance(payload, str):
-        return payload if payload.startswith("{FLG:") else None
-
-    if isinstance(payload, dict):
-        for value in payload.values():
-            flag = maybe_extract_flag(value)
-            if flag:
-                return flag
-        return None
-
-    if isinstance(payload, list):
-        for item in payload:
-            flag = maybe_extract_flag(item)
-            if flag:
-                return flag
-
-    return None
+        return submit_task_answer(
+            url,
+            api_key=str(payload["apikey"]),
+            task=str(payload["task"]),
+            answer=dict(payload["answer"]),
+            timeout_seconds=30,
+        )
+    except HttpRequestError as exc:
+        raise RuntimeError(json.dumps(exc.to_response_dict(), ensure_ascii=False)) from exc
 
 
 def reset_board(api_key: str) -> None:
     http_get(build_board_url(api_key, reset=True))
 
 
-def rotate_once(api_key: str, position: str) -> dict[str, Any]:
-    payload = {
-        "apikey": api_key,
-        "task": TASK_NAME,
-        "answer": {"rotate": position},
-    }
-    return http_post_json(VERIFY_URL, payload)
+def rotate_once(api_key: str, position: str) -> Any:
+    return http_post_json(
+        VERIFY_URL,
+        {
+            "apikey": api_key,
+            "task": TASK_NAME,
+            "answer": {"rotate": position},
+        },
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -135,10 +109,11 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    configure_logging(name="electricity")
     args = parse_args()
     api_key = get_api_key()
 
-    print(f"Planned rotations: {' '.join(ROTATION_SEQUENCE)}")
+    logger.info("Planned rotations: {}", " ".join(ROTATION_SEQUENCE))
 
     if args.dry_run:
         return 0
@@ -147,18 +122,18 @@ def main() -> int:
         raise ValueError("Missing AG3NTS_VERIFY_URL in .env.")
 
     if args.reset:
-        print("Resetting board...")
+        logger.info("Resetting board...")
         reset_board(api_key)
 
     for index, position in enumerate(ROTATION_SEQUENCE, start=1):
         response = rotate_once(api_key, position)
-        print(f"[{index}/{len(ROTATION_SEQUENCE)}] rotate {position} -> {response}")
-        flag = maybe_extract_flag(response)
+        logger.info("[{}/{}] rotate {} -> {}", index, len(ROTATION_SEQUENCE), position, response)
+        flag = extract_flag(response)
         if flag:
-            print(flag)
+            logger.success("Flag: {}", flag)
             return 0
 
-    print("Flag not returned. The board may already be in a different state.")
+    logger.warning("Flag not returned. The board may already be in a different state.")
     return 1
 
 

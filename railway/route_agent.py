@@ -11,24 +11,20 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib import error, request
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+REPO_ROOT_HINT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT_HINT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT_HINT))
 
-from repo_env import get_env, get_optional_env, load_repo_env
+from devs_utilities.bootstrap import bootstrap_repo
+from devs_utilities.http import HttpRequestError, post_json
+from devs_utilities.logging import configure_logging, logger as shared_logger
+from devs_utilities.openrouter import OpenRouterClient, OpenRouterConfig, OpenRouterError, ToolCall
+from repo_env import get_env, get_optional_env
 
 
-load_repo_env(__file__)
-
-
-try:
-    from loguru import logger
-except ImportError as exc:
-    raise SystemExit(
-        "Brak zaleznosci 'loguru'. Zainstaluj ja poleceniem: pip install loguru"
-    ) from exc
+REPO_ROOT = bootstrap_repo(__file__)
+logger = shared_logger.bind(component="railway")
 
 
 OPENROUTER_API_URL = get_env("OPENROUTER_BASE_URL")
@@ -67,16 +63,6 @@ class AppConfig:
     site_url: str | None
     site_name: str | None
     max_steps: int
-
-
-def configure_logging(show_tool_results: bool) -> None:
-    logger.remove()
-    logger.add(
-        sys.stderr,
-        level="DEBUG" if show_tool_results else "INFO",
-        format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | "
-        "<level>{level: <8}</level> | <level>{message}</level>",
-    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -217,29 +203,24 @@ class RailwayApiClient:
             "answer": answer,
         }
 
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         retries_left = self.retry_attempts
 
         while True:
-            http_request = request.Request(
-                url=self.api_url,
-                data=body,
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-
             try:
-                with request.urlopen(http_request, timeout=60) as response:
-                    raw = response.read().decode("utf-8")
+                result = post_json(
+                    self.api_url,
+                    payload,
+                    headers={"Content-Type": "application/json"},
+                    timeout_seconds=60,
+                )
                 break
-            except error.HTTPError as exc:
-                details = exc.read().decode("utf-8", errors="replace")
-                if exc.code in RETRYABLE_STATUS_CODES and retries_left > 0:
-                    retry_delay = self._extract_retry_delay(exc, details)
+            except HttpRequestError as exc:
+                if exc.status_code in RETRYABLE_STATUS_CODES and retries_left > 0:
+                    retry_delay = self._extract_retry_delay(exc)
                     logger.warning(
                         "Railway API zwrocilo {} dla akcji {}. Czekam {} s i ponawiam "
                         "probe (pozostalo prob: {}).",
-                        exc.code,
+                        exc.status_code,
                         action,
                         retry_delay,
                         retries_left,
@@ -247,34 +228,36 @@ class RailwayApiClient:
                     time.sleep(retry_delay)
                     retries_left -= 1
                     continue
-                raise RailwayError(f"HTTP {exc.code} dla Railway API: {details}") from exc
-            except error.URLError as exc:
-                raise RailwayError(f"Blad polaczenia z Railway API: {exc.reason}") from exc
-
-        try:
-            result = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise RailwayError(f"Railway API zwrocilo niepoprawny JSON: {raw}") from exc
+                raise RailwayError(str(exc)) from exc
 
         if not isinstance(result, dict):
-            raise RailwayError(f"Railway API zwrocilo niepoprawny typ danych: {type(result)!r}")
+            raise RailwayError(
+                f"Railway API zwrocilo niepoprawny typ danych: {type(result)!r}"
+            )
 
         if result.get("ok") is False:
-            message = result.get("error") or result.get("message") or raw
+            message = (
+                result.get("error")
+                or result.get("message")
+                or json.dumps(result, ensure_ascii=False)
+            )
             raise RailwayError(f"Railway API zwrocilo blad: {message}")
 
         return result
 
-    def _extract_retry_delay(self, http_error: error.HTTPError, details: str) -> int:
-        retry_after_header = http_error.headers.get("Retry-After")
+    def _extract_retry_delay(self, request_error: HttpRequestError) -> int:
+        retry_after_header = (request_error.headers or {}).get("Retry-After")
         if retry_after_header:
             try:
                 return max(1, int(retry_after_header))
             except ValueError:
-                logger.debug("Nie udalo sie sparsowac naglowka Retry-After: {}", retry_after_header)
+                logger.debug(
+                    "Nie udalo sie sparsowac naglowka Retry-After: {}",
+                    retry_after_header,
+                )
 
         try:
-            payload = json.loads(details)
+            payload = json.loads(request_error.body or "")
         except json.JSONDecodeError:
             payload = None
 
@@ -286,7 +269,7 @@ class RailwayApiClient:
             if isinstance(penalty_seconds, int) and penalty_seconds > 0:
                 return penalty_seconds
 
-        if http_error.code == 503:
+        if request_error.status_code == 503:
             return DEFAULT_503_RETRY_DELAY_SECONDS
 
         return 1
@@ -402,135 +385,32 @@ def build_tool_handlers(client: RailwayApiClient) -> dict[str, Any]:
     }
 
 
-def post_json(url: str, payload: dict[str, Any], headers: dict[str, str]) -> dict[str, Any]:
-    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    http_request = request.Request(
-        url=url,
-        data=body,
-        headers=headers,
-        method="POST",
-    )
-    try:
-        with request.urlopen(http_request, timeout=120) as response:
-            raw = response.read().decode("utf-8")
-    except error.HTTPError as exc:
-        details = exc.read().decode("utf-8", errors="replace")
-        raise RailwayError(f"HTTP {exc.code} dla OpenRouter: {details}") from exc
-    except error.URLError as exc:
-        raise RailwayError(f"Blad polaczenia z OpenRouter: {exc.reason}") from exc
-
-    try:
-        result = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise RailwayError(f"OpenRouter zwrocil niepoprawny JSON: {raw}") from exc
-
-    if not isinstance(result, dict):
-        raise RailwayError("OpenRouter zwrocil niepoprawny typ odpowiedzi.")
-    if result.get("error"):
-        raise RailwayError(str(result["error"]))
-    return result
-
-
-def call_openrouter(
-    *,
-    config: AppConfig,
-    messages: list[dict[str, Any]],
-) -> dict[str, Any]:
-    payload: dict[str, Any] = {
-        "model": config.model,
-        "messages": messages,
-        "tools": TOOLS,
-        "tool_choice": "auto",
-    }
-    headers = {
-        "Authorization": f"Bearer {config.openrouter_api_key}",
-        "Content-Type": "application/json",
-    }
-    if config.site_url:
-        headers["HTTP-Referer"] = config.site_url
-    if config.site_name:
-        headers["X-Title"] = config.site_name
-
-    return post_json(OPENROUTER_API_URL, payload, headers)
-
-
-def extract_message(response_json: dict[str, Any]) -> dict[str, Any]:
-    choices = response_json.get("choices")
-    if not isinstance(choices, list) or not choices:
-        raise RailwayError("Brak pola 'choices' w odpowiedzi OpenRouter.")
-
-    first_choice = choices[0]
-    if not isinstance(first_choice, dict):
-        raise RailwayError("Niepoprawny element 'choices' w odpowiedzi OpenRouter.")
-
-    message = first_choice.get("message")
-    if not isinstance(message, dict):
-        raise RailwayError("Brak pola 'message' w odpowiedzi OpenRouter.")
-    return message
-
-
-def extract_text_content(message: dict[str, Any]) -> str:
-    content = message.get("content")
-    if isinstance(content, str):
-        return content.strip()
-    if isinstance(content, list):
-        parts: list[str] = []
-        for item in content:
-            if isinstance(item, dict) and item.get("type") == "text":
-                text = item.get("text")
-                if isinstance(text, str) and text.strip():
-                    parts.append(text.strip())
-        return "\n".join(parts)
-    return ""
-
-
 def execute_tool_call(
-    tool_call: dict[str, Any],
+    tool_call: ToolCall,
     handlers: dict[str, Any],
     *,
     show_tool_results: bool,
 ) -> dict[str, Any]:
-    function_block = tool_call.get("function")
-    if not isinstance(function_block, dict):
-        raise RailwayError(f"Niepoprawny format tool call: {tool_call}")
+    if tool_call.name not in handlers:
+        raise RailwayError(f"Model wywolal nieznane narzedzie: {tool_call.name!r}")
 
-    name = function_block.get("name")
-    if not isinstance(name, str) or name not in handlers:
-        raise RailwayError(f"Model wywolal nieznane narzedzie: {name!r}")
-
-    arguments_raw = function_block.get("arguments") or "{}"
-    if not isinstance(arguments_raw, str):
-        raise RailwayError(f"Niepoprawny format argumentow narzedzia {name}.")
-
-    try:
-        arguments = json.loads(arguments_raw)
-    except json.JSONDecodeError as exc:
-        raise RailwayError(f"Nie udalo sie sparsowac argumentow narzedzia {name}.") from exc
-
-    if not isinstance(arguments, dict):
-        raise RailwayError(f"Argumenty narzedzia {name} musza byc obiektem JSON.")
-
-    result = handlers[name](arguments)
+    result = handlers[tool_call.name](tool_call.arguments)
     if show_tool_results:
         logger.debug(
             "Tool {} wywolany z argumentami: {}",
-            name,
-            json.dumps(arguments, ensure_ascii=False),
+            tool_call.name,
+            json.dumps(tool_call.arguments, ensure_ascii=False),
         )
         logger.debug(
             "Wynik toola {}: {}",
-            name,
+            tool_call.name,
             json.dumps(result, ensure_ascii=False, indent=2),
         )
 
-    tool_call_id = tool_call.get("id")
-    if not isinstance(tool_call_id, str) or not tool_call_id:
-        raise RailwayError(f"Brak identyfikatora wywolania narzedzia dla {name}.")
-
     return {
         "role": "tool",
-        "tool_call_id": tool_call_id,
-        "name": name,
+        "tool_call_id": tool_call.id,
+        "name": tool_call.name,
         "content": json.dumps(result, ensure_ascii=False),
     }
 
@@ -543,27 +423,38 @@ def run_agent(
     show_tool_results: bool,
 ) -> str:
     handlers = build_tool_handlers(client)
+    openrouter_client = OpenRouterClient(
+        OpenRouterConfig(
+            api_key=config.openrouter_api_key,
+            base_url=OPENROUTER_API_URL,
+            model=config.model,
+            timeout_seconds=120,
+            site_url=config.site_url,
+            site_name=config.site_name,
+        )
+    )
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": prompt},
     ]
 
     for _ in range(config.max_steps):
-        response = call_openrouter(config=config, messages=messages)
-        message = extract_message(response)
-        tool_calls = message.get("tool_calls")
+        try:
+            completion = openrouter_client.create_completion(messages, tools=TOOLS)
+        except OpenRouterError as exc:
+            raise RailwayError(str(exc)) from exc
 
-        assistant_message: dict[str, Any] = {"role": "assistant"}
-        text_content = extract_text_content(message)
-        if text_content:
-            assistant_message["content"] = text_content
-        else:
-            assistant_message["content"] = ""
+        assistant_message: dict[str, Any] = {
+            "role": "assistant",
+            "content": completion.content or "",
+        }
 
-        if isinstance(tool_calls, list) and tool_calls:
-            assistant_message["tool_calls"] = tool_calls
+        if completion.tool_calls:
+            assistant_message["tool_calls"] = [
+                tool_call.to_message_dict() for tool_call in completion.tool_calls
+            ]
             messages.append(assistant_message)
-            for tool_call in tool_calls:
+            for tool_call in completion.tool_calls:
                 tool_message = execute_tool_call(
                     tool_call,
                     handlers,
@@ -572,8 +463,8 @@ def run_agent(
                 messages.append(tool_message)
             continue
 
-        if text_content:
-            return text_content
+        if completion.content:
+            return completion.content
 
         raise RailwayError("Model nie zwrocil ani odpowiedzi tekstowej, ani tool calli.")
 
@@ -583,11 +474,11 @@ def run_agent(
 
 
 def main() -> int:
+    args = parse_args()
+    configure_logging(name="railway", verbose=args.show_tool_results)
     if not OPENROUTER_API_URL:
         logger.error("Brakuje OPENROUTER_BASE_URL w .env.")
         return 1
-    args = parse_args()
-    configure_logging(args.show_tool_results)
     config = build_config(args)
     prompt = " ".join(args.prompt).strip()
     client = RailwayApiClient(

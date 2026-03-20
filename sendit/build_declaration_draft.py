@@ -7,25 +7,20 @@ import json
 import os
 import sys
 from pathlib import Path
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+REPO_ROOT_HINT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT_HINT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT_HINT))
 
-from repo_env import get_env, get_optional_env, load_repo_env
+from devs_utilities.bootstrap import bootstrap_repo
+from devs_utilities.files import read_text_with_fallback, resolve_path, write_json
+from devs_utilities.logging import configure_logging, logger as shared_logger
+from devs_utilities.openrouter import OpenRouterClient, OpenRouterConfig, extract_completion_result
+from repo_env import get_env, get_optional_env
 
 
-load_repo_env(__file__)
-
-
-try:
-    from loguru import logger
-except ImportError as error:
-    raise SystemExit(
-        "Brak zaleznosci 'loguru'. Zainstaluj ja poleceniem: pip install loguru"
-    ) from error
+REPO_ROOT = bootstrap_repo(__file__)
+logger = shared_logger.bind(component="sendit.draft")
 
 
 OPENROUTER_URL = get_env("OPENROUTER_BASE_URL")
@@ -93,11 +88,6 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def resolve_dir(path: Path | str, base_dir: Path) -> Path:
-    normalized_path = path if isinstance(path, Path) else Path(path)
-    return normalized_path if normalized_path.is_absolute() else (base_dir / normalized_path)
-
-
 def load_openrouter_api_key() -> str | None:
     return (os.environ.get("OPENROUTER_API_KEY") or "").strip() or None
 
@@ -107,7 +97,7 @@ def load_shipment(path: Path) -> dict[str, object]:
 
 
 def load_system_prompt(path: Path) -> str:
-    prompt = path.read_text(encoding="utf-8").strip()
+    prompt = read_text_with_fallback(path).strip()
     if not prompt:
         raise ValueError(f"Plik system prompt jest pusty: {path}")
     return prompt
@@ -118,7 +108,7 @@ def load_bundle(directory: Path, pattern: str) -> str:
     for path in sorted(directory.glob(pattern)):
         if not path.is_file():
             continue
-        content = path.read_text(encoding="utf-8")
+        content = read_text_with_fallback(path)
         parts.append(f"# {path.name}\n\n{content.strip()}")
     return "\n\n".join(parts)
 
@@ -191,60 +181,6 @@ def build_messages(
     ]
 
 
-def call_openrouter(
-    *,
-    api_key: str,
-    model: str,
-    messages: list[dict[str, object]],
-    site_url: str,
-    site_name: str,
-) -> dict[str, object]:
-    payload = {"model": model, "messages": messages}
-    request = Request(
-        OPENROUTER_URL,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "HTTP-Referer": site_url,
-            "X-Title": site_name,
-        },
-        method="POST",
-    )
-    with urlopen(request, timeout=120) as response:
-        return json.loads(response.read().decode("utf-8"))
-
-
-def extract_response_text(response_json: dict[str, object]) -> str:
-    choices = response_json.get("choices")
-    if not isinstance(choices, list) or not choices:
-        raise ValueError("Brak pola 'choices' w odpowiedzi OpenRouter.")
-
-    choice = choices[0]
-    if not isinstance(choice, dict):
-        raise ValueError("Niepoprawny format odpowiedzi OpenRouter.")
-
-    message = choice.get("message")
-    if not isinstance(message, dict):
-        raise ValueError("Brak pola 'message' w odpowiedzi OpenRouter.")
-
-    content = message.get("content")
-    if isinstance(content, str):
-        return content
-
-    if isinstance(content, list):
-        text_parts: list[str] = []
-        for item in content:
-            if isinstance(item, dict) and item.get("type") == "text":
-                text = item.get("text")
-                if isinstance(text, str):
-                    text_parts.append(text)
-        if text_parts:
-            return "\n".join(text_parts)
-
-    raise ValueError("Nie udalo sie odczytac tresci odpowiedzi modelu.")
-
-
 def parse_model_json(response_text: str) -> dict[str, object]:
     stripped = response_text.strip()
     if stripped.startswith("```"):
@@ -297,23 +233,21 @@ def write_outputs(
         "evidence": evidence,
         "cheapest_legal_option_summary": cheapest_legal_option_summary,
     }
-    (output_dir / "review_report.json").write_text(
-        json.dumps(review_report, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    write_json(output_dir / "review_report.json", review_report, trailing_newline=False)
 
 
 def main() -> int:
+    configure_logging(name="sendit.draft")
     if not OPENROUTER_URL:
         logger.error("Brak OPENROUTER_BASE_URL w .env.")
         return 1
     args = parse_args()
     base_dir = Path.cwd()
-    analysis_dir = resolve_dir(args.analysis_dir, base_dir)
-    attachments_dir = resolve_dir(args.attachments_dir, base_dir)
-    shipment_file = resolve_dir(args.shipment_file, base_dir)
-    output_dir = resolve_dir(args.output_dir, base_dir)
-    system_prompt_file = resolve_dir(args.system_prompt_file, base_dir)
+    analysis_dir = resolve_path(args.analysis_dir, base_dir)
+    attachments_dir = resolve_path(args.attachments_dir, base_dir)
+    shipment_file = resolve_path(args.shipment_file, base_dir)
+    output_dir = resolve_path(args.output_dir, base_dir)
+    system_prompt_file = resolve_path(args.system_prompt_file, base_dir)
     project_root = base_dir.parent
 
     if not analysis_dir.exists():
@@ -336,6 +270,17 @@ def main() -> int:
         )
         return 1
 
+    openrouter_client = OpenRouterClient(
+        OpenRouterConfig(
+            api_key=api_key,
+            base_url=OPENROUTER_URL,
+            model=args.model,
+            timeout_seconds=120,
+            site_url=args.site_url,
+            site_name=args.site_name,
+        )
+    )
+
     analysis_bundle = load_bundle(analysis_dir, "*.md")
     attachments_bundle = load_bundle(attachments_dir, "*.md") if attachments_dir.exists() else ""
     documentation_bundle = "\n\n".join(
@@ -350,16 +295,15 @@ def main() -> int:
     logger.info("Buduje roboczy draft deklaracji na podstawie {}.", shipment_file.name)
 
     try:
-        response_json = call_openrouter(
-            api_key=api_key,
-            model=args.model,
-            messages=build_messages(system_prompt, documentation_bundle, shipment),
-            site_url=args.site_url,
-            site_name=args.site_name,
+        response_json = openrouter_client.create_raw_completion(
+            build_messages(system_prompt, documentation_bundle, shipment)
         )
-        result = parse_model_json(extract_response_text(response_json))
+        completion = extract_completion_result(response_json)
+        if not completion.content:
+            raise ValueError("Nie udalo sie odczytac tresci odpowiedzi modelu.")
+        result = parse_model_json(completion.content)
         write_outputs(output_dir=output_dir, task=args.task, result=result)
-    except (HTTPError, URLError, OSError, ValueError, json.JSONDecodeError) as error:
+    except (RuntimeError, OSError, ValueError, json.JSONDecodeError) as error:
         logger.error("Nie udalo sie przygotowac draftu: {}", error)
         return 1
 

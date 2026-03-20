@@ -5,16 +5,22 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import sys
 from dataclasses import asdict, dataclass
 from datetime import date
 from pathlib import Path
 
-try:
-    from loguru import logger
-except ImportError as error:
-    raise SystemExit(
-        "Brak zaleznosci 'loguru'. Zainstaluj ja poleceniem: pip install loguru"
-    ) from error
+REPO_ROOT_HINT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT_HINT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT_HINT))
+
+from devs_utilities.bootstrap import bootstrap_repo
+from devs_utilities.files import resolve_path
+from devs_utilities.logging import configure_logging, logger as shared_logger
+
+
+REPO_ROOT = bootstrap_repo(__file__, load_env=False)
+logger = shared_logger.bind(component="sendit.legal")
 
 
 STANDARD_TRAIN_CAPACITY_KG = 1000
@@ -120,11 +126,6 @@ def parse_args() -> argparse.Namespace:
         help="Katalog wyjsciowy. Domyslnie: legal_output",
     )
     return parser.parse_args()
-
-
-def resolve_path(path: Path | str, base_dir: Path) -> Path:
-    normalized = path if isinstance(path, Path) else Path(path)
-    return normalized if normalized.is_absolute() else (base_dir / normalized)
 
 
 def normalize_text(value: str) -> str:
@@ -430,6 +431,7 @@ def write_outputs(output_dir: Path, shipment: ShipmentInput, result: ValidationR
 
 
 def main() -> int:
+    configure_logging(name="sendit.legal")
     args = parse_args()
     base_dir = Path.cwd()
     shipment_file = resolve_path(args.shipment_file, base_dir)

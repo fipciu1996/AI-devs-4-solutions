@@ -1,0 +1,19 @@
+[project]
+name = "ai-devs-4-solutions"
+version = "0.1.0"
+description = "Shared utilities and task scripts for the AI devs solutions workspace"
+readme = "proxy/README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "loguru",
+]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["devs_utilities"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]

@@ -9,17 +9,27 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib import error, request
+REPO_ROOT_HINT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT_HINT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT_HINT))
+
+from devs_utilities.ag3nts import submit_task_answer
+from devs_utilities.bootstrap import bootstrap_repo
+from devs_utilities.files import write_json
+from devs_utilities.flags import extract_flag
+from devs_utilities.http import HttpRequestError, JsonResponseError, post_json
+from devs_utilities.logging import configure_logging, logger as shared_logger
+from devs_utilities.openrouter import (
+    OpenRouterClient,
+    OpenRouterConfig,
+    OpenRouterError,
+    ToolCall,
+)
+from repo_env import get_env, get_optional_env
 
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
-
-from repo_env import get_env, get_optional_env, load_repo_env
-
-
-load_repo_env(__file__)
+REPO_ROOT = bootstrap_repo(__file__)
+logger = shared_logger.bind(component="mailbox")
 
 
 TASK_NAME = "mailbox"
@@ -93,29 +103,6 @@ class AppConfig:
     site_name: str | None
     max_steps: int
     show_tool_results: bool
-
-
-@dataclass(frozen=True, slots=True)
-class ToolCall:
-    id: str
-    name: str
-    arguments: dict[str, Any]
-
-    def to_message_dict(self) -> dict[str, Any]:
-        return {
-            "id": self.id,
-            "type": "function",
-            "function": {
-                "name": self.name,
-                "arguments": json.dumps(self.arguments, ensure_ascii=False),
-            },
-        }
-
-
-@dataclass(frozen=True, slots=True)
-class ChatCompletionResult:
-    content: str | None
-    tool_calls: list[ToolCall]
 
 
 @dataclass(slots=True)
@@ -204,64 +191,6 @@ def build_config(args: argparse.Namespace) -> AppConfig:
     )
 
 
-def post_json(
-    url: str,
-    payload: dict[str, Any],
-    *,
-    timeout_seconds: int,
-    headers: dict[str, str] | None = None,
-) -> Any:
-    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    request_headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-    }
-    if headers:
-        request_headers.update(headers)
-
-    http_request = request.Request(
-        url=url,
-        data=body,
-        headers=request_headers,
-        method="POST",
-    )
-    try:
-        with request.urlopen(http_request, timeout=timeout_seconds) as response:
-            raw = response.read().decode("utf-8")
-    except error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace").strip()
-        raise MailboxError(f"HTTP {exc.code} for {url}: {detail or exc.reason}") from exc
-    except error.URLError as exc:
-        raise MailboxError(f"Network error for {url}: {exc.reason}") from exc
-    except TimeoutError as exc:
-        raise MailboxError(f"Request to {url} timed out.") from exc
-
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        return raw
-
-
-def maybe_extract_flag(payload: Any) -> str | None:
-    if isinstance(payload, str):
-        return payload if payload.startswith("{FLG:") else None
-
-    if isinstance(payload, dict):
-        for value in payload.values():
-            flag = maybe_extract_flag(value)
-            if flag:
-                return flag
-        return None
-
-    if isinstance(payload, list):
-        for item in payload:
-            flag = maybe_extract_flag(item)
-            if flag:
-                return flag
-
-    return None
-
-
 class ZmailClient:
     def __init__(self, config: AppConfig) -> None:
         self._config = config
@@ -293,11 +222,14 @@ class ZmailClient:
 
     def _call(self, payload: dict[str, Any]) -> Any:
         full_payload = {"apikey": self._config.ag3nts_api_key, **payload}
-        result = post_json(
-            self._config.zmail_url,
-            full_payload,
-            timeout_seconds=self._config.timeout_seconds,
-        )
+        try:
+            result = post_json(
+                self._config.zmail_url,
+                full_payload,
+                timeout_seconds=self._config.timeout_seconds,
+            )
+        except (HttpRequestError, JsonResponseError) as exc:
+            raise MailboxError(str(exc)) from exc
         if isinstance(result, dict):
             result.setdefault(
                 "agent_note",
@@ -311,123 +243,16 @@ class VerifyClient:
         self._config = config
 
     def submit_answer(self, answer: dict[str, str]) -> Any:
-        payload = {
-            "apikey": self._config.ag3nts_api_key,
-            "task": TASK_NAME,
-            "answer": answer,
-        }
-        return post_json(
-            self._config.verify_url,
-            payload,
-            timeout_seconds=self._config.timeout_seconds,
-        )
-
-
-class OpenRouterClient:
-    def __init__(self, config: AppConfig) -> None:
-        self._config = config
-
-    def create_completion(
-        self,
-        messages: list[dict[str, Any]],
-        *,
-        tools: list[dict[str, Any]],
-    ) -> ChatCompletionResult:
-        payload: dict[str, Any] = {
-            "model": self._config.model,
-            "messages": messages,
-            "tools": tools,
-            "tool_choice": "auto",
-        }
-        headers = {
-            "Authorization": f"Bearer {self._config.openrouter_api_key}",
-        }
-        if self._config.site_url:
-            headers["HTTP-Referer"] = self._config.site_url
-        if self._config.site_name:
-            headers["X-Title"] = self._config.site_name
-
-        parsed = post_json(
-            self._config.openrouter_url,
-            payload,
-            timeout_seconds=self._config.timeout_seconds,
-            headers=headers,
-        )
-        if not isinstance(parsed, dict):
-            raise MailboxError("OpenRouter returned a non-object response.")
-        return extract_completion_result(parsed)
-
-
-def extract_completion_result(payload: dict[str, Any]) -> ChatCompletionResult:
-    choices = payload.get("choices")
-    if not isinstance(choices, list) or not choices:
-        raise MailboxError("OpenRouter response is missing choices.")
-
-    first_choice = choices[0]
-    if not isinstance(first_choice, dict):
-        raise MailboxError("OpenRouter choice has an invalid format.")
-
-    message = first_choice.get("message")
-    if not isinstance(message, dict):
-        raise MailboxError("OpenRouter response is missing a message.")
-
-    return ChatCompletionResult(
-        content=extract_text_content(message.get("content")),
-        tool_calls=extract_tool_calls(message.get("tool_calls")),
-    )
-
-
-def extract_text_content(content: Any) -> str | None:
-    if content is None:
-        return None
-    if isinstance(content, str):
-        stripped = content.strip()
-        return stripped or None
-    if isinstance(content, list):
-        parts: list[str] = []
-        for item in content:
-            if not isinstance(item, dict):
-                continue
-            if item.get("type") == "text" and isinstance(item.get("text"), str):
-                stripped = item["text"].strip()
-                if stripped:
-                    parts.append(stripped)
-        if parts:
-            return "\n".join(parts)
-        return None
-    raise MailboxError("OpenRouter returned unsupported message content.")
-
-
-def extract_tool_calls(raw_tool_calls: Any) -> list[ToolCall]:
-    if raw_tool_calls is None:
-        return []
-    if not isinstance(raw_tool_calls, list):
-        raise MailboxError("OpenRouter tool_calls field has an invalid format.")
-
-    tool_calls: list[ToolCall] = []
-    for raw_tool_call in raw_tool_calls:
-        if not isinstance(raw_tool_call, dict):
-            raise MailboxError("OpenRouter tool call item has an invalid format.")
-        function_block = raw_tool_call.get("function")
-        if not isinstance(function_block, dict):
-            raise MailboxError("OpenRouter tool call is missing a function block.")
-        tool_id = raw_tool_call.get("id")
-        name = function_block.get("name")
-        arguments_raw = function_block.get("arguments")
-        if not isinstance(tool_id, str) or not tool_id:
-            raise MailboxError("OpenRouter tool call is missing an id.")
-        if not isinstance(name, str) or not name:
-            raise MailboxError("OpenRouter tool call is missing a function name.")
-        if not isinstance(arguments_raw, str):
-            raise MailboxError(f"OpenRouter arguments for {name} must be a JSON string.")
         try:
-            arguments = json.loads(arguments_raw)
-        except json.JSONDecodeError as exc:
-            raise MailboxError(f"OpenRouter arguments for {name} are not valid JSON.") from exc
-        if not isinstance(arguments, dict):
-            raise MailboxError(f"OpenRouter arguments for {name} must decode to an object.")
-        tool_calls.append(ToolCall(id=tool_id, name=name, arguments=arguments))
-    return tool_calls
+            return submit_task_answer(
+                self._config.verify_url,
+                api_key=self._config.ag3nts_api_key,
+                task=TASK_NAME,
+                answer=answer,
+                timeout_seconds=self._config.timeout_seconds,
+            )
+        except HttpRequestError as exc:
+            raise MailboxError(str(exc)) from exc
 
 
 TOOLS: list[dict[str, Any]] = [
@@ -626,10 +451,6 @@ def normalize_answer(arguments: dict[str, Any]) -> dict[str, str]:
     return normalized
 
 
-def save_json(path: Path, payload: Any) -> None:
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-
-
 def build_tool_handlers(
     *,
     zmail_client: ZmailClient,
@@ -639,11 +460,11 @@ def build_tool_handlers(
     def submit_answer(arguments: dict[str, Any]) -> Any:
         answer = normalize_answer(arguments)
         state.last_answer = answer
-        save_json(LAST_ANSWER_PATH, answer)
+        write_json(LAST_ANSWER_PATH, answer)
         response = verify_client.submit_answer(answer)
         state.final_response = response
-        save_json(LAST_RESPONSE_PATH, response)
-        flag = maybe_extract_flag(response)
+        write_json(LAST_RESPONSE_PATH, response)
+        flag = extract_flag(response)
         if flag:
             state.final_flag = flag
         return response
@@ -692,9 +513,12 @@ def execute_tool_call(
 
     result = handlers[tool_call.name](tool_call.arguments)
     if show_tool_results:
-        print(f"\n--- tool {tool_call.name} ---")
-        print(json.dumps(tool_call.arguments, ensure_ascii=False, indent=2))
-        print(json.dumps(result, ensure_ascii=False, indent=2))
+        logger.info(
+            "Tool {} args:\n{}\nTool result:\n{}",
+            tool_call.name,
+            json.dumps(tool_call.arguments, ensure_ascii=False, indent=2),
+            json.dumps(result, ensure_ascii=False, indent=2),
+        )
 
     return {
         "role": "tool",
@@ -710,7 +534,16 @@ def run_agent(
     transcript_path: Path,
 ) -> tuple[str, AgentState, list[dict[str, Any]]]:
     state = AgentState()
-    openrouter_client = OpenRouterClient(config)
+    openrouter_client = OpenRouterClient(
+        OpenRouterConfig(
+            api_key=config.openrouter_api_key,
+            base_url=config.openrouter_url,
+            model=config.model,
+            timeout_seconds=config.timeout_seconds,
+            site_url=config.site_url,
+            site_name=config.site_name,
+        )
+    )
     zmail_client = ZmailClient(config)
     verify_client = VerifyClient(config)
     handlers = build_tool_handlers(
@@ -745,23 +578,23 @@ def run_agent(
                 )
                 messages.append(tool_message)
                 if state.final_flag:
-                    save_json(transcript_path, messages)
+                    write_json(transcript_path, messages)
                     return state.final_flag, state, messages
             continue
 
         if completion.content:
             if state.final_flag:
-                save_json(transcript_path, messages)
+                write_json(transcript_path, messages)
                 return state.final_flag, state, messages
             if "FLG:" in completion.content:
-                save_json(transcript_path, messages)
+                write_json(transcript_path, messages)
                 return completion.content.strip(), state, messages
 
         if state.final_flag:
-            save_json(transcript_path, messages)
+            write_json(transcript_path, messages)
             return state.final_flag, state, messages
 
-    save_json(transcript_path, messages)
+    write_json(transcript_path, messages)
     raise MailboxError(
         f"Agent did not finish within {config.max_steps} tool-calling rounds."
     )
@@ -769,23 +602,28 @@ def run_agent(
 
 def main() -> int:
     args = parse_args()
+    configure_logging(name="mailbox", verbose=args.show_tool_results)
     config = build_config(args)
     transcript_path = Path(args.transcript_path).resolve()
 
     try:
         flag, state, _messages = run_agent(config=config, transcript_path=transcript_path)
-    except MailboxError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
+    except (MailboxError, OpenRouterError) as exc:
+        logger.error("Error: {}", exc)
         return 1
 
-    print(f"Model: {config.model}")
+    logger.info("Model: {}", config.model)
     if state.last_answer:
-        print("Answer:")
-        print(json.dumps(state.last_answer, ensure_ascii=False, indent=2))
+        logger.info(
+            "Answer:\n{}",
+            json.dumps(state.last_answer, ensure_ascii=False, indent=2),
+        )
     if state.final_response is not None:
-        print("Verify response:")
-        print(json.dumps(state.final_response, ensure_ascii=False, indent=2))
-    print(f"Flag: {flag}")
+        logger.info(
+            "Verify response:\n{}",
+            json.dumps(state.final_response, ensure_ascii=False, indent=2),
+        )
+    logger.success("Flag: {}", flag)
     return 0
 
 

@@ -6,27 +6,22 @@ import argparse
 import shutil
 import sys
 from pathlib import Path
-from urllib.error import HTTPError, URLError
 from urllib.parse import unquote, urljoin, urlparse
-from urllib.request import urlopen
 import re
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+REPO_ROOT_HINT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT_HINT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT_HINT))
 
-from repo_env import get_env, load_repo_env
+from devs_utilities.bootstrap import bootstrap_repo
+from devs_utilities.files import read_text_with_fallback
+from devs_utilities.http import HttpRequestError, get_bytes
+from devs_utilities.logging import configure_logging, logger as shared_logger
+from repo_env import get_env
 
 
-load_repo_env(__file__)
-
-
-try:
-    from loguru import logger
-except ImportError as error:
-    raise SystemExit(
-        "Brak zaleznosci 'loguru'. Zainstaluj ja poleceniem: pip install loguru"
-    ) from error
+REPO_ROOT = bootstrap_repo(__file__)
+logger = shared_logger.bind(component="sendit.download")
 
 
 MARKDOWN_LINK_RE = re.compile(r"(?<!!)\[[^\]]+\]\(([^)]+)\)")
@@ -66,10 +61,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def read_markdown(index_path: Path) -> str:
-    try:
-        return index_path.read_text(encoding="utf-8")
-    except UnicodeDecodeError:
-        return index_path.read_text(encoding="utf-8-sig")
+    return read_text_with_fallback(index_path)
 
 
 def strip_optional_title(target: str) -> str:
@@ -118,8 +110,7 @@ def filename_from_target(target: str) -> str:
 
 
 def download_remote_file(url: str, destination: Path) -> None:
-    with urlopen(url) as response, destination.open("wb") as output_file:
-        shutil.copyfileobj(response, output_file)
+    destination.write_bytes(get_bytes(url, timeout_seconds=120))
 
 
 def copy_local_file(source: Path, destination: Path) -> None:
@@ -141,7 +132,7 @@ def materialize_attachment(
     if parsed.scheme in {"http", "https"}:
         try:
             download_remote_file(target, destination)
-        except (HTTPError, URLError) as error:
+        except HttpRequestError as error:
             return f"ERROR {target} ({error})"
         return f"OK    {target} -> {destination.name}"
 
@@ -153,7 +144,7 @@ def materialize_attachment(
     remote_url = urljoin(source_url, target)
     try:
         download_remote_file(remote_url, destination)
-    except (HTTPError, URLError) as error:
+    except HttpRequestError as error:
         return (
             f"MISS  {target} (brak lokalnie; nie udalo sie pobrac z "
             f"{remote_url}: {error})"
@@ -163,6 +154,7 @@ def materialize_attachment(
 
 
 def main() -> int:
+    configure_logging(name="sendit.download")
     args = parse_args()
     index_path = args.index.resolve()
     if not args.source_url:

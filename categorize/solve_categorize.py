@@ -10,17 +10,20 @@ from dataclasses import dataclass
 from io import StringIO
 from pathlib import Path
 from typing import Any
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+REPO_ROOT_HINT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT_HINT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT_HINT))
 
-from repo_env import get_env, load_repo_env
+from devs_utilities.ag3nts import submit_task_answer
+from devs_utilities.bootstrap import bootstrap_repo
+from devs_utilities.http import HttpRequestError, get_text
+from devs_utilities.logging import configure_logging, logger as shared_logger
+from repo_env import get_env
 
 
-load_repo_env(__file__)
+REPO_ROOT = bootstrap_repo(__file__)
+logger = shared_logger.bind(component="categorize")
 
 
 VERIFY_URL = get_env("AG3NTS_VERIFY_URL")
@@ -57,34 +60,25 @@ def build_data_url(api_key: str) -> str:
 
 
 def http_get_text(url: str) -> str:
-    request = Request(url, headers={"Accept": "text/csv,text/plain;q=0.9,*/*;q=0.8"})
-    with urlopen(request, timeout=30) as response:
-        return response.read().decode("utf-8")
-
-
-def http_post_json(url: str, payload: dict[str, Any]) -> dict[str, Any]:
-    body = json.dumps(payload).encode("utf-8")
-    request = Request(
+    return get_text(
         url,
-        data=body,
-        headers={"Content-Type": "application/json", "Accept": "application/json"},
-        method="POST",
+        headers={"Accept": "text/csv,text/plain;q=0.9,*/*;q=0.8"},
+        timeout_seconds=30,
+        errors="strict",
     )
+
+
+def submit_json(url: str, payload: dict[str, Any]) -> Any:
     try:
-        with urlopen(request, timeout=30) as response:
-            raw = response.read().decode("utf-8")
-    except HTTPError as exc:
-        raw = exc.read().decode("utf-8", errors="replace")
-        try:
-            data = json.loads(raw)
-        except json.JSONDecodeError:
-            data = {"raw": raw}
-        data["http_status"] = exc.code
-        raise RuntimeError(json.dumps(data, ensure_ascii=False)) from exc
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        return {"raw": raw}
+        return submit_task_answer(
+            url,
+            api_key=str(payload["apikey"]),
+            task=str(payload["task"]),
+            answer=dict(payload["answer"]),
+            timeout_seconds=30,
+        )
+    except HttpRequestError as exc:
+        raise RuntimeError(json.dumps(exc.to_response_dict(), ensure_ascii=False)) from exc
 
 
 def parse_items(csv_text: str) -> list[Item]:
@@ -257,41 +251,46 @@ def estimate_tokens(text: str) -> int:
     return max(1, (len(text) + 3) // 4)
 
 
-def reset_budget(api_key: str) -> dict[str, Any]:
-    payload = {
-        "apikey": api_key,
-        "task": TASK_NAME,
-        "answer": {"prompt": "reset"},
-    }
-    return http_post_json(VERIFY_URL, payload)
+def reset_budget(api_key: str) -> Any:
+    return submit_json(
+        VERIFY_URL,
+        {
+            "apikey": api_key,
+            "task": TASK_NAME,
+            "answer": {"prompt": "reset"},
+        },
+    )
 
 
-def submit_prompt(api_key: str, prompt: str) -> dict[str, Any]:
-    payload = {
-        "apikey": api_key,
-        "task": TASK_NAME,
-        "answer": {"prompt": prompt},
-    }
-    return http_post_json(VERIFY_URL, payload)
+def submit_prompt(api_key: str, prompt: str) -> Any:
+    return submit_json(
+        VERIFY_URL,
+        {
+            "apikey": api_key,
+            "task": TASK_NAME,
+            "answer": {"prompt": prompt},
+        },
+    )
 
 
 def print_items(items: list[Item]) -> None:
-    print("Fetched items:")
+    logger.info("Fetched items:")
     for item in items:
         prompt = build_prompt(item)
-        print(
+        logger.info(
             f"- {item.item_id}: {item.description} "
             f"(prompt~{estimate_tokens(prompt)} toks)"
         )
 
 
 def main() -> int:
+    configure_logging(name="categorize")
     api_key = get_api_key()
     if not api_key:
-        print("Missing CATEGORIZE_API_KEY/AG3NTS_API_KEY/PACKAGES_API_KEY.", file=sys.stderr)
+        logger.error("Missing CATEGORIZE_API_KEY/AG3NTS_API_KEY/PACKAGES_API_KEY.")
         return 1
     if not VERIFY_URL:
-        print("Missing AG3NTS_VERIFY_URL in .env.", file=sys.stderr)
+        logger.error("Missing AG3NTS_VERIFY_URL in .env.")
         return 1
     data_url = build_data_url(api_key)
 
@@ -299,44 +298,40 @@ def main() -> int:
         csv_text = http_get_text(data_url)
         items = parse_items(csv_text)
         items, order_mode = resolve_send_order(items, sys.argv[1:])
-    except (HTTPError, URLError, TimeoutError, RuntimeError, ValueError) as exc:
-        print(f"Failed to fetch/parse CSV: {exc}", file=sys.stderr)
+    except (HttpRequestError, RuntimeError, ValueError) as exc:
+        logger.error("Failed to fetch/parse CSV: {}", exc)
         return 1
 
     print_items(items)
-    print(f"\nOrder mode: {order_mode}")
-    print(
-        "\nSend order: "
-        + " -> ".join(item.item_id for item in items)
-    )
-    print(f"\nUsing verify endpoint: {VERIFY_URL}")
+    logger.info("Order mode: {}", order_mode)
+    logger.info("Send order: {}", " -> ".join(item.item_id for item in items))
+    logger.info("Using verify endpoint: {}", VERIFY_URL)
 
     if "--reset" in sys.argv:
         try:
             response = reset_budget(api_key)
-        except (HTTPError, URLError, TimeoutError, RuntimeError) as exc:
-            print(f"Reset failed: {exc}", file=sys.stderr)
+        except RuntimeError as exc:
+            logger.error("Reset failed: {}", exc)
             return 1
-        print("\nReset response:")
-        print(json.dumps(response, ensure_ascii=False, indent=2))
+        logger.info("Reset response:\n{}", json.dumps(response, ensure_ascii=False, indent=2))
 
     for index, item in enumerate(items, start=1):
         prompt = build_prompt(item)
-        print(f"\n[{index}/{len(items)}] Sending item {item.item_id}")
-        print(f"Prompt ({estimate_tokens(prompt)} toks est.): {prompt}")
+        logger.info("[{}/{}] Sending item {}", index, len(items), item.item_id)
+        logger.info("Prompt ({} toks est.): {}", estimate_tokens(prompt), prompt)
         try:
             response = submit_prompt(api_key, prompt)
-        except (HTTPError, URLError, TimeoutError, RuntimeError) as exc:
-            print(f"Submit failed for {item.item_id}: {exc}", file=sys.stderr)
+        except RuntimeError as exc:
+            logger.error("Submit failed for {}: {}", item.item_id, exc)
             return 1
 
-        print(json.dumps(response, ensure_ascii=False, indent=2))
+        logger.info("Response:\n{}", json.dumps(response, ensure_ascii=False, indent=2))
         serialized = json.dumps(response, ensure_ascii=False)
         if "FLG:" in serialized:
-            print("\nFlag received.")
+            logger.success("Flag received.")
             return 0
 
-    print("\nFinished sending all items.")
+    logger.info("Finished sending all items.")
     return 0
 
 
