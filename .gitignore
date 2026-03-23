@@ -3,5 +3,10 @@
 /sendit/attachments/
 /sendit/draft/
 /sendit/legal_output/
+/sensors/sensors.zip
+/sensors/dataset/
+/failure/failure.log
+/failure/final_logs.txt
 __pycache__/
 *.pyc
+**/*.json
