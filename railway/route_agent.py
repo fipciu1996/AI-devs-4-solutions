@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 import sys
 import time
@@ -16,11 +15,12 @@ REPO_ROOT_HINT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT_HINT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT_HINT))
 
+from devs_utilities.ag3nts import AG3NTS_RAILWAY_URL
 from devs_utilities.bootstrap import bootstrap_repo
 from devs_utilities.http import HttpRequestError, post_json
 from devs_utilities.logging import configure_logging, logger as shared_logger
 from devs_utilities.openrouter import OpenRouterClient, OpenRouterConfig, OpenRouterError, ToolCall
-from repo_env import get_env, get_optional_env
+from repo_env import get_env, get_int_env, get_optional_env
 
 
 REPO_ROOT = bootstrap_repo(__file__)
@@ -28,10 +28,12 @@ logger = shared_logger.bind(component="railway")
 
 
 OPENROUTER_API_URL = get_env("OPENROUTER_BASE_URL")
-DEFAULT_MODEL = "openrouter/healer-alpha"
-DEFAULT_MAX_STEPS = 8
-DEFAULT_RAILWAY_RETRY_ATTEMPTS = 3
-DEFAULT_503_RETRY_DELAY_SECONDS = 30
+DEFAULT_MODEL = get_env("OPENROUTER_MODEL", "openrouter/healer-alpha") or "openrouter/healer-alpha"
+DEFAULT_MAX_STEPS = get_int_env("RAILWAY_MAX_STEPS", 8) or 8
+DEFAULT_RAILWAY_RETRY_ATTEMPTS = get_int_env("RAILWAY_RETRY_ATTEMPTS", 3) or 3
+DEFAULT_503_RETRY_DELAY_SECONDS = get_int_env("RAILWAY_RETRY_DELAY_503_SECONDS", 30) or 30
+RAILWAY_API_TIMEOUT_SECONDS = get_int_env("RAILWAY_API_TIMEOUT_SECONDS", 60) or 60
+OPENROUTER_TIMEOUT_SECONDS = get_int_env("OPENROUTER_TIMEOUT_SECONDS", 120) or 120
 RAILWAY_TASK_NAME = "railway"
 RETRYABLE_STATUS_CODES = {429, 503}
 ROUTE_PATTERN = re.compile(r"^[a-z]-[0-9]{1,2}$", re.IGNORECASE)
@@ -79,11 +81,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--railway-api-url",
-        help="Endpoint API tras. Mozna tez ustawic RAILWAY_API_URL.",
+        help=f"Endpoint API tras. Domyslnie: {AG3NTS_RAILWAY_URL}",
     )
     parser.add_argument(
         "--railway-api-key",
-        help="Klucz API tras. Mozna tez ustawic RAILWAY_API_KEY.",
+        help="Klucz API tras. Domyslnie: AG3NTS_API_KEY z .env.",
     )
     parser.add_argument(
         "--openrouter-api-key",
@@ -120,20 +122,18 @@ def parse_args() -> argparse.Namespace:
 
 def build_config(args: argparse.Namespace) -> AppConfig:
     def read_value(cli_value: str | None, env_name: str) -> str:
-        return (cli_value or os.environ.get(env_name) or "").strip()
+        return (cli_value or get_env(env_name)).strip()
 
-    railway_api_url = read_value(args.railway_api_url, "RAILWAY_API_URL")
-    railway_api_key = read_value(args.railway_api_key, "RAILWAY_API_KEY")
+    railway_api_url = (args.railway_api_url or AG3NTS_RAILWAY_URL).strip()
+    railway_api_key = read_value(args.railway_api_key, "AG3NTS_API_KEY")
     openrouter_api_key = read_value(args.openrouter_api_key, "OPENROUTER_API_KEY")
-    model = (args.model or get_env("OPENROUTER_MODEL") or DEFAULT_MODEL).strip()
+    model = (args.model or DEFAULT_MODEL).strip()
     site_url = (args.site_url or get_optional_env("OPENROUTER_SITE_URL") or "").strip() or None
     site_name = (args.site_name or get_optional_env("OPENROUTER_SITE_NAME") or "").strip() or None
 
     missing: list[str] = []
-    if not railway_api_url:
-        missing.append("RAILWAY_API_URL")
     if not railway_api_key:
-        missing.append("RAILWAY_API_KEY")
+        missing.append("AG3NTS_API_KEY")
     if not openrouter_api_key:
         missing.append("OPENROUTER_API_KEY")
 
@@ -211,7 +211,7 @@ class RailwayApiClient:
                     self.api_url,
                     payload,
                     headers={"Content-Type": "application/json"},
-                    timeout_seconds=60,
+                    timeout_seconds=RAILWAY_API_TIMEOUT_SECONDS,
                 )
                 break
             except HttpRequestError as exc:
@@ -428,7 +428,7 @@ def run_agent(
             api_key=config.openrouter_api_key,
             base_url=OPENROUTER_API_URL,
             model=config.model,
-            timeout_seconds=120,
+            timeout_seconds=OPENROUTER_TIMEOUT_SECONDS,
             site_url=config.site_url,
             site_name=config.site_name,
         )

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import csv
 import json
-import os
 import sys
 from dataclasses import dataclass
 from io import StringIO
@@ -15,22 +14,25 @@ REPO_ROOT_HINT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT_HINT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT_HINT))
 
-from devs_utilities.ag3nts import submit_task_answer
+from devs_utilities.ag3nts import (
+    AG3NTS_VERIFY_URL,
+    build_ag3nts_task_data_url,
+    submit_task_answer,
+)
 from devs_utilities.bootstrap import bootstrap_repo
 from devs_utilities.http import HttpRequestError, get_text
 from devs_utilities.logging import configure_logging, logger as shared_logger
-from repo_env import get_env
+from repo_env import get_env, get_int_env
 
 
 REPO_ROOT = bootstrap_repo(__file__)
 logger = shared_logger.bind(component="categorize")
 
 
-VERIFY_URL = get_env("AG3NTS_VERIFY_URL")
-DATA_BASE_URL = get_env("AG3NTS_DATA_BASE_URL")
 TASK_NAME = "categorize"
-DEFAULT_SEND_ORDER = "J-D-I-B-A-C-G-E-H-F"
-DEFAULT_ORDER_MODE = "csv_position"
+DEFAULT_SEND_ORDER = get_env("CATEGORIZE_SEND_ORDER", "J-D-I-B-A-C-G-E-H-F")
+DEFAULT_ORDER_MODE = get_env("CATEGORIZE_ORDER_MODE", "csv_position") or "csv_position"
+REQUEST_TIMEOUT_SECONDS = get_int_env("AG3NTS_TIMEOUT_SECONDS", 30) or 30
 PROMPT_TEMPLATE = (
     "Reply DNG or NEU. Reactor/fuel/cassette/core/rod => NEU. DNG only for weapon, "
     "firearm part, ammo, explosive, poison, corrosive, radioactive, biohazard, "
@@ -46,24 +48,18 @@ class Item:
 
 
 def get_api_key() -> str:
-    return (
-        os.getenv("CATEGORIZE_API_KEY")
-        or os.getenv("AG3NTS_API_KEY")
-        or os.getenv("PACKAGES_API_KEY")
-    )
+    return get_env("AG3NTS_API_KEY")
 
 
 def build_data_url(api_key: str) -> str:
-    if not DATA_BASE_URL:
-        raise ValueError("Missing AG3NTS_DATA_BASE_URL in .env.")
-    return f"{DATA_BASE_URL.rstrip('/')}/{api_key}/{TASK_NAME}.csv"
+    return build_ag3nts_task_data_url(api_key, f"{TASK_NAME}.csv")
 
 
 def http_get_text(url: str) -> str:
     return get_text(
         url,
         headers={"Accept": "text/csv,text/plain;q=0.9,*/*;q=0.8"},
-        timeout_seconds=30,
+        timeout_seconds=REQUEST_TIMEOUT_SECONDS,
         errors="strict",
     )
 
@@ -75,7 +71,7 @@ def submit_json(url: str, payload: dict[str, Any]) -> Any:
             api_key=str(payload["apikey"]),
             task=str(payload["task"]),
             answer=dict(payload["answer"]),
-            timeout_seconds=30,
+            timeout_seconds=REQUEST_TIMEOUT_SECONDS,
         )
     except HttpRequestError as exc:
         raise RuntimeError(json.dumps(exc.to_response_dict(), ensure_ascii=False)) from exc
@@ -146,7 +142,7 @@ def parse_send_order(raw_order: str) -> list[str]:
 
 
 def parse_order_mode(argv: list[str]) -> str:
-    mode = os.getenv("CATEGORIZE_ORDER_MODE", DEFAULT_ORDER_MODE).strip().lower()
+    mode = DEFAULT_ORDER_MODE.strip().lower()
     for index, arg in enumerate(argv):
         if arg == "--order-mode":
             try:
@@ -253,7 +249,7 @@ def estimate_tokens(text: str) -> int:
 
 def reset_budget(api_key: str) -> Any:
     return submit_json(
-        VERIFY_URL,
+        AG3NTS_VERIFY_URL,
         {
             "apikey": api_key,
             "task": TASK_NAME,
@@ -264,7 +260,7 @@ def reset_budget(api_key: str) -> Any:
 
 def submit_prompt(api_key: str, prompt: str) -> Any:
     return submit_json(
-        VERIFY_URL,
+        AG3NTS_VERIFY_URL,
         {
             "apikey": api_key,
             "task": TASK_NAME,
@@ -287,10 +283,7 @@ def main() -> int:
     configure_logging(name="categorize")
     api_key = get_api_key()
     if not api_key:
-        logger.error("Missing CATEGORIZE_API_KEY/AG3NTS_API_KEY/PACKAGES_API_KEY.")
-        return 1
-    if not VERIFY_URL:
-        logger.error("Missing AG3NTS_VERIFY_URL in .env.")
+        logger.error("Missing AG3NTS_API_KEY in .env.")
         return 1
     data_url = build_data_url(api_key)
 
@@ -305,7 +298,7 @@ def main() -> int:
     print_items(items)
     logger.info("Order mode: {}", order_mode)
     logger.info("Send order: {}", " -> ".join(item.item_id for item in items))
-    logger.info("Using verify endpoint: {}", VERIFY_URL)
+    logger.info("Using verify endpoint: {}", AG3NTS_VERIFY_URL)
 
     if "--reset" in sys.argv:
         try:

@@ -14,13 +14,17 @@ REPO_ROOT_HINT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT_HINT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT_HINT))
 
-from devs_utilities.ag3nts import submit_task_answer
+from devs_utilities.ag3nts import (
+    AG3NTS_VERIFY_URL,
+    build_ag3nts_task_data_url,
+    submit_task_answer,
+)
 from devs_utilities.bootstrap import bootstrap_repo
 from devs_utilities.files import write_json
 from devs_utilities.flags import extract_flag
 from devs_utilities.http import HttpRequestError, get_text
 from devs_utilities.logging import configure_logging, logger as shared_logger
-from repo_env import get_env
+from repo_env import get_env, get_int_env
 
 
 REPO_ROOT = bootstrap_repo(__file__)
@@ -28,8 +32,7 @@ logger = shared_logger.bind(component="failure")
 
 
 TASK_NAME = "failure"
-VERIFY_URL = get_env("AG3NTS_VERIFY_URL")
-DATA_BASE_URL = get_env("AG3NTS_DATA_BASE_URL")
+REQUEST_TIMEOUT_SECONDS = get_int_env("FAILURE_TIMEOUT_SECONDS", 60) or 60
 LOG_PATTERN = re.compile(
     r"^\[(?P<timestamp>[^\]]+)\] \[(?P<level>[^\]]+)\] (?P<message>.*)$"
 )
@@ -323,16 +326,14 @@ def get_api_key() -> str:
 
 
 def build_log_url(api_key: str) -> str:
-    if not DATA_BASE_URL:
-        raise ValueError("Missing AG3NTS_DATA_BASE_URL in .env.")
-    return f"{DATA_BASE_URL.rstrip('/')}/{api_key}/{TASK_NAME}.log"
+    return build_ag3nts_task_data_url(api_key, f"{TASK_NAME}.log")
 
 
 def http_get_text(url: str) -> str:
     return get_text(
         url,
         headers={"Accept": "text/plain,*/*;q=0.8"},
-        timeout_seconds=60,
+        timeout_seconds=REQUEST_TIMEOUT_SECONDS,
         errors="strict",
     )
 
@@ -344,7 +345,7 @@ def http_post_json(url: str, payload: dict[str, Any]) -> dict[str, Any]:
             api_key=str(payload["apikey"]),
             task=str(payload["task"]),
             answer=dict(payload["answer"]),
-            timeout_seconds=60,
+            timeout_seconds=REQUEST_TIMEOUT_SECONDS,
         )
     except HttpRequestError as exc:
         raise RuntimeError(json.dumps(exc.to_response_dict(), ensure_ascii=False, indent=2)) from exc
@@ -446,15 +447,12 @@ def main() -> int:
     if not args.verify:
         return 0
 
-    if not VERIFY_URL:
-        raise ValueError("Missing AG3NTS_VERIFY_URL in .env.")
-
     payload = {
         "apikey": api_key,
         "task": TASK_NAME,
         "answer": {"logs": condensed_logs},
     }
-    response = http_post_json(VERIFY_URL, payload)
+    response = http_post_json(AG3NTS_VERIFY_URL, payload)
     write_json(RESPONSE_PATH, response)
     logger.info("Verify response:\n{}", json.dumps(response, ensure_ascii=False, indent=2))
 

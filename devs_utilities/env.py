@@ -57,3 +57,15 @@ def get_optional_env(name: str) -> str | None:
 
     value = get_env(name)
     return value or None
+
+
+def get_int_env(name: str, default: int | None = None) -> int | None:
+    """Read an integer environment variable with an optional default."""
+
+    value = get_optional_env(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer, got: {value}") from exc

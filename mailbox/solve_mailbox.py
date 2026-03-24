@@ -13,7 +13,11 @@ REPO_ROOT_HINT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT_HINT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT_HINT))
 
-from devs_utilities.ag3nts import submit_task_answer
+from devs_utilities.ag3nts import (
+    AG3NTS_VERIFY_URL,
+    AG3NTS_ZMAIL_URL,
+    submit_task_answer,
+)
 from devs_utilities.bootstrap import bootstrap_repo
 from devs_utilities.files import write_json
 from devs_utilities.flags import extract_flag
@@ -25,7 +29,7 @@ from devs_utilities.openrouter import (
     OpenRouterError,
     ToolCall,
 )
-from repo_env import get_env, get_optional_env
+from repo_env import get_env, get_int_env, get_optional_env
 
 
 REPO_ROOT = bootstrap_repo(__file__)
@@ -33,12 +37,20 @@ logger = shared_logger.bind(component="mailbox")
 
 
 TASK_NAME = "mailbox"
-DEFAULT_ZMAIL_URL = "https://example.invalid/api/zmail"
-DEFAULT_MODEL = "openai/gpt-4.1-mini"
-DEFAULT_MAX_STEPS = 24
-DEFAULT_TOOL_PAGE_SIZE = 5
-DEFAULT_WAIT_SECONDS = 5
-MAX_WAIT_SECONDS = 30
+DEFAULT_ZMAIL_URL = AG3NTS_ZMAIL_URL
+DEFAULT_MODEL = get_env("OPENROUTER_MODEL", "openai/gpt-4.1-mini") or "openai/gpt-4.1-mini"
+DEFAULT_API_TIMEOUT_SECONDS = (
+    get_int_env(
+        "MAILBOX_TIMEOUT_SECONDS",
+        get_int_env("AG3NTS_TIMEOUT_SECONDS", 120) or 120,
+    )
+    or 120
+)
+DEFAULT_OPENROUTER_TIMEOUT_SECONDS = get_int_env("OPENROUTER_TIMEOUT_SECONDS", 120) or 120
+DEFAULT_MAX_STEPS = get_int_env("MAILBOX_MAX_STEPS", 24) or 24
+DEFAULT_TOOL_PAGE_SIZE = get_int_env("MAILBOX_TOOL_PAGE_SIZE", 5) or 5
+DEFAULT_WAIT_SECONDS = get_int_env("MAILBOX_WAIT_SECONDS", 5) or 5
+MAX_WAIT_SECONDS = get_int_env("MAILBOX_MAX_WAIT_SECONDS", 30) or 30
 OUTPUT_DIR = Path(__file__).resolve().parent
 LAST_RESPONSE_PATH = OUTPUT_DIR / "last_verify_response.json"
 LAST_ANSWER_PATH = OUTPUT_DIR / "last_answer.json"
@@ -98,7 +110,8 @@ class AppConfig:
     openrouter_api_key: str
     openrouter_url: str
     model: str
-    timeout_seconds: int
+    api_timeout_seconds: int
+    openrouter_timeout_seconds: int
     site_url: str | None
     site_name: str | None
     max_steps: int
@@ -118,8 +131,7 @@ def parse_args() -> argparse.Namespace:
         "--model",
         default=None,
         help=(
-            "OpenRouter model. Defaults to MAILBOX_OPENROUTER_MODEL or "
-            f"{DEFAULT_MODEL}."
+            f"OpenRouter model. Defaults to OPENROUTER_MODEL or {DEFAULT_MODEL}."
         ),
     )
     parser.add_argument(
@@ -143,29 +155,36 @@ def parse_args() -> argparse.Namespace:
 
 def build_config(args: argparse.Namespace) -> AppConfig:
     ag3nts_api_key = get_env("AG3NTS_API_KEY")
-    verify_url = get_env("AG3NTS_VERIFY_URL")
     openrouter_api_key = get_env("OPENROUTER_API_KEY")
     openrouter_url = get_env("OPENROUTER_BASE_URL")
-    model = (args.model or get_env("MAILBOX_OPENROUTER_MODEL") or DEFAULT_MODEL).strip()
-    zmail_url = get_env("AG3NTS_ZMAIL_URL") or DEFAULT_ZMAIL_URL
+    model = (args.model or DEFAULT_MODEL).strip()
+    zmail_url = DEFAULT_ZMAIL_URL
 
-    timeout_raw = get_env("OPENROUTER_TIMEOUT_SECONDS", "120")
+    timeout_raw = get_env("MAILBOX_TIMEOUT_SECONDS") or get_env(
+        "AG3NTS_TIMEOUT_SECONDS",
+        str(DEFAULT_API_TIMEOUT_SECONDS),
+    )
     try:
-        timeout_seconds = max(10, int(timeout_raw))
+        api_timeout_seconds = max(10, int(timeout_raw))
     except ValueError as exc:
-        raise SystemExit(f"OPENROUTER_TIMEOUT_SECONDS must be an integer, got: {timeout_raw}") from exc
+        raise SystemExit(
+            f"MAILBOX_TIMEOUT_SECONDS/AG3NTS_TIMEOUT_SECONDS must be an integer, got: {timeout_raw}"
+        ) from exc
+    try:
+        openrouter_timeout_seconds = max(10, int(DEFAULT_OPENROUTER_TIMEOUT_SECONDS))
+    except ValueError as exc:
+        raise SystemExit(
+            "OPENROUTER_TIMEOUT_SECONDS must be an integer, "
+            f"got: {DEFAULT_OPENROUTER_TIMEOUT_SECONDS}"
+        ) from exc
 
     missing: list[str] = []
     if not ag3nts_api_key:
         missing.append("AG3NTS_API_KEY")
-    if not verify_url:
-        missing.append("AG3NTS_VERIFY_URL")
     if not openrouter_api_key:
         missing.append("OPENROUTER_API_KEY")
     if not openrouter_url:
         missing.append("OPENROUTER_BASE_URL")
-    if not model:
-        missing.append("MAILBOX_OPENROUTER_MODEL")
 
     if missing:
         joined = ", ".join(missing)
@@ -178,12 +197,13 @@ def build_config(args: argparse.Namespace) -> AppConfig:
 
     return AppConfig(
         ag3nts_api_key=ag3nts_api_key,
-        verify_url=verify_url,
+        verify_url=AG3NTS_VERIFY_URL,
         zmail_url=zmail_url,
         openrouter_api_key=openrouter_api_key,
         openrouter_url=openrouter_url,
         model=model,
-        timeout_seconds=timeout_seconds,
+        api_timeout_seconds=api_timeout_seconds,
+        openrouter_timeout_seconds=openrouter_timeout_seconds,
         site_url=site_url,
         site_name=site_name,
         max_steps=args.max_steps,
@@ -226,7 +246,7 @@ class ZmailClient:
             result = post_json(
                 self._config.zmail_url,
                 full_payload,
-                timeout_seconds=self._config.timeout_seconds,
+                timeout_seconds=self._config.api_timeout_seconds,
             )
         except (HttpRequestError, JsonResponseError) as exc:
             raise MailboxError(str(exc)) from exc
@@ -249,7 +269,7 @@ class VerifyClient:
                 api_key=self._config.ag3nts_api_key,
                 task=TASK_NAME,
                 answer=answer,
-                timeout_seconds=self._config.timeout_seconds,
+                timeout_seconds=self._config.api_timeout_seconds,
             )
         except HttpRequestError as exc:
             raise MailboxError(str(exc)) from exc
@@ -539,7 +559,7 @@ def run_agent(
             api_key=config.openrouter_api_key,
             base_url=config.openrouter_url,
             model=config.model,
-            timeout_seconds=config.timeout_seconds,
+            timeout_seconds=config.openrouter_timeout_seconds,
             site_url=config.site_url,
             site_name=config.site_name,
         )

@@ -12,12 +12,16 @@ REPO_ROOT_HINT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT_HINT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT_HINT))
 
-from devs_utilities.ag3nts import submit_task_answer
+from devs_utilities.ag3nts import (
+    AG3NTS_VERIFY_URL,
+    build_ag3nts_task_data_url,
+    submit_task_answer,
+)
 from devs_utilities.bootstrap import bootstrap_repo
 from devs_utilities.flags import extract_flag
 from devs_utilities.http import HttpRequestError, get_bytes
 from devs_utilities.logging import configure_logging, logger as shared_logger
-from repo_env import get_env
+from repo_env import get_env, get_int_env
 
 
 REPO_ROOT = bootstrap_repo(__file__)
@@ -25,18 +29,15 @@ logger = shared_logger.bind(component="electricity")
 
 
 TASK_NAME = "electricity"
-VERIFY_URL = get_env("AG3NTS_VERIFY_URL")
-DATA_BASE_URL = get_env("AG3NTS_DATA_BASE_URL")
+REQUEST_TIMEOUT_SECONDS = get_int_env("AG3NTS_TIMEOUT_SECONDS", 30) or 30
 
-# Sequence derived from the board downloaded on 2026-03-17.
 ROTATION_SEQUENCE = [
-    "1x2",
-    "1x3",
-    "2x1",
-    "2x2",
-    "2x2",
-    "2x2",
-    "3x1",
+    token.strip()
+    for token in get_env(
+        "ELECTRICITY_ROTATION_SEQUENCE",
+        "1x2,1x3,2x1,2x2,2x2,2x2,3x1",
+    ).split(",")
+    if token.strip()
 ]
 
 
@@ -48,20 +49,17 @@ def get_api_key() -> str:
 
 
 def build_board_url(api_key: str, *, reset: bool = False) -> str:
-    if not DATA_BASE_URL:
-        raise ValueError("Missing AG3NTS_DATA_BASE_URL in .env.")
-
-    suffix = f"/{api_key}/{TASK_NAME}.png"
+    suffix = f"{TASK_NAME}.png"
     if reset:
-        suffix += "?reset=1"
-    return f"{DATA_BASE_URL.rstrip('/')}{suffix}"
+        return f"{build_ag3nts_task_data_url(api_key, suffix)}?reset=1"
+    return build_ag3nts_task_data_url(api_key, suffix)
 
 
 def http_get(url: str) -> bytes:
     return get_bytes(
         url,
         headers={"Accept": "image/png,*/*;q=0.8"},
-        timeout_seconds=30,
+        timeout_seconds=REQUEST_TIMEOUT_SECONDS,
     )
 
 
@@ -72,7 +70,7 @@ def http_post_json(url: str, payload: dict[str, object]) -> object:
             api_key=str(payload["apikey"]),
             task=str(payload["task"]),
             answer=dict(payload["answer"]),
-            timeout_seconds=30,
+            timeout_seconds=REQUEST_TIMEOUT_SECONDS,
         )
     except HttpRequestError as exc:
         raise RuntimeError(json.dumps(exc.to_response_dict(), ensure_ascii=False)) from exc
@@ -84,7 +82,7 @@ def reset_board(api_key: str) -> None:
 
 def rotate_once(api_key: str, position: str) -> Any:
     return http_post_json(
-        VERIFY_URL,
+        AG3NTS_VERIFY_URL,
         {
             "apikey": api_key,
             "task": TASK_NAME,
@@ -117,9 +115,6 @@ def main() -> int:
 
     if args.dry_run:
         return 0
-
-    if not VERIFY_URL:
-        raise ValueError("Missing AG3NTS_VERIFY_URL in .env.")
 
     if args.reset:
         logger.info("Resetting board...")

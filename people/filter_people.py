@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import os
 import sys
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -15,12 +14,12 @@ REPO_ROOT_HINT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT_HINT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT_HINT))
 
-from devs_utilities.ag3nts import submit_task_answer
+from devs_utilities.ag3nts import AG3NTS_VERIFY_URL, submit_task_answer
 from devs_utilities.bootstrap import bootstrap_repo
 from devs_utilities.files import resolve_path, write_json
 from devs_utilities.logging import configure_logging, logger as shared_logger
 from devs_utilities.openrouter import OpenRouterClient, OpenRouterConfig, extract_completion_result
-from repo_env import get_env, get_optional_env
+from repo_env import get_env, get_int_env, get_optional_env
 
 
 REPO_ROOT = bootstrap_repo(__file__)
@@ -28,9 +27,12 @@ logger = shared_logger.bind(component="people.filter")
 
 
 OPENROUTER_API_URL = get_env("OPENROUTER_BASE_URL")
-VERIFY_URL = get_env("AG3NTS_VERIFY_URL")
 TASK_NAME = "people"
-TODAY = date(2026, 3, 10)
+REFERENCE_DATE = date.fromisoformat(get_env("PEOPLE_REFERENCE_DATE", "2026-03-10"))
+DEFAULT_OPENROUTER_MODEL = get_env("OPENROUTER_MODEL", "openai/gpt-4.1-mini") or "openai/gpt-4.1-mini"
+DEFAULT_BATCH_SIZE = get_int_env("PEOPLE_BATCH_SIZE", 25) or 25
+API_TIMEOUT_SECONDS = get_int_env("PEOPLE_TIMEOUT_SECONDS", 120) or 120
+OPENROUTER_TIMEOUT_SECONDS = get_int_env("OPENROUTER_TIMEOUT_SECONDS", 120) or 120
 ALLOWED_TAGS = [
     "IT",
     "transport",
@@ -124,7 +126,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--verify",
         action="store_true",
-        help="Wyślij wynik na endpoint z AG3NTS_VERIFY_URL.",
+        help="Wyślij wynik na wbudowany endpoint /verify.",
     )
     parser.add_argument(
         "--dry-run",
@@ -140,19 +142,17 @@ def load_config(path: Path, args: argparse.Namespace) -> AppConfig:
         payload = json.loads(path.read_text(encoding="utf-8"))
 
     hub_api_key = str(
-        payload.get("hub_api_key") or os.environ.get("AG3NTS_API_KEY") or ""
+        payload.get("hub_api_key") or get_env("AG3NTS_API_KEY") or ""
     ).strip()
     openrouter_api_key = str(
         payload.get("openrouter_api_key")
-        or os.environ.get("OPENROUTER_API_KEY")
+        or get_env("OPENROUTER_API_KEY")
         or ""
     ).strip()
-    openrouter_model = str(
-        payload.get("openrouter_model") or get_env("OPENROUTER_MODEL", "openai/gpt-4.1-mini")
-    ).strip()
+    openrouter_model = str(payload.get("openrouter_model") or DEFAULT_OPENROUTER_MODEL).strip()
     site_url = str(payload.get("site_url") or get_optional_env("OPENROUTER_SITE_URL") or "").strip() or None
     site_name = str(payload.get("site_name") or get_optional_env("OPENROUTER_SITE_NAME") or "").strip() or None
-    batch_size = int(payload.get("batch_size") or 25)
+    batch_size = int(payload.get("batch_size") or DEFAULT_BATCH_SIZE)
 
     if args.model:
         openrouter_model = args.model
@@ -199,7 +199,7 @@ def read_people(csv_path: Path) -> list[Person]:
 def filter_candidates(people: list[Person]) -> list[Person]:
     filtered: list[Person] = []
     for person in people:
-        age = person.age_on(TODAY)
+        age = person.age_on(REFERENCE_DATE)
         if person.gender != "M":
             continue
         if not 20 <= age <= 40:
@@ -359,8 +359,8 @@ def build_verify_payload(answer: list[dict[str, Any]], hub_api_key: str) -> dict
 
 def main() -> None:
     configure_logging(name="people.filter")
-    if not OPENROUTER_API_URL or not VERIFY_URL:
-        raise ValueError("Missing OPENROUTER_BASE_URL or AG3NTS_VERIFY_URL in .env.")
+    if not OPENROUTER_API_URL:
+        raise ValueError("Missing OPENROUTER_BASE_URL in .env.")
     args = parse_args()
     config_path = resolve_path(args.config, REPO_ROOT / "people")
     csv_path = resolve_path(args.csv, REPO_ROOT / "people")
@@ -372,7 +372,7 @@ def main() -> None:
             api_key=config.openrouter_api_key,
             base_url=OPENROUTER_API_URL,
             model=config.openrouter_model,
-            timeout_seconds=120,
+            timeout_seconds=OPENROUTER_TIMEOUT_SECONDS,
             site_url=config.site_url,
             site_name=config.site_name,
         )
@@ -380,14 +380,14 @@ def main() -> None:
 
     if args.dry_run:
         preview = {
-            "today": TODAY.isoformat(),
+            "today": REFERENCE_DATE.isoformat(),
             "candidate_count": len(candidates),
             "candidates": [
                 {
                     "row_id": person.row_id,
                     "name": person.name,
                     "surname": person.surname,
-                    "age": person.age_on(TODAY),
+                    "age": person.age_on(REFERENCE_DATE),
                     "born": person.birth_year,
                     "city": person.birth_place,
                     "job": person.job,
@@ -407,11 +407,11 @@ def main() -> None:
 
     if args.verify:
         verify_response = submit_task_answer(
-            VERIFY_URL,
+            AG3NTS_VERIFY_URL,
             api_key=config.hub_api_key,
             task=TASK_NAME,
             answer=answer,
-            timeout_seconds=120,
+            timeout_seconds=API_TIMEOUT_SECONDS,
         )
         logger.info(
             "Verify response:\n{}",

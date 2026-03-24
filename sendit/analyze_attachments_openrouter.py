@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import base64
 import mimetypes
-import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,7 +18,7 @@ from devs_utilities.bootstrap import bootstrap_repo
 from devs_utilities.files import read_text_with_fallback, resolve_path, write_json
 from devs_utilities.logging import configure_logging, logger as shared_logger
 from devs_utilities.openrouter import OpenRouterClient, OpenRouterConfig, extract_completion_result
-from repo_env import get_env, get_optional_env
+from repo_env import get_env, get_int_env, get_optional_env
 
 
 REPO_ROOT = bootstrap_repo(__file__)
@@ -27,7 +26,14 @@ logger = shared_logger.bind(component="sendit.analyze")
 
 
 OPENROUTER_URL = get_env("OPENROUTER_BASE_URL")
-DEFAULT_MODEL = "openai/gpt-4.1-mini"
+DEFAULT_MODEL = get_env("OPENROUTER_MODEL", "openai/gpt-4.1-mini") or "openai/gpt-4.1-mini"
+DEFAULT_MAX_TEXT_CHARS = get_int_env("SENDIT_ANALYZE_MAX_TEXT_CHARS", 24_000) or 24_000
+OPENROUTER_TIMEOUT_SECONDS = get_int_env("OPENROUTER_TIMEOUT_SECONDS", 120) or 120
+DEFAULT_SITE_NAME = (
+    get_optional_env("OPENROUTER_SITE_NAME")
+    or get_optional_env("OPENROUTER_APP_TITLE")
+    or "sendit-local-analyzer"
+)
 TEXT_EXTENSIONS = {".md", ".txt", ".csv", ".json", ".yaml", ".yml"}
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
 
@@ -85,7 +91,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-text-chars",
         type=int,
-        default=24_000,
+        default=DEFAULT_MAX_TEXT_CHARS,
         help="Maksymalna liczba znakow czytanych z jednego pliku tekstowego.",
     )
     parser.add_argument(
@@ -95,7 +101,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--site-name",
-        default=get_env("OPENROUTER_SITE_NAME", "sendit-local-analyzer"),
+        default=DEFAULT_SITE_NAME,
         help="Opcjonalny naglowek X-Title dla OpenRouter.",
     )
     return parser.parse_args()
@@ -198,13 +204,13 @@ def main() -> int:
     base_dir = Path.cwd()
     input_dir = resolve_path(args.input_dir, base_dir)
     output_dir = resolve_path(args.output_dir, base_dir)
-    project_root = base_dir.parent
+    project_root = REPO_ROOT
 
     if not input_dir.exists():
         logger.error("Brak katalogu wejsciowego: {}", input_dir)
         return 1
 
-    api_key = (os.environ.get("OPENROUTER_API_KEY") or "").strip() or None
+    api_key = get_env("OPENROUTER_API_KEY") or None
 
     if not api_key:
         logger.error(
@@ -219,7 +225,7 @@ def main() -> int:
             api_key=api_key,
             base_url=OPENROUTER_URL,
             model=args.model,
-            timeout_seconds=120,
+            timeout_seconds=OPENROUTER_TIMEOUT_SECONDS,
             site_url=args.site_url,
             site_name=args.site_name,
         )

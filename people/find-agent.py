@@ -6,26 +6,30 @@ import argparse
 import csv
 import json
 import math
-import os
 import sys
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib import parse
 
 REPO_ROOT_HINT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT_HINT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT_HINT))
 
-from devs_utilities.ag3nts import submit_task_answer
+from devs_utilities.ag3nts import (
+    AG3NTS_ACCESS_LEVEL_URL,
+    AG3NTS_LOCATION_URL,
+    AG3NTS_VERIFY_URL,
+    build_ag3nts_task_data_url,
+    submit_task_answer,
+)
 from devs_utilities.bootstrap import bootstrap_repo
 from devs_utilities.files import resolve_path, write_json
 from devs_utilities.http import get_json as http_get_json
 from devs_utilities.http import post_json as http_post_json
 from devs_utilities.logging import configure_logging, logger as shared_logger
 from devs_utilities.openrouter import OpenRouterClient, OpenRouterConfig, extract_completion_result
-from repo_env import get_env, get_optional_env
+from repo_env import get_env, get_int_env, get_optional_env
 
 
 REPO_ROOT = bootstrap_repo(__file__)
@@ -33,11 +37,10 @@ logger = shared_logger.bind(component="people.find")
 
 
 OPENROUTER_API_URL = get_env("OPENROUTER_BASE_URL")
-HUB_VERIFY_URL = get_env("AG3NTS_VERIFY_URL")
-HUB_LOCATION_URL = get_env("AG3NTS_LOCATION_URL")
-HUB_ACCESS_URL = get_env("AG3NTS_ACCESS_URL")
-AG3NTS_DATA_BASE_URL = get_env("AG3NTS_DATA_BASE_URL")
 TASK_NAME = "findhim"
+DEFAULT_OPENROUTER_MODEL = get_env("OPENROUTER_MODEL", "openai/gpt-4.1-mini") or "openai/gpt-4.1-mini"
+API_TIMEOUT_SECONDS = get_int_env("PEOPLE_TIMEOUT_SECONDS", 120) or 120
+OPENROUTER_TIMEOUT_SECONDS = get_int_env("OPENROUTER_TIMEOUT_SECONDS", 120) or 120
 DEFAULT_PLANTS_PATH = "findhim_locations.json"
 DEFAULT_SUSPECTS_PATH = "people_result.json"
 DEFAULT_OUTPUT_PATH = "findhim_result.json"
@@ -119,7 +122,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--verify",
         action="store_true",
-        help="Wyślij wynik na endpoint z AG3NTS_VERIFY_URL.",
+        help="Wyślij wynik na wbudowany endpoint /verify.",
     )
     parser.add_argument(
         "--refresh-plants",
@@ -140,16 +143,14 @@ def load_config(path: Path, args: argparse.Namespace) -> AppConfig:
         payload = json.loads(path.read_text(encoding="utf-8"))
 
     hub_api_key = str(
-        payload.get("hub_api_key") or os.environ.get("AG3NTS_API_KEY") or ""
+        payload.get("hub_api_key") or get_env("AG3NTS_API_KEY") or ""
     ).strip()
     openrouter_api_key = str(
         payload.get("openrouter_api_key")
-        or os.environ.get("OPENROUTER_API_KEY")
+        or get_env("OPENROUTER_API_KEY")
         or ""
     ).strip()
-    openrouter_model = str(
-        payload.get("openrouter_model") or get_env("OPENROUTER_MODEL", "openai/gpt-4.1-mini")
-    ).strip()
+    openrouter_model = str(payload.get("openrouter_model") or DEFAULT_OPENROUTER_MODEL).strip()
     site_url = (
         str(payload.get("site_url") or get_optional_env("OPENROUTER_SITE_URL") or "").strip()
         or None
@@ -206,13 +207,8 @@ def load_suspects(path: Path, birth_years: dict[tuple[str, str], int]) -> list[S
 def fetch_power_plants(config: AppConfig, path: Path, refresh: bool) -> dict[str, Any]:
     if path.exists() and not refresh:
         return json.loads(path.read_text(encoding="utf-8"))
-    if not AG3NTS_DATA_BASE_URL:
-        raise RuntimeError("Missing AG3NTS_DATA_BASE_URL in .env.")
-    url = (
-        f"{AG3NTS_DATA_BASE_URL.rstrip('/')}/"
-        f"{parse.quote(config.hub_api_key)}/findhim_locations.json"
-    )
-    payload = http_get_json(url, timeout_seconds=120)
+    url = build_ag3nts_task_data_url(config.hub_api_key, "findhim_locations.json")
+    payload = http_get_json(url, timeout_seconds=API_TIMEOUT_SECONDS)
     write_json(path, payload)
     return payload
 
@@ -329,9 +325,9 @@ def fetch_person_locations(config: AppConfig, suspect: Suspect) -> list[Coordina
         "surname": suspect.surname,
     }
     response = http_post_json(
-        HUB_LOCATION_URL,
+        AG3NTS_LOCATION_URL,
         payload,
-        timeout_seconds=120,
+        timeout_seconds=API_TIMEOUT_SECONDS,
     )
     if isinstance(response, dict):
         raw_locations = (
@@ -365,9 +361,9 @@ def fetch_access_level(config: AppConfig, suspect: Suspect) -> int:
         "birthYear": suspect.birth_year,
     }
     response = http_post_json(
-        HUB_ACCESS_URL,
+        AG3NTS_ACCESS_LEVEL_URL,
         payload,
-        timeout_seconds=120,
+        timeout_seconds=API_TIMEOUT_SECONDS,
     )
     access_level = response.get("accessLevel") if isinstance(response, dict) else None
     if access_level is None:
@@ -429,16 +425,8 @@ def build_verify_payload(match: CandidateMatch, config: AppConfig) -> dict[str, 
 
 def main() -> None:
     configure_logging(name="people.find")
-    required_urls = (
-        OPENROUTER_API_URL,
-        HUB_VERIFY_URL,
-        HUB_LOCATION_URL,
-        HUB_ACCESS_URL,
-    )
-    if not all(required_urls):
-        raise ValueError(
-            "Missing OPENROUTER_BASE_URL or AG3NTS_* URLs in .env."
-        )
+    if not OPENROUTER_API_URL:
+        raise ValueError("Missing OPENROUTER_BASE_URL in .env.")
     args = parse_args()
     people_dir = REPO_ROOT / "people"
     config = load_config(resolve_path(args.config, people_dir), args)
@@ -454,7 +442,7 @@ def main() -> None:
             api_key=config.openrouter_api_key,
             base_url=OPENROUTER_API_URL,
             model=config.openrouter_model,
-            timeout_seconds=120,
+            timeout_seconds=OPENROUTER_TIMEOUT_SECONDS,
             site_url=config.site_url,
             site_name=config.site_name,
         )
@@ -480,11 +468,11 @@ def main() -> None:
 
     if args.verify and not args.dry_run:
         response = submit_task_answer(
-            HUB_VERIFY_URL,
+            AG3NTS_VERIFY_URL,
             api_key=config.hub_api_key,
             task=TASK_NAME,
             answer=payload["answer"],
-            timeout_seconds=120,
+            timeout_seconds=API_TIMEOUT_SECONDS,
         )
         logger.info("Verify response:\n{}", json.dumps(response, ensure_ascii=False, indent=2))
 

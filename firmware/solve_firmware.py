@@ -1,4 +1,4 @@
-"""Solve the AG3NTS firmware task through the restricted shell API."""
+"""Solve the AG3NTS firmware task with an OpenRouter tool-calling agent."""
 
 from __future__ import annotations
 
@@ -15,13 +15,23 @@ REPO_ROOT_HINT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT_HINT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT_HINT))
 
-from devs_utilities.ag3nts import submit_task_answer
+from devs_utilities.ag3nts import (
+    AG3NTS_SHELL_URL,
+    AG3NTS_VERIFY_URL,
+    submit_task_answer,
+)
 from devs_utilities.bootstrap import bootstrap_repo
 from devs_utilities.files import write_json
 from devs_utilities.flags import extract_flag
 from devs_utilities.http import HttpRequestError, JsonResponseError, post_json
 from devs_utilities.logging import configure_logging, logger as shared_logger
-from repo_env import get_env, get_optional_env
+from devs_utilities.openrouter import (
+    OpenRouterClient,
+    OpenRouterConfig,
+    OpenRouterError,
+    ToolCall,
+)
+from repo_env import get_env, get_int_env, get_optional_env
 
 
 REPO_ROOT = bootstrap_repo(__file__)
@@ -29,33 +39,30 @@ logger = shared_logger.bind(component="firmware")
 
 
 TASK_NAME = "firmware"
-DEFAULT_SHELL_URL = "https://example.invalid/api/shell"
-DEFAULT_TIMEOUT_SECONDS = 30
+DEFAULT_SHELL_URL = AG3NTS_SHELL_URL
+DEFAULT_MODEL = get_env("OPENROUTER_MODEL", "nvidia/nemotron-3-super-120b-a12b:free")
+DEFAULT_API_TIMEOUT_SECONDS = (
+    get_int_env(
+        "FIRMWARE_TIMEOUT_SECONDS",
+        get_int_env("AG3NTS_TIMEOUT_SECONDS", 30) or 30,
+    )
+    or 30
+)
+DEFAULT_OPENROUTER_TIMEOUT_SECONDS = get_int_env("OPENROUTER_TIMEOUT_SECONDS", 120) or 120
+DEFAULT_MAX_STEPS = get_int_env("FIRMWARE_MAX_STEPS", 18) or 18
 
 COOLER_DIR = "/opt/firmware/cooler"
 COOLER_BIN = f"{COOLER_DIR}/cooler.bin"
-SETTINGS_PATH = f"{COOLER_DIR}/settings.ini"
-LOCK_PATH = f"{COOLER_DIR}/cooler-is-blocked.lock"
-PASSWORD_NOTE_PATH = "/home/operator/notes/pass.txt"
+COOLER_GITIGNORE_PATH = f"{COOLER_DIR}/.gitignore"
 
 OUTPUT_DIR = Path(__file__).resolve().parent
 LAST_ANSWER_PATH = OUTPUT_DIR / "last_answer.json"
 LAST_SESSION_PATH = OUTPUT_DIR / "last_session.json"
+LAST_TRANSCRIPT_PATH = OUTPUT_DIR / "last_transcript.json"
 LAST_VERIFY_RESPONSE_PATH = OUTPUT_DIR / "last_verify_response.json"
 TOOL_MANIFEST_PATH = OUTPUT_DIR / "shell_tools.json"
 
 CONFIRMATION_PATTERN = re.compile(r"(ECCS-[a-f0-9]{40})", re.IGNORECASE)
-PASSWORD_ATTEMPT_PATTERN = re.compile(
-    rf"{re.escape(COOLER_BIN)}\s+([A-Za-z0-9._-]+)"
-)
-
-RESTRICTED_PATH_PREFIXES = ("/etc", "/root", "/proc")
-RESTRICTED_REMOTE_PATHS = {
-    f"{COOLER_DIR}/.env",
-    f"{COOLER_DIR}/storage.cfg",
-    f"{COOLER_DIR}/logs",
-}
-
 EXPECTED_COMMAND_PREFIXES = (
     "help",
     "ls",
@@ -71,6 +78,8 @@ EXPECTED_COMMAND_PREFIXES = (
     "history",
     "whoami",
 )
+FORBIDDEN_OPERATOR_SNIPPETS = (";", "|", "&&", "||", "$(", "`")
+RESTRICTED_SYSTEM_PREFIXES = ("/etc", "/root", "/proc")
 
 
 class FirmwareError(RuntimeError):
@@ -85,7 +94,6 @@ class ShellBanError(FirmwareError):
     reason: str
     seconds_left: int
     reboot_requested: bool
-    code: int
 
     def __str__(self) -> str:
         return (
@@ -96,32 +104,40 @@ class ShellBanError(FirmwareError):
 
 @dataclass(frozen=True, slots=True)
 class ShellCommandRecord:
-    """A single shell command and its parsed response."""
+    """One remote shell command with its parsed response."""
 
     command: str
     response: Any
 
 
+@dataclass(slots=True)
+class AgentState:
+    """Mutable state shared across tool calls."""
+
+    final_flag: str | None = None
+    final_response: Any = None
+    last_confirmation: str | None = None
+
+
 @dataclass(frozen=True, slots=True)
 class AppConfig:
-    """Runtime settings for the firmware solver."""
+    """Runtime configuration for the firmware agent."""
 
     api_key: str
     verify_url: str
     shell_url: str
-    timeout_seconds: int
-    reboot_first: bool
-    password_override: str | None
+    openrouter_api_key: str
+    openrouter_url: str
+    model: str
+    api_timeout_seconds: int
+    openrouter_timeout_seconds: int
+    site_url: str | None
+    site_name: str | None
     verify: bool
-
-
-@dataclass(frozen=True, slots=True)
-class RunResult:
-    """Successful firmware run details."""
-
-    password: str
-    confirmation: str
-    launch_output: str
+    reboot_first: bool
+    max_steps: int
+    show_tool_results: bool
+    password_hint: str | None
 
 
 def parse_args() -> argparse.Namespace:
@@ -132,103 +148,159 @@ def parse_args() -> argparse.Namespace:
         help="Submit the recovered confirmation code to /verify.",
     )
     parser.add_argument(
-        "--password",
-        default=None,
-        help="Optional password override for cooler.bin.",
-    )
-    parser.add_argument(
         "--skip-reboot",
         action="store_true",
-        help="Do not reboot the virtual filesystem before solving.",
+        help="Do not reboot the virtual filesystem before starting the agent.",
+    )
+    parser.add_argument(
+        "--model",
+        default=None,
+        help=(
+            f"OpenRouter model override. Defaults to OPENROUTER_MODEL or {DEFAULT_MODEL}."
+        ),
+    )
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=DEFAULT_MAX_STEPS,
+        help=f"Maximum OpenRouter tool-calling rounds. Default: {DEFAULT_MAX_STEPS}.",
+    )
+    parser.add_argument(
+        "--show-tool-results",
+        action="store_true",
+        help="Print each OpenRouter tool call and tool result.",
+    )
+    parser.add_argument(
+        "--password-hint",
+        default=None,
+        help="Optional hint to include in the agent prompt.",
+    )
+    parser.add_argument(
+        "--transcript-path",
+        default=str(LAST_TRANSCRIPT_PATH),
+        help="Where to save the OpenRouter message transcript.",
     )
     return parser.parse_args()
 
 
 def build_config(args: argparse.Namespace) -> AppConfig:
     api_key = get_env("AG3NTS_API_KEY")
-    verify_url = get_env("AG3NTS_VERIFY_URL")
-    shell_url = get_optional_env("AG3NTS_SHELL_URL") or DEFAULT_SHELL_URL
-    timeout_raw = get_optional_env("AG3NTS_TIMEOUT_SECONDS") or str(
-        DEFAULT_TIMEOUT_SECONDS
-    )
+    shell_url = DEFAULT_SHELL_URL
+    openrouter_api_key = get_env("OPENROUTER_API_KEY")
+    openrouter_url = get_env("OPENROUTER_BASE_URL")
+    model = (args.model or DEFAULT_MODEL).strip()
 
+    api_timeout_raw = (
+        get_optional_env("FIRMWARE_TIMEOUT_SECONDS")
+        or get_optional_env("AG3NTS_TIMEOUT_SECONDS")
+        or str(DEFAULT_API_TIMEOUT_SECONDS)
+    )
     try:
-        timeout_seconds = max(5, int(timeout_raw))
+        api_timeout_seconds = max(10, int(api_timeout_raw))
     except ValueError as exc:
         raise SystemExit(
-            f"AG3NTS_TIMEOUT_SECONDS must be an integer, got: {timeout_raw}"
+            "FIRMWARE_TIMEOUT_SECONDS/AG3NTS_TIMEOUT_SECONDS must be an integer, "
+            f"got: {api_timeout_raw}"
+        ) from exc
+    try:
+        openrouter_timeout_seconds = max(10, int(DEFAULT_OPENROUTER_TIMEOUT_SECONDS))
+    except ValueError as exc:
+        raise SystemExit(
+            "OPENROUTER_TIMEOUT_SECONDS must be an integer, "
+            f"got: {DEFAULT_OPENROUTER_TIMEOUT_SECONDS}"
         ) from exc
 
     missing: list[str] = []
     if not api_key:
         missing.append("AG3NTS_API_KEY")
-    if not verify_url:
-        missing.append("AG3NTS_VERIFY_URL")
-    if not shell_url:
-        missing.append("AG3NTS_SHELL_URL")
+    if not openrouter_api_key:
+        missing.append("OPENROUTER_API_KEY")
+    if not openrouter_url:
+        missing.append("OPENROUTER_BASE_URL")
+    if not model:
+        missing.append("OPENROUTER_MODEL")
+    if args.max_steps < 1:
+        raise SystemExit("--max-steps must be a positive integer.")
 
     if missing:
         raise SystemExit(f"Missing required settings: {', '.join(missing)}")
 
-    password_override = args.password.strip() if args.password else None
-    if password_override == "":
-        password_override = None
+    site_url = get_optional_env("OPENROUTER_SITE_URL") or get_optional_env(
+        "OPENROUTER_APP_URL"
+    )
+    site_name = get_optional_env("OPENROUTER_SITE_NAME") or get_optional_env(
+        "OPENROUTER_APP_TITLE"
+    )
+    password_hint = args.password_hint.strip() if args.password_hint else None
+    if password_hint == "":
+        password_hint = None
 
     return AppConfig(
         api_key=api_key,
-        verify_url=verify_url,
+        verify_url=AG3NTS_VERIFY_URL,
         shell_url=shell_url,
-        timeout_seconds=timeout_seconds,
-        reboot_first=not args.skip_reboot,
-        password_override=password_override,
+        openrouter_api_key=openrouter_api_key,
+        openrouter_url=openrouter_url,
+        model=model,
+        api_timeout_seconds=api_timeout_seconds,
+        openrouter_timeout_seconds=openrouter_timeout_seconds,
+        site_url=site_url,
+        site_name=site_name,
         verify=args.verify,
+        reboot_first=not args.skip_reboot,
+        max_steps=args.max_steps,
+        show_tool_results=args.show_tool_results,
+        password_hint=password_hint,
     )
 
 
-def build_tool_manifest(help_lines: list[str]) -> dict[str, Any]:
-    """Convert help output into a compact tool manifest for agent use."""
-
-    tools: list[dict[str, str]] = []
-    for raw_line in help_lines:
-        if not isinstance(raw_line, str) or " - " not in raw_line:
-            continue
-        command_spec, description = raw_line.split(" - ", 1)
-        command_name = command_spec.split(" ", 1)[0]
-        tools.append(
-            {
-                "tool_name": f"shell_{command_name}",
-                "remote_command": command_spec,
-                "description": description.strip(),
-            }
-        )
-    return {"count": len(tools), "tools": tools}
-
-
 class ShellClient:
-    """Thin wrapper around the firmware shell API with safety rails."""
+    """Safe wrapper around the firmware shell API."""
 
     def __init__(self, config: AppConfig) -> None:
         self._config = config
         self._history: list[ShellCommandRecord] = []
+        self._restricted_exact_paths = {
+            f"{COOLER_DIR}/.env",
+            f"{COOLER_DIR}/storage.cfg",
+        }
+        self._restricted_prefix_paths = set(RESTRICTED_SYSTEM_PREFIXES)
+        self._allowed_commands = set(EXPECTED_COMMAND_PREFIXES) | {COOLER_BIN}
 
     @property
     def history(self) -> list[ShellCommandRecord]:
         return list(self._history)
 
+    def add_gitignore_entries(self, entries: list[str]) -> None:
+        for entry in entries:
+            normalized = entry.strip()
+            if not normalized:
+                continue
+            if normalized.endswith("/"):
+                self._restricted_prefix_paths.add(
+                    f"{COOLER_DIR}/{normalized.rstrip('/')}"
+                )
+            else:
+                self._restricted_exact_paths.add(f"{COOLER_DIR}/{normalized}")
+
     def execute(self, command: str) -> dict[str, Any]:
-        self._ensure_safe_command(command)
-        payload = {"apikey": self._config.api_key, "cmd": command}
+        normalized_command = command.strip()
+        self._ensure_safe_command(normalized_command)
+        payload = {"apikey": self._config.api_key, "cmd": normalized_command}
+
         try:
             response = post_json(
                 self._config.shell_url,
                 payload,
-                timeout_seconds=self._config.timeout_seconds,
+                timeout_seconds=self._config.api_timeout_seconds,
             )
         except HttpRequestError as exc:
             parsed = exc.body_as_json()
             if isinstance(parsed, dict) and isinstance(parsed.get("code"), int):
-                self._history.append(ShellCommandRecord(command=command, response=parsed))
-                raise self._to_ban_error(command, parsed) from exc
+                self._history.append(
+                    ShellCommandRecord(command=normalized_command, response=parsed)
+                )
+                raise self._to_ban_error(normalized_command, parsed) from exc
             raise FirmwareError(str(exc)) from exc
         except JsonResponseError as exc:
             raise FirmwareError(
@@ -238,7 +310,9 @@ class ShellClient:
         if not isinstance(response, dict):
             raise FirmwareError("Shell API returned a non-object response.")
 
-        self._history.append(ShellCommandRecord(command=command, response=response))
+        self._history.append(
+            ShellCommandRecord(command=normalized_command, response=response)
+        )
         return response
 
     def help(self) -> list[str]:
@@ -251,20 +325,6 @@ class ShellClient:
     def reboot(self) -> dict[str, Any]:
         return self.execute("reboot")
 
-    def history_entries(self) -> list[str]:
-        response = self.execute("history")
-        data = response.get("data")
-        if not isinstance(data, list) or not all(isinstance(item, str) for item in data):
-            raise FirmwareError("Unexpected history payload from shell API.")
-        return data
-
-    def list_dir(self, path: str) -> list[str]:
-        response = self.execute(f"ls {path}")
-        data = response.get("data")
-        if not isinstance(data, list) or not all(isinstance(item, str) for item in data):
-            raise FirmwareError(f"Unexpected directory listing payload for {path}.")
-        return data
-
     def read_text(self, path: str) -> str:
         response = self.execute(f"cat {path}")
         data = response.get("data")
@@ -272,29 +332,23 @@ class ShellClient:
             raise FirmwareError(f"Unexpected file payload for {path}.")
         return data
 
-    def edit_line(self, path: str, line_number: int, content: str) -> dict[str, Any]:
-        if line_number < 1:
-            raise FirmwareError("edit_line requires a positive line number.")
-        return self.execute(f"editline {path} {line_number} {content}")
-
-    def remove_file(self, path: str) -> dict[str, Any]:
-        return self.execute(f"rm {path}")
-
-    def run_binary(self, password: str) -> str:
-        response = self.execute(f"{COOLER_BIN} {password}")
-        data = response.get("data")
-        if not isinstance(data, str):
-            raise FirmwareError("Unexpected executable output payload.")
-        return data
-
     def _ensure_safe_command(self, command: str) -> None:
-        parts = command.split()
-        if not parts:
+        if not command:
             raise FirmwareError("Refusing to execute an empty remote command.")
+        if any(snippet in command for snippet in FORBIDDEN_OPERATOR_SNIPPETS):
+            raise FirmwareError(
+                "Refusing to execute a command containing shell control operators."
+            )
 
+        parts = command.split()
         command_name = parts[0]
+        if command_name not in self._allowed_commands:
+            raise FirmwareError(f"Unsupported remote command: {command_name}")
+
         target_path: str | None = None
-        if command_name in {"ls", "cat", "cd", "rm"} and len(parts) >= 2:
+        if command_name == COOLER_BIN:
+            target_path = command_name
+        elif command_name in {"ls", "cat", "cd", "rm"} and len(parts) >= 2:
             target_path = parts[1]
         elif command_name == "editline" and len(parts) >= 2:
             target_path = parts[1]
@@ -304,11 +358,11 @@ class ShellClient:
 
     def _is_restricted_path(self, path: str) -> bool:
         normalized = path.rstrip("/") or "/"
-        if normalized in RESTRICTED_REMOTE_PATHS:
+        if normalized in self._restricted_exact_paths:
             return True
         return any(
             normalized == prefix or normalized.startswith(f"{prefix}/")
-            for prefix in RESTRICTED_PATH_PREFIXES
+            for prefix in self._restricted_prefix_paths
         )
 
     def _to_ban_error(self, command: str, payload: dict[str, Any]) -> ShellBanError:
@@ -324,20 +378,33 @@ class ShellClient:
             reason=str(ban_payload.get("reason") or payload.get("message") or "ban"),
             seconds_left=max(0, seconds_left),
             reboot_requested=bool(payload.get("reboot")),
-            code=int(payload.get("code", -1)),
         )
 
 
-def handle_shell_ban(error: ShellBanError, shell: ShellClient) -> None:
-    """Sleep out an existing ban, then reboot to reset the VM state."""
+class VerifyClient:
+    """Submission helper for the AG3NTS verify endpoint."""
 
-    logger.warning("Shell ban encountered: {}", error)
-    wait_seconds = max(1, error.seconds_left + 1)
-    logger.info("Waiting {}s for the ban to expire.", wait_seconds)
-    time.sleep(wait_seconds)
-    if error.reboot_requested:
-        logger.info("Rebooting the virtual filesystem after the ban.")
-        shell.reboot()
+    def __init__(self, config: AppConfig) -> None:
+        self._config = config
+
+    def submit_confirmation(self, confirmation: str) -> Any:
+        return submit_task_answer(
+            self._config.verify_url,
+            api_key=self._config.api_key,
+            task=TASK_NAME,
+            answer={"confirmation": confirmation},
+            timeout_seconds=self._config.api_timeout_seconds,
+        )
+
+
+def parse_gitignore_entries(text: str) -> list[str]:
+    entries: list[str] = []
+    for raw_line in text.splitlines():
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        entries.append(stripped)
+    return entries
 
 
 def ensure_expected_help(help_lines: list[str]) -> None:
@@ -352,252 +419,510 @@ def ensure_expected_help(help_lines: list[str]) -> None:
         )
 
 
-def parse_settings_lines(settings_text: str) -> dict[tuple[str, str], int]:
-    """Map `(section, key)` to 1-based line numbers in settings.ini."""
-
-    line_map: dict[tuple[str, str], int] = {}
-    current_section = ""
-    for line_number, raw_line in enumerate(settings_text.splitlines(), start=1):
-        stripped = raw_line.strip()
-        if stripped.startswith("[") and stripped.endswith("]"):
-            current_section = stripped[1:-1].strip()
-            continue
-        if "=" not in stripped:
-            continue
-        key = stripped.split("=", 1)[0].lstrip("#").strip()
-        line_map[(current_section, key)] = line_number
-    return line_map
-
-
-def ensure_correct_settings(shell: ShellClient) -> dict[str, Any]:
-    """Fix the known bad settings in cooler/settings.ini."""
-
-    settings_text = shell.read_text(SETTINGS_PATH)
-    current_lines = settings_text.splitlines()
-    line_map = parse_settings_lines(settings_text)
-
-    desired_lines: dict[tuple[str, str], str] = {
-        ("main", "SAFETY_CHECK"): "SAFETY_CHECK=pass",
-        ("test_mode", "enabled"): "enabled=false",
-        ("cooling", "enabled"): "enabled=true",
-    }
-
-    changed: list[dict[str, Any]] = []
-    for key, desired_text in desired_lines.items():
-        line_number = line_map.get(key)
-        if line_number is None:
-            section, setting = key
-            raise FirmwareError(
-                f"Cannot find `{setting}` inside the `{section}` section of settings.ini."
-            )
-        current_text = current_lines[line_number - 1].strip()
-        if current_text == desired_text:
-            continue
-        shell.edit_line(SETTINGS_PATH, line_number, desired_text)
-        current_lines[line_number - 1] = desired_text
-        changed.append(
-            {
-                "section": key[0],
-                "key": key[1],
-                "line_number": line_number,
-                "before": current_text,
-                "after": desired_text,
-            }
-        )
-
-    return {
-        "changed": changed,
-        "final_preview": "\n".join(current_lines),
-    }
-
-
-def collect_password_candidates(
-    shell: ShellClient, password_override: str | None
-) -> list[str]:
-    """Gather likely passwords from safe places in the VM state."""
-
-    candidates: list[str] = []
-
-    def add_candidate(value: str) -> None:
-        normalized = value.strip()
-        if normalized and normalized not in candidates:
-            candidates.append(normalized)
-
-    if password_override:
-        add_candidate(password_override)
-
-    note_password = shell.read_text(PASSWORD_NOTE_PATH).strip()
-    if note_password:
-        add_candidate(note_password)
-
-    for entry in shell.history_entries():
-        match = PASSWORD_ATTEMPT_PATTERN.search(entry)
-        if not match:
-            continue
-        candidate = match.group(1).strip()
-        if candidate.startswith("-"):
-            continue
-        add_candidate(candidate)
-
-    if not candidates:
-        raise FirmwareError("No password candidates recovered from the VM.")
-
-    return candidates
-
-
-def remove_lock_if_present(shell: ShellClient) -> bool:
-    listing = shell.list_dir(COOLER_DIR)
-    if "cooler-is-blocked.lock" not in listing:
-        return False
-    shell.remove_file(LOCK_PATH)
-    return True
-
-
-def launch_cooler(shell: ShellClient, passwords: list[str]) -> RunResult:
-    """Try password candidates until cooler.bin prints the confirmation code."""
-
-    last_output = ""
-    for password in passwords:
-        output = shell.run_binary(password)
-        last_output = output
-        confirmation = extract_confirmation(output)
-        if confirmation:
-            return RunResult(
-                password=password,
-                confirmation=confirmation,
-                launch_output=output,
-            )
-
-        if "Lock file exists" in output:
-            logger.warning("Detected a stale lock file. Removing it and retrying.")
-            remove_lock_if_present(shell)
-            retry_output = shell.run_binary(password)
-            last_output = retry_output
-            confirmation = extract_confirmation(retry_output)
-            if confirmation:
-                return RunResult(
-                    password=password,
-                    confirmation=confirmation,
-                    launch_output=retry_output,
-                )
-
-    raise FirmwareError(
-        "cooler.bin did not return an ECCS confirmation code. "
-        f"Last output:\n{last_output}"
-    )
-
-
-def extract_confirmation(output: str) -> str | None:
-    match = CONFIRMATION_PATTERN.search(output)
+def extract_confirmation(text: str) -> str | None:
+    match = CONFIRMATION_PATTERN.search(text)
     if not match:
         return None
     return match.group(1)
 
 
-def solve_firmware(config: AppConfig) -> tuple[RunResult, dict[str, Any]]:
-    shell = ShellClient(config)
-    if config.reboot_first:
-        logger.info("Rebooting the virtual filesystem before solving.")
-        shell.reboot()
-
-    try:
-        help_lines = shell.help()
-    except ShellBanError as exc:
-        handle_shell_ban(exc, shell)
-        help_lines = shell.help()
-
-    ensure_expected_help(help_lines)
-    tool_manifest = build_tool_manifest(help_lines)
-    write_json(TOOL_MANIFEST_PATH, tool_manifest)
-
-    try:
-        settings_report = ensure_correct_settings(shell)
-        password_candidates = collect_password_candidates(
-            shell, config.password_override
+def build_tool_manifest(
+    help_lines: list[str],
+    gitignore_entries: list[str],
+    *,
+    verify_enabled: bool,
+) -> dict[str, Any]:
+    shell_commands: list[dict[str, str]] = []
+    for raw_line in help_lines:
+        if not isinstance(raw_line, str) or " - " not in raw_line:
+            continue
+        command_spec, description = raw_line.split(" - ", 1)
+        shell_commands.append(
+            {
+                "remote_command": command_spec,
+                "description": description.strip(),
+            }
         )
-        lock_removed = remove_lock_if_present(shell)
-        run_result = launch_cooler(shell, password_candidates)
-    except ShellBanError as exc:
-        handle_shell_ban(exc, shell)
-        raise FirmwareError(
-            "The solver hit a shell ban during a supposedly safe operation. "
-            "The remote VM was rebooted; rerun the script."
-        ) from exc
 
-    session_payload = {
-        "help": help_lines,
-        "settings_report": settings_report,
-        "password_candidates": password_candidates,
-        "lock_removed_before_run": lock_removed,
-        "run_result": {
-            "password": run_result.password,
-            "confirmation": run_result.confirmation,
-            "launch_output": run_result.launch_output,
+    return {
+        "task": TASK_NAME,
+        "shell_commands": shell_commands,
+        "gitignore_entries": gitignore_entries,
+        "openrouter_tools": [
+            {
+                "name": "run_shell_command",
+                "description": "Execute one raw command on the restricted firmware shell.",
+            },
+            {
+                "name": "submit_confirmation",
+                "description": (
+                    "Submit the recovered ECCS confirmation to /verify."
+                    if verify_enabled
+                    else "Store the recovered ECCS confirmation locally."
+                ),
+            },
+        ],
+    }
+
+
+def build_openrouter_tools(*, verify_enabled: bool) -> list[dict[str, Any]]:
+    submit_description = (
+        "Submit the recovered ECCS confirmation to the AG3NTS verify endpoint. "
+        "Use it immediately after you see an ECCS-... code."
+        if verify_enabled
+        else "Store the recovered ECCS confirmation locally and stop after that."
+    )
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": "run_shell_command",
+                "description": (
+                    "Execute one raw command through the restricted firmware shell API. "
+                    "Supported commands come from help, plus direct execution of "
+                    "/opt/firmware/cooler/cooler.bin."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {
+                            "type": "string",
+                            "description": (
+                                "A single shell command such as `help`, "
+                                "`cat /home/operator/notes/pass.txt`, "
+                                "`editline /opt/firmware/cooler/settings.ini 2 SAFETY_CHECK=pass`, "
+                                "or `/opt/firmware/cooler/cooler.bin admin1`."
+                            ),
+                        }
+                    },
+                    "required": ["command"],
+                    "additionalProperties": False,
+                },
+            },
         },
-        "transcript": [
+        {
+            "type": "function",
+            "function": {
+                "name": "submit_confirmation",
+                "description": submit_description,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "confirmation": {
+                            "type": "string",
+                            "description": "The recovered ECCS confirmation code.",
+                        }
+                    },
+                    "required": ["confirmation"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+    ]
+
+
+def build_system_prompt(
+    help_lines: list[str],
+    gitignore_entries: list[str],
+    *,
+    verify_enabled: bool,
+    password_hint: str | None,
+) -> str:
+    help_text = "\n".join(f"- {line}" for line in help_lines)
+    gitignore_text = "\n".join(f"- {entry}" for entry in gitignore_entries)
+    verification_line = (
+        "Stop only after submit_confirmation returns a flag."
+        if verify_enabled
+        else "Stop after submit_confirmation stores the confirmation locally."
+    )
+    hint_line = (
+        f"User supplied password hint: {password_hint}\n"
+        if password_hint
+        else ""
+    )
+    return (
+        "You are a firmware recovery agent working through tools only.\n\n"
+        "Goal:\n"
+        "- recover the password needed by /opt/firmware/cooler/cooler.bin\n"
+        "- fix the configuration so the cooler can start\n"
+        "- run the binary and recover the ECCS confirmation code\n"
+        "- submit that confirmation with the submit_confirmation tool\n\n"
+        "Hard rules:\n"
+        "- Never touch /etc, /root, or /proc.\n"
+        "- Respect /opt/firmware/cooler/.gitignore exactly.\n"
+        "- If a command returns a refusal or ban, do not repeat that command.\n"
+        "- After any reboot, assume previous filesystem edits are gone.\n"
+        "- Prefer absolute paths.\n"
+        "- Useful safe clues often live in shell history, /home/operator, "
+        "and /opt/firmware/cooler/settings.ini.\n"
+        "- If you change settings.ini, only edit specific lines with editline.\n"
+        "- If a lock file blocks startup, fix the root cause first and then remove the lock.\n"
+        f"- {verification_line}\n\n"
+        "Fresh shell help:\n"
+        f"{help_text}\n\n"
+        "Entries ignored by /opt/firmware/cooler/.gitignore:\n"
+        f"{gitignore_text}\n\n"
+        f"{hint_line}"
+        "Be concise. Think with tools."
+    )
+
+
+def build_initial_user_prompt(*, rebooted: bool) -> str:
+    reboot_line = (
+        "The VM has already been rebooted once, so you are starting from a clean state."
+        if rebooted
+        else "The VM has not been rebooted for you yet."
+    )
+    return (
+        "Solve the firmware task through the shell tool. "
+        "Inspect the safe clues, repair the configuration, run cooler.bin, "
+        "and submit the ECCS confirmation.\n\n"
+        f"{reboot_line}"
+    )
+
+
+def handle_shell_ban(error: ShellBanError, shell: ShellClient) -> dict[str, Any]:
+    wait_seconds = max(1, error.seconds_left + 1)
+    logger.warning("Shell ban encountered: {}", error)
+    logger.info("Waiting {}s for the ban to expire.", wait_seconds)
+    time.sleep(wait_seconds)
+
+    rebooted = False
+    reboot_response: Any = None
+    if error.reboot_requested:
+        logger.info("Rebooting the virtual filesystem after the ban.")
+        reboot_response = shell.reboot()
+        rebooted = True
+
+    return {
+        "ok": False,
+        "error": str(error),
+        "command": error.command,
+        "ban_reason": error.reason,
+        "waited_seconds": wait_seconds,
+        "vm_rebooted": rebooted,
+        "reboot_response": reboot_response,
+        "agent_guidance": (
+            "Avoid the banned command. If the VM was rebooted, re-apply any needed "
+            "safe configuration changes before continuing."
+        ),
+    }
+
+
+def build_tool_handlers(
+    *,
+    config: AppConfig,
+    shell: ShellClient,
+    verify_client: VerifyClient,
+    state: AgentState,
+) -> dict[str, Any]:
+    def run_shell_command(arguments: dict[str, Any]) -> Any:
+        command = str(arguments.get("command", "")).strip()
+        if not command:
+            return {
+                "ok": False,
+                "error": "Missing required `command` argument.",
+            }
+        try:
+            response = shell.execute(command)
+        except ShellBanError as exc:
+            return handle_shell_ban(exc, shell)
+        except FirmwareError as exc:
+            return {
+                "ok": False,
+                "command": command,
+                "error": str(exc),
+            }
+
+        return {
+            "ok": True,
+            "command": command,
+            "response": response,
+        }
+
+    def submit_confirmation(arguments: dict[str, Any]) -> Any:
+        raw_confirmation = str(arguments.get("confirmation", "")).strip()
+        confirmation = extract_confirmation(raw_confirmation)
+        if confirmation is None:
+            return {
+                "ok": False,
+                "error": (
+                    "The provided confirmation does not match the expected "
+                    "ECCS-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx format."
+                ),
+                "provided_confirmation": raw_confirmation,
+            }
+
+        state.last_confirmation = confirmation
+        payload = {
+            "apikey": config.api_key,
+            "task": TASK_NAME,
+            "answer": {"confirmation": confirmation},
+        }
+        write_json(LAST_ANSWER_PATH, payload)
+
+        if not config.verify:
+            response = {
+                "ok": True,
+                "verification_skipped": True,
+                "confirmation": confirmation,
+            }
+            state.final_response = response
+            write_json(LAST_VERIFY_RESPONSE_PATH, response)
+            return response
+
+        try:
+            response = verify_client.submit_confirmation(confirmation)
+        except HttpRequestError as exc:
+            response = exc.to_response_dict()
+            state.final_response = response
+            write_json(LAST_VERIFY_RESPONSE_PATH, response)
+            return response
+
+        state.final_response = response
+        write_json(LAST_VERIFY_RESPONSE_PATH, response)
+        flag = extract_flag(response)
+        if flag:
+            state.final_flag = flag
+        return response
+
+    return {
+        "run_shell_command": run_shell_command,
+        "submit_confirmation": submit_confirmation,
+    }
+
+
+def execute_tool_call(
+    tool_call: ToolCall,
+    handlers: dict[str, Any],
+    *,
+    show_tool_results: bool,
+) -> dict[str, Any]:
+    if tool_call.name not in handlers:
+        raise FirmwareError(f"Model called an unknown tool: {tool_call.name}")
+
+    result = handlers[tool_call.name](tool_call.arguments)
+    if show_tool_results:
+        logger.info(
+            "Tool {} args:\n{}\nTool result:\n{}",
+            tool_call.name,
+            json.dumps(tool_call.arguments, ensure_ascii=False, indent=2),
+            json.dumps(result, ensure_ascii=False, indent=2),
+        )
+
+    return {
+        "role": "tool",
+        "tool_call_id": tool_call.id,
+        "name": tool_call.name,
+        "content": json.dumps(result, ensure_ascii=False),
+    }
+
+
+def build_session_payload(
+    *,
+    config: AppConfig,
+    help_lines: list[str],
+    gitignore_entries: list[str],
+    state: AgentState,
+    shell: ShellClient,
+    messages: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "task": TASK_NAME,
+        "model": config.model,
+        "verify_enabled": config.verify,
+        "help": help_lines,
+        "gitignore_entries": gitignore_entries,
+        "last_confirmation": state.last_confirmation,
+        "final_response": state.final_response,
+        "final_flag": state.final_flag,
+        "shell_transcript": [
             {"command": item.command, "response": item.response}
             for item in shell.history
         ],
+        "agent_messages": messages,
     }
-    write_json(LAST_SESSION_PATH, session_payload)
-    return run_result, session_payload
 
 
-def verify_confirmation(config: AppConfig, confirmation: str) -> Any:
-    answer = {"confirmation": confirmation}
+def maybe_finish_from_plain_text(
+    *,
+    completion_content: str | None,
+    handlers: dict[str, Any],
+    state: AgentState,
+    config: AppConfig,
+) -> bool:
+    text = (completion_content or "").strip()
+    if not text:
+        return False
+
+    flag = extract_flag(text)
+    if flag:
+        state.final_flag = flag
+        return True
+
+    confirmation = extract_confirmation(text)
+    if confirmation is None or state.last_confirmation is not None:
+        return False
+
+    logger.warning(
+        "Model returned a confirmation in plain text without using the tool. "
+        "Submitting it automatically."
+    )
+    response = handlers["submit_confirmation"]({"confirmation": confirmation})
+    auto_flag = extract_flag(response)
+    if auto_flag:
+        state.final_flag = auto_flag
+    return (not config.verify and state.last_confirmation is not None) or (
+        state.final_flag is not None
+    )
+
+
+def run_agent(
+    *,
+    config: AppConfig,
+    transcript_path: Path,
+) -> tuple[AgentState, dict[str, Any]]:
+    shell = ShellClient(config)
+    if config.reboot_first:
+        logger.info("Rebooting the virtual filesystem before starting the agent.")
+        shell.reboot()
+
+    help_lines = shell.help()
+    ensure_expected_help(help_lines)
+    gitignore_entries = parse_gitignore_entries(shell.read_text(COOLER_GITIGNORE_PATH))
+    shell.add_gitignore_entries(gitignore_entries)
     write_json(
-        LAST_ANSWER_PATH,
-        {
-            "apikey": config.api_key,
-            "task": TASK_NAME,
-            "answer": answer,
-        },
+        TOOL_MANIFEST_PATH,
+        build_tool_manifest(
+            help_lines,
+            gitignore_entries,
+            verify_enabled=config.verify,
+        ),
     )
 
-    response = submit_task_answer(
-        config.verify_url,
-        api_key=config.api_key,
-        task=TASK_NAME,
-        answer=answer,
-        timeout_seconds=config.timeout_seconds,
+    client = OpenRouterClient(
+        OpenRouterConfig(
+            api_key=config.openrouter_api_key,
+            base_url=config.openrouter_url,
+            model=config.model,
+            timeout_seconds=config.openrouter_timeout_seconds,
+            site_url=config.site_url,
+            site_name=config.site_name,
+        )
     )
-    write_json(LAST_VERIFY_RESPONSE_PATH, response)
-    return response
+    verify_client = VerifyClient(config)
+    state = AgentState()
+    handlers = build_tool_handlers(
+        config=config,
+        shell=shell,
+        verify_client=verify_client,
+        state=state,
+    )
+    tools = build_openrouter_tools(verify_enabled=config.verify)
+    messages: list[dict[str, Any]] = [
+        {
+            "role": "system",
+            "content": build_system_prompt(
+                help_lines,
+                gitignore_entries,
+                verify_enabled=config.verify,
+                password_hint=config.password_hint,
+            ),
+        },
+        {
+            "role": "user",
+            "content": build_initial_user_prompt(rebooted=config.reboot_first),
+        },
+    ]
+
+    try:
+        for _step in range(config.max_steps):
+            completion = client.create_completion(messages, tools=tools)
+            assistant_message: dict[str, Any] = {
+                "role": "assistant",
+                "content": completion.content or "",
+            }
+            if completion.tool_calls:
+                assistant_message["tool_calls"] = [
+                    tool_call.to_message_dict() for tool_call in completion.tool_calls
+                ]
+            messages.append(assistant_message)
+
+            if completion.tool_calls:
+                for tool_call in completion.tool_calls:
+                    tool_message = execute_tool_call(
+                        tool_call,
+                        handlers,
+                        show_tool_results=config.show_tool_results,
+                    )
+                    messages.append(tool_message)
+                    if state.final_flag:
+                        break
+                    if not config.verify and state.last_confirmation:
+                        break
+
+                if state.final_flag or (not config.verify and state.last_confirmation):
+                    break
+                continue
+
+            if maybe_finish_from_plain_text(
+                completion_content=completion.content,
+                handlers=handlers,
+                state=state,
+                config=config,
+            ):
+                break
+
+        else:
+            raise FirmwareError(
+                f"Agent did not finish within {config.max_steps} tool-calling rounds."
+            )
+    finally:
+        write_json(transcript_path, messages)
+        write_json(
+            LAST_SESSION_PATH,
+            build_session_payload(
+                config=config,
+                help_lines=help_lines,
+                gitignore_entries=gitignore_entries,
+                state=state,
+                shell=shell,
+                messages=messages,
+            ),
+        )
+
+    return state, build_session_payload(
+        config=config,
+        help_lines=help_lines,
+        gitignore_entries=gitignore_entries,
+        state=state,
+        shell=shell,
+        messages=messages,
+    )
 
 
 def main() -> int:
     args = parse_args()
-    configure_logging(name="firmware")
     config = build_config(args)
+    transcript_path = Path(args.transcript_path).resolve()
+    configure_logging(name="firmware", verbose=config.show_tool_results)
 
     try:
-        run_result, _session = solve_firmware(config)
-    except FirmwareError as exc:
+        state, _session = run_agent(config=config, transcript_path=transcript_path)
+    except (FirmwareError, OpenRouterError) as exc:
         logger.error("Error: {}", exc)
         return 1
 
-    logger.info("Recovered password candidate: {}", run_result.password)
-    logger.success("Confirmation: {}", run_result.confirmation)
-
-    if not config.verify:
-        return 0
-
-    try:
-        verify_response = verify_confirmation(config, run_result.confirmation)
-    except HttpRequestError as exc:
-        payload = exc.to_response_dict()
-        write_json(LAST_VERIFY_RESPONSE_PATH, payload)
-        logger.error("Verify request failed: {}", json.dumps(payload, ensure_ascii=False))
-        return 1
-
-    logger.info(
-        "Verify response:\n{}",
-        json.dumps(verify_response, ensure_ascii=False, indent=2),
-    )
-    flag = extract_flag(verify_response)
-    if flag:
-        logger.success("Flag: {}", flag)
-
+    logger.info("Model: {}", config.model)
+    if state.last_confirmation:
+        logger.success("Confirmation: {}", state.last_confirmation)
+    if state.final_response is not None:
+        logger.info(
+            "Verify response:\n{}",
+            json.dumps(state.final_response, ensure_ascii=False, indent=2),
+        )
+    if state.final_flag:
+        logger.success("Flag: {}", state.final_flag)
     return 0
 
 

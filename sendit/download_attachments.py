@@ -17,7 +17,7 @@ from devs_utilities.bootstrap import bootstrap_repo
 from devs_utilities.files import read_text_with_fallback
 from devs_utilities.http import HttpRequestError, get_bytes
 from devs_utilities.logging import configure_logging, logger as shared_logger
-from repo_env import get_env
+from devs_utilities.ag3nts import build_ag3nts_public_data_url
 
 
 REPO_ROOT = bootstrap_repo(__file__)
@@ -28,6 +28,7 @@ MARKDOWN_LINK_RE = re.compile(r"(?<!!)\[[^\]]+\]\(([^)]+)\)")
 AUTOLINK_RE = re.compile(r"<(https?://[^>]+)>")
 BARE_URL_RE = re.compile(r"(?<!\()(?P<url>https?://[^\s)>]+)")
 INCLUDE_FILE_RE = re.compile(r"""\[include\s+file=["']([^"']+)["']\]""")
+DEFAULT_SOURCE_URL = build_ag3nts_public_data_url("doc/index.md")
 
 
 def parse_args() -> argparse.Namespace:
@@ -51,10 +52,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--source-url",
-        default=get_env("SENDIT_SOURCE_INDEX_URL"),
+        default=DEFAULT_SOURCE_URL,
         help=(
             "Zrodlowy URL index.md, uzywany do rozwiazywania wzglednych "
-            "sciezek zalacznikow. Domyslnie: SENDIT_SOURCE_INDEX_URL z .env"
+            "sciezek zalacznikow. Domyslnie: wbudowany URL index.md z huba"
         ),
     )
     return parser.parse_args()
@@ -157,9 +158,6 @@ def main() -> int:
     configure_logging(name="sendit.download")
     args = parse_args()
     index_path = args.index.resolve()
-    if not args.source_url:
-        logger.error("Brak SENDIT_SOURCE_INDEX_URL w .env albo --source-url.")
-        return 1
 
     if not index_path.exists():
         logger.error("Brak pliku: {}", index_path)

@@ -12,13 +12,13 @@ REPO_ROOT_HINT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT_HINT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT_HINT))
 
-from devs_utilities.ag3nts import submit_task_answer
+from devs_utilities.ag3nts import AG3NTS_VERIFY_URL, submit_task_answer
 from devs_utilities.bootstrap import bootstrap_repo
 from devs_utilities.files import write_json
 from devs_utilities.flags import extract_flag
 from devs_utilities.http import HttpRequestError
 from devs_utilities.logging import configure_logging, logger as shared_logger
-from repo_env import get_env
+from repo_env import get_env, get_int_env
 
 
 REPO_ROOT = bootstrap_repo(__file__)
@@ -26,7 +26,6 @@ logger = shared_logger.bind(component="drone")
 
 
 TASK_NAME = "drone"
-VERIFY_URL = get_env("AG3NTS_VERIFY_URL")
 OUTPUT_DIR = Path(__file__).resolve().parent
 LAST_RESPONSE_PATH = OUTPUT_DIR / "last_verify_response.json"
 LAST_PROBE_PATH = OUTPUT_DIR / "grid_probe_results.json"
@@ -34,11 +33,14 @@ LAST_PROBE_PATH = OUTPUT_DIR / "grid_probe_results.json"
 # The map analysis plus API feedback narrows the dam to column 2, row 4
 # on a 3x4 grid. The destination object is the Żarnowiec plant code from
 # the earlier tasks data set.
-DESTINATION_OBJECT = "PWR6132PL"
-DAM_SECTOR_X = 2
-DAM_SECTOR_Y = 4
-GRID_COLUMNS = 3
-GRID_ROWS = 4
+DESTINATION_OBJECT = get_env("DRONE_DESTINATION_OBJECT", "PWR6132PL")
+DAM_SECTOR_X = get_int_env("DRONE_DAM_SECTOR_X", 2) or 2
+DAM_SECTOR_Y = get_int_env("DRONE_DAM_SECTOR_Y", 4) or 4
+GRID_COLUMNS = get_int_env("DRONE_GRID_COLUMNS", 3) or 3
+GRID_ROWS = get_int_env("DRONE_GRID_ROWS", 4) or 4
+DEFAULT_POWER = get_env("DRONE_DEFAULT_POWER", "100%") or "100%"
+DEFAULT_HEIGHT = get_env("DRONE_DEFAULT_HEIGHT", "10m") or "10m"
+REQUEST_TIMEOUT_SECONDS = get_int_env("AG3NTS_TIMEOUT_SECONDS", 30) or 30
 
 
 def parse_args() -> argparse.Namespace:
@@ -50,13 +52,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--power",
-        default="100%",
-        help="Engine power to set before take-off. Default: 100%%.",
+        default=DEFAULT_POWER,
+        help=f"Engine power to set before take-off. Default: {DEFAULT_POWER}.",
     )
     parser.add_argument(
         "--height",
-        default="10m",
-        help="Flight height to set before take-off. Default: 10m.",
+        default=DEFAULT_HEIGHT,
+        help=f"Flight height to set before take-off. Default: {DEFAULT_HEIGHT}.",
     )
     parser.add_argument(
         "--x",
@@ -82,8 +84,6 @@ def get_api_key() -> str:
     api_key = get_env("AG3NTS_API_KEY")
     if not api_key:
         raise SystemExit("Missing AG3NTS_API_KEY in .env.")
-    if not VERIFY_URL:
-        raise SystemExit("Missing AG3NTS_VERIFY_URL in .env.")
     return api_key
 
 
@@ -94,7 +94,7 @@ def post_json(url: str, payload: dict[str, Any]) -> Any:
             api_key=str(payload["apikey"]),
             task=str(payload["task"]),
             answer=dict(payload["answer"]),
-            timeout_seconds=30,
+            timeout_seconds=REQUEST_TIMEOUT_SECONDS,
         )
     except HttpRequestError as exc:
         return exc.to_response_dict()
@@ -135,7 +135,7 @@ def build_probe_instructions(*, destination: str, sector_x: int, sector_y: int) 
 
 def submit_instructions(api_key: str, instructions: list[str]) -> Any:
     return post_json(
-        VERIFY_URL,
+        AG3NTS_VERIFY_URL,
         {
             "apikey": api_key,
             "task": TASK_NAME,

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 from pathlib import Path
 
@@ -16,7 +15,7 @@ from devs_utilities.bootstrap import bootstrap_repo
 from devs_utilities.files import read_text_with_fallback, resolve_path, write_json
 from devs_utilities.logging import configure_logging, logger as shared_logger
 from devs_utilities.openrouter import OpenRouterClient, OpenRouterConfig, extract_completion_result
-from repo_env import get_env, get_optional_env
+from repo_env import get_env, get_int_env, get_optional_env
 
 
 REPO_ROOT = bootstrap_repo(__file__)
@@ -24,7 +23,15 @@ logger = shared_logger.bind(component="sendit.draft")
 
 
 OPENROUTER_URL = get_env("OPENROUTER_BASE_URL")
-DEFAULT_MODEL = "openai/gpt-4.1-mini"
+DEFAULT_MODEL = get_env("OPENROUTER_MODEL", "openai/gpt-4.1-mini") or "openai/gpt-4.1-mini"
+DEFAULT_TASK_NAME = get_env("SENDIT_TASK_NAME", "sendit") or "sendit"
+DEFAULT_SITE_NAME = (
+    get_optional_env("OPENROUTER_SITE_NAME")
+    or get_optional_env("OPENROUTER_APP_TITLE")
+    or "sendit-draft-builder"
+)
+DEFAULT_SYSTEM_PROMPT_FILE = get_env("SENDIT_SYSTEM_PROMPT_FILE", "openrouter_system_prompt.txt")
+OPENROUTER_TIMEOUT_SECONDS = get_int_env("OPENROUTER_TIMEOUT_SECONDS", 120) or 120
 
 
 def parse_args() -> argparse.Namespace:
@@ -61,8 +68,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--task",
-        default="sendit",
-        help="Nazwa zadania do podgladu payloadu. Domyslnie: sendit",
+        default=DEFAULT_TASK_NAME,
+        help=f"Nazwa zadania do podgladu payloadu. Domyslnie: {DEFAULT_TASK_NAME}",
     )
     parser.add_argument(
         "--model",
@@ -76,20 +83,20 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--site-name",
-        default=get_env("OPENROUTER_SITE_NAME", "sendit-draft-builder"),
+        default=DEFAULT_SITE_NAME,
         help="Opcjonalny naglowek X-Title dla OpenRouter.",
     )
     parser.add_argument(
         "--system-prompt-file",
         type=Path,
-        default=Path("openrouter_system_prompt.txt"),
-        help="Plik z system promptem dla OpenRouter. Domyslnie: openrouter_system_prompt.txt",
+        default=Path(DEFAULT_SYSTEM_PROMPT_FILE),
+        help=f"Plik z system promptem dla OpenRouter. Domyslnie: {DEFAULT_SYSTEM_PROMPT_FILE}",
     )
     return parser.parse_args()
 
 
 def load_openrouter_api_key() -> str | None:
-    return (os.environ.get("OPENROUTER_API_KEY") or "").strip() or None
+    return get_env("OPENROUTER_API_KEY") or None
 
 
 def load_shipment(path: Path) -> dict[str, object]:
@@ -248,7 +255,7 @@ def main() -> int:
     shipment_file = resolve_path(args.shipment_file, base_dir)
     output_dir = resolve_path(args.output_dir, base_dir)
     system_prompt_file = resolve_path(args.system_prompt_file, base_dir)
-    project_root = base_dir.parent
+    project_root = REPO_ROOT
 
     if not analysis_dir.exists():
         logger.error("Brak katalogu analysis: {}", analysis_dir)
@@ -275,7 +282,7 @@ def main() -> int:
             api_key=api_key,
             base_url=OPENROUTER_URL,
             model=args.model,
-            timeout_seconds=120,
+            timeout_seconds=OPENROUTER_TIMEOUT_SECONDS,
             site_url=args.site_url,
             site_name=args.site_name,
         )

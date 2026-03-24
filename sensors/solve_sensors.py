@@ -15,13 +15,18 @@ REPO_ROOT_HINT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT_HINT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT_HINT))
 
-from devs_utilities.ag3nts import build_task_answer_payload, submit_task_answer
+from devs_utilities.ag3nts import (
+    AG3NTS_VERIFY_URL,
+    build_ag3nts_public_data_url,
+    build_task_answer_payload,
+    submit_task_answer,
+)
 from devs_utilities.bootstrap import bootstrap_repo
 from devs_utilities.files import write_json
 from devs_utilities.http import HttpRequestError, get_bytes
 from devs_utilities.logging import configure_logging, logger as shared_logger
 from devs_utilities.openrouter import OpenRouterClient, OpenRouterConfig, OpenRouterError
-from repo_env import get_env, get_optional_env
+from repo_env import get_env, get_int_env, get_optional_env
 
 
 REPO_ROOT = bootstrap_repo(__file__)
@@ -29,9 +34,11 @@ logger = shared_logger.bind(component="sensors")
 
 
 TASK_NAME = "evaluation"
-DATA_URL = "https://example.invalid/dane/sensors.zip"
-DEFAULT_MODEL = "xiaomi/mimo-v2-omni"
-DEFAULT_BATCH_SIZE = 10
+DATA_URL = build_ag3nts_public_data_url("sensors.zip")
+DEFAULT_MODEL = get_env("OPENROUTER_MODEL", "xiaomi/mimo-v2-omni") or "xiaomi/mimo-v2-omni"
+DEFAULT_BATCH_SIZE = get_int_env("SENSORS_BATCH_SIZE", 10) or 10
+DOWNLOAD_TIMEOUT_SECONDS = get_int_env("SENSORS_DOWNLOAD_TIMEOUT_SECONDS", 60) or 60
+VERIFY_TIMEOUT_SECONDS = get_int_env("AG3NTS_TIMEOUT_SECONDS", 30) or 30
 
 OUTPUT_DIR = Path(__file__).resolve().parent
 ZIP_PATH = OUTPUT_DIR / "sensors.zip"
@@ -351,8 +358,7 @@ def parse_args() -> argparse.Namespace:
         "--model",
         default=None,
         help=(
-            "OpenRouter model override. Defaults to SENSORS_OPENROUTER_MODEL, "
-            f"OPENROUTER_MODEL, or {DEFAULT_MODEL}."
+            f"OpenRouter model override. Defaults to OPENROUTER_MODEL or {DEFAULT_MODEL}."
         ),
     )
     parser.add_argument(
@@ -398,7 +404,7 @@ def ensure_dataset(*, skip_download: bool, force_extract: bool) -> None:
         if skip_download:
             raise SystemExit(f"Missing dataset archive: {ZIP_PATH}")
         logger.info("Downloading dataset from {}", DATA_URL)
-        ZIP_PATH.write_bytes(get_bytes(DATA_URL, timeout_seconds=60))
+        ZIP_PATH.write_bytes(get_bytes(DATA_URL, timeout_seconds=DOWNLOAD_TIMEOUT_SECONDS))
 
     wanted_count = expected_file_count(ZIP_PATH)
     current_count = count_dataset_files(DATASET_DIR) if DATASET_DIR.exists() else 0
@@ -532,12 +538,7 @@ def chunked(items: list[T], size: int) -> list[list[T]]:
 def build_openrouter_client(model_override: str | None) -> OpenRouterClient:
     api_key = get_env("OPENROUTER_API_KEY")
     base_url = get_env("OPENROUTER_BASE_URL")
-    model = (
-        model_override
-        or get_optional_env("SENSORS_OPENROUTER_MODEL")
-        or get_optional_env("OPENROUTER_MODEL")
-        or DEFAULT_MODEL
-    )
+    model = model_override or get_optional_env("OPENROUTER_MODEL") or DEFAULT_MODEL
     resolved_model = LEGACY_MODEL_ALIASES.get(model, model)
     if resolved_model != model:
         logger.warning(
@@ -831,15 +832,12 @@ def build_final_answer(
 
 
 def verify_answer(payload: dict[str, Any]) -> Any:
-    verify_url = get_env("AG3NTS_VERIFY_URL")
-    if not verify_url:
-        raise SystemExit("Missing AG3NTS_VERIFY_URL in .env.")
     return submit_task_answer(
-        verify_url,
+        AG3NTS_VERIFY_URL,
         api_key=str(payload["apikey"]),
         task=str(payload["task"]),
         answer=dict(payload["answer"]),
-        timeout_seconds=30,
+        timeout_seconds=VERIFY_TIMEOUT_SECONDS,
     )
 
 
