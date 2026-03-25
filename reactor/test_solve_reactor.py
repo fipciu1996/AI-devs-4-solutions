@@ -1,6 +1,15 @@
 import unittest
 
-from reactor.solve_reactor import BlockState, ReactorState, plan_commands
+from devs_utilities.openrouter import OpenRouterError
+from reactor.solve_reactor import (
+    BlockState,
+    ModelDecision,
+    ReactorOption,
+    ReactorState,
+    parse_model_decision,
+    plan_commands,
+    resolve_command_choice,
+)
 
 
 class SolveReactorTests(unittest.TestCase):
@@ -89,6 +98,80 @@ class SolveReactorTests(unittest.TestCase):
             current = next_state
 
         self.assertTrue(current.is_goal())
+
+    def test_parse_model_decision_reads_valid_json(self) -> None:
+        decision = parse_model_decision(
+            '{"command":"right","reason":"Open path toward the goal."}',
+            allowed_commands={"right", "wait"},
+        )
+
+        self.assertEqual(
+            decision,
+            ModelDecision(command="right", reason="Open path toward the goal."),
+        )
+
+    def test_parse_model_decision_rejects_invalid_command(self) -> None:
+        with self.assertRaises(OpenRouterError):
+            parse_model_decision(
+                '{"command":"left","reason":"Backtrack."}',
+                allowed_commands={"right", "wait"},
+            )
+
+    def test_resolve_command_choice_uses_model_when_it_matches_best_option(self) -> None:
+        wait_state = ReactorState(
+            player_col=1,
+            blocks=(
+                BlockState(col=2, top_row=2, bottom_row=3, direction="down"),
+                BlockState(col=3, top_row=3, bottom_row=4, direction="up"),
+                BlockState(col=4, top_row=2, bottom_row=3, direction="up"),
+                BlockState(col=5, top_row=3, bottom_row=4, direction="down"),
+                BlockState(col=6, top_row=2, bottom_row=3, direction="down"),
+            ),
+        )
+        right_state = ReactorState(
+            player_col=2,
+            blocks=wait_state.blocks,
+        )
+        options = [
+            ReactorOption(command="right", next_state=right_state, remaining_steps=4),
+            ReactorOption(command="wait", next_state=wait_state, remaining_steps=5),
+        ]
+
+        command, meta = resolve_command_choice(
+            options,
+            ModelDecision(command="right", reason="Fastest safe progress."),
+        )
+
+        self.assertEqual(command, "right")
+        self.assertEqual(meta["source"], "openrouter")
+
+    def test_resolve_command_choice_falls_back_when_model_picks_longer_route(self) -> None:
+        wait_state = ReactorState(
+            player_col=1,
+            blocks=(
+                BlockState(col=2, top_row=2, bottom_row=3, direction="down"),
+                BlockState(col=3, top_row=3, bottom_row=4, direction="up"),
+                BlockState(col=4, top_row=2, bottom_row=3, direction="up"),
+                BlockState(col=5, top_row=3, bottom_row=4, direction="down"),
+                BlockState(col=6, top_row=2, bottom_row=3, direction="down"),
+            ),
+        )
+        right_state = ReactorState(
+            player_col=2,
+            blocks=wait_state.blocks,
+        )
+        options = [
+            ReactorOption(command="right", next_state=right_state, remaining_steps=4),
+            ReactorOption(command="wait", next_state=wait_state, remaining_steps=5),
+        ]
+
+        command, meta = resolve_command_choice(
+            options,
+            ModelDecision(command="wait", reason="Safer to pause."),
+        )
+
+        self.assertEqual(command, "right")
+        self.assertEqual(meta["source"], "planner_fallback")
 
 
 if __name__ == "__main__":

@@ -20,7 +20,8 @@ from devs_utilities.files import write_json
 from devs_utilities.flags import extract_flag
 from devs_utilities.http import HttpRequestError
 from devs_utilities.logging import configure_logging, logger as shared_logger
-from repo_env import get_env, get_int_env
+from devs_utilities.openrouter import OpenRouterClient, OpenRouterConfig, OpenRouterError
+from repo_env import get_env, get_int_env, get_optional_env
 
 
 REPO_ROOT = bootstrap_repo(__file__)
@@ -29,9 +30,14 @@ logger = shared_logger.bind(component="reactor")
 
 TASK_NAME = "reactor"
 BOARD_COLUMNS = 7
+BOARD_ROWS = 5
 GOAL_COLUMN = 7
 DEFAULT_MAX_STEPS = get_int_env("REACTOR_MAX_STEPS", 64) or 64
 VERIFY_TIMEOUT_SECONDS = get_int_env("AG3NTS_TIMEOUT_SECONDS", 30) or 30
+DEFAULT_MODEL = get_env("OPENROUTER_MODEL", "openai/gpt-4.1-mini") or "openai/gpt-4.1-mini"
+DEFAULT_OPENROUTER_TIMEOUT_SECONDS = (
+    get_int_env("OPENROUTER_TIMEOUT_SECONDS", 60) or 60
+)
 OUTPUT_DIR = Path(__file__).resolve().parent
 LAST_RESPONSE_PATH = OUTPUT_DIR / "last_verify_response.json"
 LAST_TRACE_PATH = OUTPUT_DIR / "last_trace.json"
@@ -41,6 +47,51 @@ ApiCommand = Literal["start", "reset", "left", "wait", "right"]
 Direction = Literal["up", "down"]
 
 ACTION_PRIORITY: tuple[MoveCommand, ...] = ("right", "wait", "left")
+MODEL_SYSTEM_PROMPT = """You are the reasoning module for a reactor-navigation robot.
+
+Goal:
+- move the robot from column 1 to column 7 on the bottom lane
+- never choose a move that can lead to an immediate collision
+- prefer progress toward the goal and avoid unnecessary backtracking
+
+Rules:
+- Blocks move exactly one step after every command.
+- You will receive only safe candidate moves.
+- Choose the best candidate move for this turn.
+- Return valid JSON only, following the provided schema.
+- Keep the reason short and concrete.
+"""
+
+
+@dataclass(frozen=True, slots=True)
+class ReactorOption:
+    """A safe move candidate together with its predicted aftermath."""
+
+    command: MoveCommand
+    next_state: ReactorState
+    remaining_steps: int
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "command": self.command,
+            "remaining_steps_to_goal": self.remaining_steps,
+            "next_player_col": self.next_state.player_col,
+            "next_board": render_board(self.next_state),
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ModelDecision:
+    """A normalized OpenRouter decision payload."""
+
+    command: MoveCommand
+    reason: str
+
+    def as_dict(self) -> dict[str, str]:
+        return {
+            "command": self.command,
+            "reason": self.reason,
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,6 +219,14 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_MAX_STEPS,
         help=f"Maximum move commands after start. Default: {DEFAULT_MAX_STEPS}.",
     )
+    parser.add_argument(
+        "--model",
+        default=None,
+        help=(
+            "OpenRouter model override. Defaults to OPENROUTER_MODEL or "
+            f"{DEFAULT_MODEL}."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -193,6 +252,43 @@ def send_command(api_key: str, command: ApiCommand) -> dict[str, Any]:
     if isinstance(response, dict):
         return dict(response)
     return {"raw": response}
+
+
+def build_openrouter_client(model_override: str | None) -> OpenRouterClient:
+    api_key = get_env("OPENROUTER_API_KEY")
+    base_url = get_env("OPENROUTER_BASE_URL")
+    model = (model_override or get_optional_env("OPENROUTER_MODEL") or DEFAULT_MODEL).strip()
+    timeout_raw = get_optional_env("OPENROUTER_TIMEOUT_SECONDS") or str(
+        DEFAULT_OPENROUTER_TIMEOUT_SECONDS
+    )
+
+    try:
+        timeout_seconds = max(10, int(timeout_raw))
+    except ValueError as exc:
+        raise SystemExit(
+            f"OPENROUTER_TIMEOUT_SECONDS must be an integer, got: {timeout_raw}"
+        ) from exc
+
+    missing: list[str] = []
+    if not api_key:
+        missing.append("OPENROUTER_API_KEY")
+    if not base_url:
+        missing.append("OPENROUTER_BASE_URL")
+    if missing:
+        raise SystemExit(f"Missing required OpenRouter settings: {', '.join(missing)}")
+
+    return OpenRouterClient(
+        OpenRouterConfig(
+            api_key=api_key,
+            base_url=base_url,
+            model=model,
+            timeout_seconds=timeout_seconds,
+            site_url=get_optional_env("OPENROUTER_SITE_URL")
+            or get_optional_env("OPENROUTER_APP_URL"),
+            site_name=get_optional_env("OPENROUTER_SITE_NAME")
+            or get_optional_env("OPENROUTER_APP_TITLE"),
+        )
+    )
 
 
 def plan_commands(initial_state: ReactorState) -> list[MoveCommand] | None:
@@ -235,6 +331,166 @@ def reconstruct_plan(
     return commands
 
 
+def render_board(state: ReactorState) -> list[str]:
+    board = [["." for _ in range(BOARD_COLUMNS)] for _ in range(BOARD_ROWS)]
+    for block in state.blocks:
+        board[block.top_row - 1][block.col - 1] = "B"
+        board[block.bottom_row - 1][block.col - 1] = "B"
+    board[BOARD_ROWS - 1][GOAL_COLUMN - 1] = "G"
+    board[BOARD_ROWS - 1][state.player_col - 1] = "P"
+    return ["".join(row) for row in board]
+
+
+def build_safe_options(state: ReactorState) -> list[ReactorOption]:
+    options: list[ReactorOption] = []
+    for command in ACTION_PRIORITY:
+        next_state = state.apply(command)
+        if next_state is None:
+            continue
+        remaining_plan = plan_commands(next_state)
+        if remaining_plan is None:
+            continue
+        options.append(
+            ReactorOption(
+                command=command,
+                next_state=next_state,
+                remaining_steps=len(remaining_plan),
+            )
+        )
+    return options
+
+
+def build_decision_schema(allowed_commands: list[MoveCommand]) -> dict[str, Any]:
+    return {
+        "name": "reactor_move_decision",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "enum": allowed_commands,
+                },
+                "reason": {
+                    "type": "string",
+                },
+            },
+            "required": ["command", "reason"],
+            "additionalProperties": False,
+        },
+    }
+
+
+def build_decision_prompt(
+    state: ReactorState,
+    options: list[ReactorOption],
+) -> str:
+    payload = {
+        "current_player_col": state.player_col,
+        "goal_col": GOAL_COLUMN,
+        "current_board": render_board(state),
+        "blocks": [block.as_dict() for block in state.blocks],
+        "safe_options": [option.as_dict() for option in options],
+    }
+    return (
+        "Choose the best command for this turn.\n"
+        "The board is represented as 5 strings from top row to bottom row.\n"
+        "Return JSON only.\n\n"
+        f"{json.dumps(payload, ensure_ascii=False, indent=2)}"
+    )
+
+
+def parse_model_decision(
+    raw_content: str,
+    *,
+    allowed_commands: set[MoveCommand],
+) -> ModelDecision:
+    try:
+        parsed = json.loads(raw_content)
+    except json.JSONDecodeError as exc:
+        raise OpenRouterError("OpenRouter returned invalid JSON for reactor move.") from exc
+
+    if not isinstance(parsed, dict):
+        raise OpenRouterError("OpenRouter reactor decision must be an object.")
+
+    command = parsed.get("command")
+    reason = parsed.get("reason")
+    if not isinstance(command, str) or command not in allowed_commands:
+        raise OpenRouterError("OpenRouter selected an invalid reactor command.")
+    if not isinstance(reason, str) or not reason.strip():
+        raise OpenRouterError("OpenRouter reactor decision is missing a reason.")
+
+    return ModelDecision(command=command, reason=reason.strip())
+
+
+def choose_command_with_openrouter(
+    *,
+    client: OpenRouterClient,
+    state: ReactorState,
+    options: list[ReactorOption],
+) -> ModelDecision:
+    allowed_commands = [option.command for option in options]
+    completion = client.create_completion(
+        [
+            {"role": "system", "content": MODEL_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": build_decision_prompt(state, options),
+            },
+        ],
+        extra_payload={
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": build_decision_schema(allowed_commands),
+            }
+        },
+    )
+    if not completion.content:
+        raise OpenRouterError("OpenRouter returned no content for reactor move.")
+    return parse_model_decision(
+        completion.content,
+        allowed_commands=set(allowed_commands),
+    )
+
+
+def resolve_command_choice(
+    options: list[ReactorOption],
+    model_decision: ModelDecision | None,
+) -> tuple[MoveCommand, dict[str, Any]]:
+    if not options:
+        raise ValueError("At least one safe reactor option is required.")
+
+    best_option = min(options, key=lambda option: (option.remaining_steps, ACTION_PRIORITY.index(option.command)))
+    by_command = {option.command: option for option in options}
+
+    if model_decision is None:
+        return best_option.command, {
+            "source": "planner_fallback",
+            "reason": "OpenRouter decision unavailable.",
+            "fallback_command": best_option.command,
+            "best_remaining_steps": best_option.remaining_steps,
+        }
+
+    selected_option = by_command.get(model_decision.command)
+    if (
+        selected_option is not None
+        and selected_option.remaining_steps == best_option.remaining_steps
+    ):
+        return model_decision.command, {
+            "source": "openrouter",
+            "reason": model_decision.reason,
+            "best_remaining_steps": best_option.remaining_steps,
+        }
+
+    return best_option.command, {
+        "source": "planner_fallback",
+        "reason": model_decision.reason,
+        "requested_command": model_decision.command,
+        "fallback_command": best_option.command,
+        "best_remaining_steps": best_option.remaining_steps,
+    }
+
+
 def append_trace(
     trace: list[dict[str, Any]],
     *,
@@ -242,6 +498,8 @@ def append_trace(
     response: Mapping[str, Any],
     planned_path: list[MoveCommand] | None = None,
     predicted_state: ReactorState | None = None,
+    safe_options: list[ReactorOption] | None = None,
+    decision_meta: dict[str, Any] | None = None,
 ) -> None:
     entry: dict[str, Any] = {
         "command": command,
@@ -252,6 +510,10 @@ def append_trace(
     if predicted_state is not None:
         entry["predicted_state"] = predicted_state.as_dict()
         entry["prediction_matched_api"] = predicted_state.matches_api_payload(response)
+    if safe_options is not None:
+        entry["safe_options"] = [option.as_dict() for option in safe_options]
+    if decision_meta is not None:
+        entry["decision"] = dict(decision_meta)
     trace.append(entry)
 
 
@@ -265,6 +527,7 @@ def main() -> int:
     configure_logging(name="reactor")
     args = parse_args()
     api_key = get_api_key()
+    openrouter_client = build_openrouter_client(args.model)
     trace: list[dict[str, Any]] = []
 
     if args.reset_first:
@@ -294,18 +557,30 @@ def main() -> int:
             logger.error("Cannot parse reactor state: {}", exc)
             return 1
 
-        plan = plan_commands(state)
-        if not plan:
+        options = build_safe_options(state)
+        if not options:
             write_json(LAST_TRACE_PATH, trace)
             logger.error("No safe plan found from the current reactor state.")
             return 1
 
-        command = plan[0]
+        plan = plan_commands(state) or []
+        model_decision: ModelDecision | None = None
+        try:
+            model_decision = choose_command_with_openrouter(
+                client=openrouter_client,
+                state=state,
+                options=options,
+            )
+        except OpenRouterError as exc:
+            logger.warning("OpenRouter decision failed, using planner fallback: {}", exc)
+
+        command, decision_meta = resolve_command_choice(options, model_decision)
         predicted_state = state.apply(command)
         logger.info(
-            "Step {}: sending {} (planned remaining steps: {}).",
+            "Step {}: sending {} via {} (planned remaining steps: {}).",
             step_index,
             command,
+            decision_meta["source"],
             len(plan),
         )
 
@@ -316,6 +591,8 @@ def main() -> int:
             response=response,
             planned_path=plan,
             predicted_state=predicted_state,
+            safe_options=options,
+            decision_meta=decision_meta,
         )
         write_json(LAST_RESPONSE_PATH, response)
 
