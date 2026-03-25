@@ -270,6 +270,14 @@ def proxy_docker_compose() -> list[CommandSpec]:
     ]
 
 
+def reactor_run() -> list[CommandSpec]:
+    return [build_python_command("reactor\\solve_reactor.py")]
+
+
+def reactor_reset_run() -> list[CommandSpec]:
+    return [build_python_command("reactor\\solve_reactor.py", "--reset-first")]
+
+
 TASK_MENUS: dict[str, list[MenuAction]] = {
     "Categorize": [
         MenuAction("Run default", "Send prompts using current defaults.", categorize_default),
@@ -298,6 +306,10 @@ TASK_MENUS: dict[str, list[MenuAction]] = {
     "Proxy": [
         MenuAction("Run local server", "Start proxy_api_server with Python.", proxy_local_server),
         MenuAction("Run docker compose", "Start the proxy stack with Docker Compose.", proxy_docker_compose),
+    ],
+    "Reactor": [
+        MenuAction("Run solver", "Start the reactor run from the current board.", reactor_run),
+        MenuAction("Reset and run", "Reset the board before starting the solver.", reactor_reset_run),
     ],
 }
 
