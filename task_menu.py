@@ -1,7 +1,8 @@
-"""Interactive launcher for the repository tasks."""
+"""Interactive launcher built dynamically from the current repository state."""
 
 from __future__ import annotations
 
+import shlex
 import subprocess
 import sys
 from collections.abc import Callable
@@ -14,7 +15,13 @@ from repo_env import load_repo_env
 
 REPO_ROOT = Path(__file__).resolve().parent
 PYTHON = sys.executable
-DEFAULT_CATEGORIZE_ORDER = "J-D-I-B-A-C-G-E-H-F"
+IGNORED_DIRS = {
+    ".git",
+    ".idea",
+    ".venv",
+    "__pycache__",
+    "devs_utilities",
+}
 logger = shared_logger.bind(component="task_menu")
 
 load_repo_env(__file__)
@@ -33,20 +40,19 @@ class MenuAction:
     builder: Callable[[], list[CommandSpec] | None]
 
 
+@dataclass(frozen=True, slots=True)
+class TaskMenu:
+    name: str
+    path: Path
+    actions: tuple[MenuAction, ...]
+
+
 def prompt_text(label: str, default: str | None = None) -> str:
     suffix = f" [{default}]" if default else ""
     value = input(f"{label}{suffix}: ").strip()
     if value:
         return value
     return default or ""
-
-
-def prompt_yes_no(label: str, default: bool = False) -> bool:
-    default_hint = "Y/n" if default else "y/N"
-    value = input(f"{label} [{default_hint}]: ").strip().lower()
-    if not value:
-        return default
-    return value in {"y", "yes", "t", "true", "1"}
 
 
 def pause() -> None:
@@ -69,272 +75,183 @@ def run_commands(commands: list[CommandSpec]) -> int:
     return last_return_code
 
 
-def build_python_command(script: str, *args: str, cwd: Path | None = None) -> CommandSpec:
+def build_python_command(script_path: Path, *args: str, cwd: Path | None = None) -> CommandSpec:
+    relative_script = script_path.relative_to(REPO_ROOT)
     return CommandSpec(
-        command=[PYTHON, script, *args],
+        command=[PYTHON, str(relative_script), *args],
         cwd=cwd or REPO_ROOT,
     )
 
 
-def categorize_default() -> list[CommandSpec]:
-    return [build_python_command("categorize\\solve_categorize.py")]
+def split_args(raw_args: str) -> list[str]:
+    """Split a free-form argument string into CLI tokens."""
+
+    if not raw_args.strip():
+        return []
+    return shlex.split(raw_args, posix=False)
 
 
-def categorize_reset() -> list[CommandSpec]:
-    return [build_python_command("categorize\\solve_categorize.py", "--reset")]
+def titleize_name(raw_name: str) -> str:
+    """Convert a directory or file stem into a readable label."""
+
+    return raw_name.replace("-", " ").replace("_", " ").title()
 
 
-def categorize_custom() -> list[CommandSpec]:
-    order_mode = prompt_text("Order mode", "csv_position")
-    order = prompt_text("Order", DEFAULT_CATEGORIZE_ORDER)
-    args = [f"--order-mode={order_mode}", f"--order={order}"]
-    if prompt_yes_no("Reset before sending?", False):
-        args.append("--reset")
-    return [build_python_command("categorize\\solve_categorize.py", *args)]
+def script_sort_key(script_path: Path) -> tuple[int, str]:
+    """Prefer obvious entrypoints before generic helpers."""
+
+    name = script_path.name.casefold()
+    if name.startswith("solve_"):
+        return (0, name)
+    if name == "route_agent.py":
+        return (1, name)
+    if name == "submit_tools.py":
+        return (2, name)
+    if name.startswith("test_"):
+        return (9, name)
+    return (3, name)
 
 
-def people_filter_dry_run() -> list[CommandSpec]:
-    return [build_python_command("people\\filter_people.py", "--dry-run")]
+def module_sort_key(module_path: Path) -> tuple[int, str]:
+    return (0, module_path.parent.name.casefold(), module_path.name.casefold())
 
 
-def people_filter_save() -> list[CommandSpec]:
-    output_path = prompt_text("Output file", "people\\people_result.json")
-    return [build_python_command("people\\filter_people.py", "--output", output_path)]
+def discover_task_dirs() -> list[Path]:
+    """Return top-level task directories worth showing in the menu."""
 
-
-def people_filter_verify() -> list[CommandSpec]:
-    output_path = prompt_text("Output file", "people\\people_result.json")
-    return [
-        build_python_command(
-            "people\\filter_people.py",
-            "--output",
-            output_path,
-            "--verify",
+    task_dirs: list[Path] = []
+    for child in sorted(REPO_ROOT.iterdir(), key=lambda path: path.name.casefold()):
+        if not child.is_dir() or child.name in IGNORED_DIRS or child.name.startswith("."):
+            continue
+        has_scripts = any(
+            script.name != "__init__.py"
+            for script in child.glob("*.py")
         )
-    ]
+        has_compose = (child / "docker-compose.yml").exists()
+        has_server_module = any(child.glob("src/*/server.py"))
+        if has_scripts or has_compose or has_server_module:
+            task_dirs.append(child)
+    return task_dirs
 
 
-def people_find_agent_dry_run() -> list[CommandSpec]:
-    suspects = prompt_text("Suspects file", "people\\people_result.json")
-    return [build_python_command("people\\find-agent.py", "--suspects", suspects, "--dry-run")]
+def build_script_action(script_path: Path) -> MenuAction:
+    """Create a generic runner for a discovered Python script."""
+
+    relative_script = script_path.relative_to(REPO_ROOT)
+    label = f"Run {script_path.name}"
+    description = f"Run {relative_script} with optional extra arguments."
+
+    def builder() -> list[CommandSpec]:
+        extra_args = split_args(prompt_text("Extra args", ""))
+        return [build_python_command(script_path, *extra_args)]
+
+    return MenuAction(label, description, builder)
 
 
-def people_find_agent_save() -> list[CommandSpec]:
-    suspects = prompt_text("Suspects file", "people\\people_result.json")
-    output_path = prompt_text("Output file", "people\\findhim_result.json")
-    args = ["--suspects", suspects, "--output", output_path]
-    if prompt_yes_no("Refresh plants cache?", False):
-        args.append("--refresh-plants")
-    return [build_python_command("people\\find-agent.py", *args)]
+def build_module_server_action(task_dir: Path, server_path: Path) -> MenuAction:
+    """Create an action for `python -m package.server` entrypoints."""
+
+    package_dir = server_path.parent
+    module_name = f"{package_dir.name}.server"
+    label = f"Run {module_name}"
+    description = f"Start the local server module in {task_dir.name}."
+
+    def builder() -> list[CommandSpec]:
+        extra_args = split_args(prompt_text("Extra args", ""))
+        return [
+            CommandSpec(
+                command=[PYTHON, "-m", module_name, *extra_args],
+                cwd=task_dir,
+            )
+        ]
+
+    return MenuAction(label, description, builder)
 
 
-def people_find_agent_verify() -> list[CommandSpec]:
-    suspects = prompt_text("Suspects file", "people\\people_result.json")
-    output_path = prompt_text("Output file", "people\\findhim_result.json")
-    args = ["--suspects", suspects, "--output", output_path, "--verify"]
-    if prompt_yes_no("Refresh plants cache?", False):
-        args.append("--refresh-plants")
-    return [build_python_command("people\\find-agent.py", *args)]
+def build_docker_compose_action(task_dir: Path) -> MenuAction:
+    """Create an action for a discovered docker-compose file."""
 
+    def builder() -> list[CommandSpec]:
+        extra_args = split_args(prompt_text("Compose args", "up --build"))
+        return [
+            CommandSpec(
+                command=["docker", "compose", "--env-file", "..\\.env", *extra_args],
+                cwd=task_dir,
+            )
+        ]
 
-def people_full_pipeline() -> list[CommandSpec]:
-    people_output = prompt_text("People output file", "people\\people_result.json")
-    findhim_output = prompt_text("Findhim output file", "people\\findhim_result.json")
-    commands = [
-        build_python_command("people\\filter_people.py", "--output", people_output),
-        build_python_command(
-            "people\\find-agent.py",
-            "--suspects",
-            people_output,
-            "--output",
-            findhim_output,
-        ),
-    ]
-    return commands
-
-
-def railway_run_prompt() -> list[CommandSpec] | None:
-    prompt = prompt_text("Railway prompt")
-    if not prompt:
-        logger.error("Prompt is required.")
-        return None
-    args = ["railway\\route_agent.py"]
-    if prompt_yes_no("Show tool results?", False):
-        args.append("--show-tool-results")
-    args.append(prompt)
-    return [build_python_command(*args)]
-
-
-def sendit_download() -> list[CommandSpec]:
-    index_path = prompt_text("Index file", "sendit\\index.md")
-    return [build_python_command("sendit\\download_attachments.py", "--index", index_path)]
-
-
-def sendit_analyze() -> list[CommandSpec]:
-    input_dir = prompt_text("Input dir", "sendit\\attachments")
-    output_dir = prompt_text("Output dir", "sendit\\analysis")
-    return [
-        build_python_command(
-            "sendit\\analyze_attachments_openrouter.py",
-            "--input-dir",
-            input_dir,
-            "--output-dir",
-            output_dir,
-        )
-    ]
-
-
-def sendit_build_draft() -> list[CommandSpec]:
-    shipment_file = prompt_text("Shipment file", "sendit\\shipment.example.json")
-    return [
-        build_python_command(
-            "sendit\\build_declaration_draft.py",
-            "--shipment-file",
-            shipment_file,
-            "--analysis-dir",
-            "sendit\\analysis",
-            "--attachments-dir",
-            "sendit\\attachments",
-            "--output-dir",
-            "sendit\\draft",
-        )
-    ]
-
-
-def sendit_generate_legal() -> list[CommandSpec]:
-    shipment_file = prompt_text("Shipment file", "sendit\\shipment.legal.example.json")
-    output_dir = prompt_text("Output dir", "sendit\\legal_output")
-    return [
-        build_python_command(
-            "sendit\\generate_legal_declaration.py",
-            "--shipment-file",
-            shipment_file,
-            "--output-dir",
-            output_dir,
-        )
-    ]
-
-
-def sendit_full_pipeline() -> list[CommandSpec]:
-    shipment_file = prompt_text("Draft shipment file", "sendit\\shipment.example.json")
-    legal_shipment_file = prompt_text(
-        "Legal shipment file",
-        "sendit\\shipment.legal.example.json",
+    return MenuAction(
+        "Run docker compose",
+        f"Run docker compose in {task_dir.name}.",
+        builder,
     )
-    return [
-        build_python_command("sendit\\download_attachments.py", "--index", "sendit\\index.md"),
-        build_python_command(
-            "sendit\\analyze_attachments_openrouter.py",
-            "--input-dir",
-            "sendit\\attachments",
-            "--output-dir",
-            "sendit\\analysis",
+
+
+def discover_actions(task_dir: Path) -> tuple[MenuAction, ...]:
+    """Build all actions available for a task directory."""
+
+    actions: list[MenuAction] = []
+
+    scripts = sorted(
+        (
+            path
+            for path in task_dir.glob("*.py")
+            if path.name != "__init__.py" and not path.name.startswith("test_")
         ),
-        build_python_command(
-            "sendit\\build_declaration_draft.py",
-            "--shipment-file",
-            shipment_file,
-            "--analysis-dir",
-            "sendit\\analysis",
-            "--attachments-dir",
-            "sendit\\attachments",
-            "--output-dir",
-            "sendit\\draft",
-        ),
-        build_python_command(
-            "sendit\\generate_legal_declaration.py",
-            "--shipment-file",
-            legal_shipment_file,
-            "--output-dir",
-            "sendit\\legal_output",
-        ),
-    ]
+        key=script_sort_key,
+    )
+    actions.extend(build_script_action(script_path) for script_path in scripts)
+
+    server_modules = sorted(task_dir.glob("src/*/server.py"), key=module_sort_key)
+    actions.extend(
+        build_module_server_action(task_dir, server_path)
+        for server_path in server_modules
+    )
+
+    if (task_dir / "docker-compose.yml").exists():
+        actions.append(build_docker_compose_action(task_dir))
+
+    return tuple(actions)
 
 
-def proxy_local_server() -> list[CommandSpec]:
-    return [
-        build_python_command(
-            "-m",
-            "proxy_api_server.server",
-            cwd=REPO_ROOT / "proxy",
-        )
-    ]
+def discover_task_menus() -> list[TaskMenu]:
+    """Discover current tasks and actions from the filesystem."""
+
+    task_menus: list[TaskMenu] = []
+    for task_dir in discover_task_dirs():
+        actions = discover_actions(task_dir)
+        if actions:
+            task_menus.append(
+                TaskMenu(
+                    name=titleize_name(task_dir.name),
+                    path=task_dir,
+                    actions=actions,
+                )
+            )
+    return task_menus
 
 
-def proxy_docker_compose() -> list[CommandSpec]:
-    return [
-        CommandSpec(
-            command=["docker", "compose", "--env-file", "..\\.env", "up", "--build"],
-            cwd=REPO_ROOT / "proxy",
-        )
-    ]
-
-
-def reactor_run() -> list[CommandSpec]:
-    return [build_python_command("reactor\\solve_reactor.py")]
-
-
-def reactor_reset_run() -> list[CommandSpec]:
-    return [build_python_command("reactor\\solve_reactor.py", "--reset-first")]
-
-
-TASK_MENUS: dict[str, list[MenuAction]] = {
-    "Categorize": [
-        MenuAction("Run default", "Send prompts using current defaults.", categorize_default),
-        MenuAction("Run with reset", "Reset the budget and send prompts again.", categorize_reset),
-        MenuAction("Custom run", "Pick order mode and order interactively.", categorize_custom),
-    ],
-    "People": [
-        MenuAction("Filter dry-run", "Preview filtered candidates only.", people_filter_dry_run),
-        MenuAction("Filter and save", "Build people_result.json.", people_filter_save),
-        MenuAction("Filter and verify", "Build and verify people_result.json.", people_filter_verify),
-        MenuAction("Find agent dry-run", "Preview findhim step without verify.", people_find_agent_dry_run),
-        MenuAction("Find agent and save", "Build findhim_result.json.", people_find_agent_save),
-        MenuAction("Find agent and verify", "Build and verify findhim_result.json.", people_find_agent_verify),
-        MenuAction("Full pipeline", "Run filter_people and find-agent sequentially.", people_full_pipeline),
-    ],
-    "Railway": [
-        MenuAction("Run prompt", "Send a natural-language railway instruction.", railway_run_prompt),
-    ],
-    "Sendit": [
-        MenuAction("Download attachments", "Resolve and copy/download files from index.md.", sendit_download),
-        MenuAction("Analyze attachments", "Create OpenRouter analysis reports.", sendit_analyze),
-        MenuAction("Build draft", "Create the working declaration draft.", sendit_build_draft),
-        MenuAction("Generate legal declaration", "Run local legal validation/generation.", sendit_generate_legal),
-        MenuAction("Full pipeline", "Run the common sendit flow end-to-end.", sendit_full_pipeline),
-    ],
-    "Proxy": [
-        MenuAction("Run local server", "Start proxy_api_server with Python.", proxy_local_server),
-        MenuAction("Run docker compose", "Start the proxy stack with Docker Compose.", proxy_docker_compose),
-    ],
-    "Reactor": [
-        MenuAction("Run solver", "Start the reactor run from the current board.", reactor_run),
-        MenuAction("Reset and run", "Reset the board before starting the solver.", reactor_reset_run),
-    ],
-}
-
-
-def show_main_menu() -> str:
+def show_main_menu(task_menus: list[TaskMenu]) -> str:
     logger.info("Interactive Task Menu")
-    task_names = list(TASK_MENUS)
-    for index, task_name in enumerate(task_names, start=1):
-        logger.info("{}. {}", index, task_name)
+    for index, task_menu in enumerate(task_menus, start=1):
+        logger.info("{}. {}", index, task_menu.name)
     logger.info("q. Quit")
     choice = input("\nSelect task: ").strip().lower()
     if choice == "q":
         return choice
     if choice.isdigit():
         selected_index = int(choice) - 1
-        if 0 <= selected_index < len(task_names):
-            return task_names[selected_index]
+        if 0 <= selected_index < len(task_menus):
+            return str(selected_index)
     logger.warning("Invalid choice.")
     return ""
 
 
-def show_task_menu(task_name: str, actions: list[MenuAction]) -> bool:
+def show_task_menu(task_menu: TaskMenu) -> bool:
     while True:
-        logger.info("{}", task_name)
-        for index, action in enumerate(actions, start=1):
+        logger.info("{}", task_menu.name)
+        logger.info("Path: {}", task_menu.path)
+        for index, action in enumerate(task_menu.actions, start=1):
             logger.info("{}. {} - {}", index, action.label, action.description)
         logger.info("b. Back")
         logger.info("q. Quit")
@@ -348,11 +265,11 @@ def show_task_menu(task_name: str, actions: list[MenuAction]) -> bool:
             continue
 
         selected_index = int(choice) - 1
-        if not 0 <= selected_index < len(actions):
+        if not 0 <= selected_index < len(task_menu.actions):
             logger.warning("Invalid choice.")
             continue
 
-        commands = actions[selected_index].builder()
+        commands = task_menu.actions[selected_index].builder()
         if commands is None:
             pause()
             continue
@@ -364,13 +281,20 @@ def show_task_menu(task_name: str, actions: list[MenuAction]) -> bool:
 def main() -> int:
     configure_logging(name="task_menu")
     while True:
-        selected_task = show_main_menu()
+        task_menus = discover_task_menus()
+        if not task_menus:
+            logger.warning("No runnable tasks were discovered.")
+            return 1
+
+        selected_task = show_main_menu(task_menus)
         if not selected_task:
             continue
         if selected_task == "q":
             logger.info("Goodbye.")
             return 0
-        should_continue = show_task_menu(selected_task, TASK_MENUS[selected_task])
+
+        task_menu = task_menus[int(selected_task)]
+        should_continue = show_task_menu(task_menu)
         if not should_continue:
             logger.info("Goodbye.")
             return 0
