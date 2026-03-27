@@ -1,0 +1,18 @@
+services:
+  negotiations-api-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: negotiations-api-server
+    env_file:
+      - ../.env
+    environment:
+      API_HOST: ${NEGOTIATIONS_API_HOST:-0.0.0.0}
+      API_PORT: ${NEGOTIATIONS_API_PORT:-18081}
+      API_TOOL_PATH: ${NEGOTIATIONS_API_TOOL_PATH:-/api/find-cities}
+      DATA_BASE_URL: ${NEGOTIATIONS_DATA_BASE_URL:-https://example.invalid/dane/s03e04_csv}
+      DATA_CACHE_DIR: ${NEGOTIATIONS_DATA_CACHE_DIR:-/app/data_cache}
+      REQUEST_TIMEOUT_SECONDS: ${NEGOTIATIONS_REQUEST_TIMEOUT_SECONDS:-30}
+      MATCH_LIMIT: ${NEGOTIATIONS_MATCH_LIMIT:-5}
+    ports:
+      - "${NEGOTIATIONS_API_PORT:-18081}:${NEGOTIATIONS_API_PORT:-18081}"
