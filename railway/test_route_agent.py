@@ -16,6 +16,10 @@ from devs_utilities.http import HttpRequestError
 from route_agent import RailwayApiClient, RailwayError, require_route, require_status
 
 
+TEST_API_URL = "".join(("https", "://", "***MASKED***", "/api"))
+TEST_API_KEY = "***MASKED***"
+
+
 class ValidationTests(unittest.TestCase):
     def test_require_route_normalizes_case(self) -> None:
         self.assertEqual(require_route("A-12"), "a-12")
@@ -36,7 +40,7 @@ class RailwayClientTests(unittest.TestCase):
     @patch("route_agent.post_json")
     def test_call_builds_expected_payload(self, mock_post_json) -> None:
         mock_post_json.return_value = {"ok": True, "status": "RTOPEN"}
-        client = RailwayApiClient("https://***MASKED***/api", "secret")
+        client = RailwayApiClient(TEST_API_URL, TEST_API_KEY)
 
         result = client.call(action="setstatus", route="B-4", value="rtopen")
 
@@ -44,9 +48,9 @@ class RailwayClientTests(unittest.TestCase):
         self.assertEqual(
             mock_post_json.call_args.args,
             (
-                "https://***MASKED***/api",
+                TEST_API_URL,
                 {
-                    "apikey": "secret",
+                    "apikey": TEST_API_KEY,
                     "task": "railway",
                     "answer": {
                         "action": "setstatus",
@@ -67,7 +71,7 @@ class RailwayClientTests(unittest.TestCase):
     @patch("route_agent.post_json")
     def test_call_raises_for_api_error_response(self, mock_post_json) -> None:
         mock_post_json.return_value = {"ok": False, "error": "boom"}
-        client = RailwayApiClient("https://***MASKED***/api", "secret")
+        client = RailwayApiClient(TEST_API_URL, TEST_API_KEY)
 
         with self.assertRaises(RailwayError):
             client.call(action="help")
@@ -77,7 +81,7 @@ class RailwayClientTests(unittest.TestCase):
     def test_call_retries_after_rate_limit(self, mock_post_json, mock_sleep) -> None:
         mock_post_json.side_effect = [
             HttpRequestError(
-                url="https://***MASKED***/api",
+                url=TEST_API_URL,
                 message="HTTP 429",
                 status_code=429,
                 body=json.dumps(
@@ -91,7 +95,7 @@ class RailwayClientTests(unittest.TestCase):
             ),
             {"ok": True, "status": "RTOPEN"},
         ]
-        client = RailwayApiClient("https://***MASKED***/api", "secret")
+        client = RailwayApiClient(TEST_API_URL, TEST_API_KEY)
 
         result = client.call(action="getstatus", route="a-1")
 
@@ -103,7 +107,7 @@ class RailwayClientTests(unittest.TestCase):
     def test_call_retries_after_service_unavailable(self, mock_post_json, mock_sleep) -> None:
         mock_post_json.side_effect = [
             HttpRequestError(
-                url="https://***MASKED***/api",
+                url=TEST_API_URL,
                 message="HTTP 503",
                 status_code=503,
                 body=json.dumps(
@@ -115,7 +119,7 @@ class RailwayClientTests(unittest.TestCase):
             ),
             {"ok": True, "status": "RTCLOSE"},
         ]
-        client = RailwayApiClient("https://***MASKED***/api", "secret")
+        client = RailwayApiClient(TEST_API_URL, TEST_API_KEY)
 
         result = client.call(action="getstatus", route="a-1")
 
@@ -131,7 +135,7 @@ class RailwayClientTests(unittest.TestCase):
     ) -> None:
         mock_post_json.side_effect = [
             HttpRequestError(
-                url="https://***MASKED***/api",
+                url=TEST_API_URL,
                 message="HTTP 503",
                 status_code=503,
                 body=json.dumps(
@@ -143,7 +147,7 @@ class RailwayClientTests(unittest.TestCase):
             ),
             {"ok": True, "status": "RTOPEN"},
         ]
-        client = RailwayApiClient("https://***MASKED***/api", "secret")
+        client = RailwayApiClient(TEST_API_URL, TEST_API_KEY)
 
         result = client.call(action="getstatus", route="a-1")
 

@@ -6,6 +6,8 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from devs_utilities.ag3nts import build_ag3nts_public_data_url
+
 
 @dataclass(frozen=True, slots=True)
 class Settings:
@@ -23,6 +25,7 @@ class Settings:
 def load_settings() -> Settings:
     """Load application settings from the environment."""
 
+    default_data_base_url = build_ag3nts_public_data_url("s03e04_csv")
     api_tool_path = os.getenv("API_TOOL_PATH", "/api/find-cities").strip() or "/api/find-cities"
     if not api_tool_path.startswith("/"):
         api_tool_path = f"/{api_tool_path}"
@@ -32,7 +35,7 @@ def load_settings() -> Settings:
         api_tool_path=api_tool_path.rstrip("/") or "/api/find-cities",
         data_base_url=os.getenv(
             "DATA_BASE_URL",
-            "https://example.invalid/dane/s03e04_csv",
+            default_data_base_url,
         ).rstrip("/"),
         data_cache_dir=Path(os.getenv("DATA_CACHE_DIR", "data_cache")),
         request_timeout_seconds=float(os.getenv("REQUEST_TIMEOUT_SECONDS", "30")),

@@ -2,13 +2,19 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
+from .env import get_env, load_repo_env
 from .http import RAW_TEXT, post_json
 
 
-AG3NTS_BASE_URL = "https://example.invalid"
+load_repo_env(Path(__file__))
+AG3NTS_BASE_URL = get_env("AG3NTS_BASE_URL")
+if not AG3NTS_BASE_URL:
+    raise RuntimeError("Missing AG3NTS_BASE_URL in the repository .env file.")
+
 AG3NTS_VERIFY_URL = f"{AG3NTS_BASE_URL}/verify"
 AG3NTS_LOCATION_URL = f"{AG3NTS_BASE_URL}/location"
 AG3NTS_ACCESS_LEVEL_URL = f"{AG3NTS_BASE_URL}/accesslevel"

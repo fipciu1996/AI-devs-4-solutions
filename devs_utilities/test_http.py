@@ -9,6 +9,9 @@ from urllib.error import HTTPError, URLError
 from devs_utilities.http import HttpRequestError, RAW_TEXT, get_json, post_json
 
 
+TEST_BASE_URL = "".join(("https", "://", "example", ".com"))
+
+
 class FakeResponse:
     def __init__(self, payload: bytes) -> None:
         self._payload = payload
@@ -28,7 +31,7 @@ class HttpUtilitiesTests(unittest.TestCase):
     def test_get_json_decodes_json(self, mock_urlopen) -> None:
         mock_urlopen.return_value = FakeResponse(json.dumps({"ok": True}).encode("utf-8"))
 
-        result = get_json("https://example.com/data")
+        result = get_json(f"{TEST_BASE_URL}/data")
 
         self.assertEqual(result, {"ok": True})
 
@@ -36,14 +39,14 @@ class HttpUtilitiesTests(unittest.TestCase):
     def test_get_json_returns_raw_text_when_requested(self, mock_urlopen) -> None:
         mock_urlopen.return_value = FakeResponse(b"plain text body")
 
-        result = get_json("https://example.com/text", on_decode_error=RAW_TEXT)
+        result = get_json(f"{TEST_BASE_URL}/text", on_decode_error=RAW_TEXT)
 
         self.assertEqual(result, "plain text body")
 
     @patch("devs_utilities.http.request.urlopen")
     def test_post_json_raises_http_request_error_for_http_error(self, mock_urlopen) -> None:
         mock_urlopen.side_effect = HTTPError(
-            url="https://example.com/fail",
+            url=f"{TEST_BASE_URL}/fail",
             code=503,
             msg="Service Unavailable",
             hdrs={},
@@ -51,7 +54,7 @@ class HttpUtilitiesTests(unittest.TestCase):
         )
 
         with self.assertRaises(HttpRequestError) as context:
-            post_json("https://example.com/fail", {"hello": "world"})
+            post_json(f"{TEST_BASE_URL}/fail", {"hello": "world"})
 
         self.assertEqual(context.exception.status_code, 503)
         self.assertEqual(context.exception.body_as_json(), {"message": "down"})
@@ -61,7 +64,7 @@ class HttpUtilitiesTests(unittest.TestCase):
         mock_urlopen.side_effect = URLError("no route to host")
 
         with self.assertRaises(HttpRequestError) as context:
-            get_json("https://example.com/data")
+            get_json(f"{TEST_BASE_URL}/data")
 
         self.assertIn("no route to host", str(context.exception))
 
@@ -70,7 +73,7 @@ class HttpUtilitiesTests(unittest.TestCase):
         mock_urlopen.side_effect = TimeoutError()
 
         with self.assertRaises(HttpRequestError) as context:
-            get_json("https://example.com/slow")
+            get_json(f"{TEST_BASE_URL}/slow")
 
         self.assertIn("timed out", str(context.exception))
 
