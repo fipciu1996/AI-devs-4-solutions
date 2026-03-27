@@ -25,7 +25,12 @@ from devs_utilities.bootstrap import bootstrap_repo
 from devs_utilities.files import write_json
 from devs_utilities.http import HttpRequestError, get_bytes
 from devs_utilities.logging import configure_logging, logger as shared_logger
-from devs_utilities.openrouter import OpenRouterClient, OpenRouterConfig, OpenRouterError
+from devs_utilities.openrouter import (
+    OpenRouterClient,
+    OpenRouterConfig,
+    OpenRouterError,
+    ToolCall,
+)
 from repo_env import get_env, get_int_env, get_optional_env
 
 
@@ -195,6 +200,7 @@ Your task:
 - Decide whether the note claims everything is OK, claims there is a problem,
   or is too ambiguous to tell.
 - Ignore unusual writing style and focus on meaning.
+- Use tool calling before giving the final answer.
 
 Use:
 - "ok" when the note says the system looks normal, healthy, stable, approved,
@@ -214,6 +220,7 @@ Return JSON only:
   ]
 }
 """
+MODEL_MAX_STEPS = 4
 
 LEGACY_MODEL_ALIASES = {
     "openrouter/healer-alpha": "xiaomi/mimo-v2-omni",
@@ -613,6 +620,120 @@ def parse_model_review(payload: str) -> list[NoteReview]:
     return reviews
 
 
+SENSOR_REVIEW_TOOLS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_notes_batch_context",
+            "description": "Return the operator notes that need classification in the current batch.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "validate_review_payload",
+            "description": "Validate that the proposed review payload contains exactly the expected note keys.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "results": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "key": {"type": "string"},
+                                "note_claim": {"type": "string"},
+                                "reason": {"type": "string"},
+                            },
+                            "required": ["key", "note_claim", "reason"],
+                            "additionalProperties": False,
+                        },
+                    }
+                },
+                "required": ["results"],
+                "additionalProperties": False,
+            },
+        },
+    },
+]
+
+
+def build_sensor_review_handlers(batch: list[dict[str, str]]) -> dict[str, Any]:
+    expected_keys = {item["key"] for item in batch}
+
+    def get_notes_batch_context(_: dict[str, Any]) -> dict[str, Any]:
+        return {"notes": batch}
+
+    def validate_review_payload(arguments: dict[str, Any]) -> dict[str, Any]:
+        raw_results = arguments.get("results")
+        if not isinstance(raw_results, list):
+            return {"is_valid": False, "message": "results must be a list"}
+        received_keys = {
+            item.get("key")
+            for item in raw_results
+            if isinstance(item, dict) and isinstance(item.get("key"), str)
+        }
+        return {
+            "is_valid": received_keys == expected_keys,
+            "expected_keys": sorted(expected_keys),
+            "received_keys": sorted(str(key) for key in received_keys if isinstance(key, str)),
+        }
+
+    return {
+        "get_notes_batch_context": get_notes_batch_context,
+        "validate_review_payload": validate_review_payload,
+    }
+
+
+def execute_sensor_tool_call(tool_call: ToolCall, handlers: dict[str, Any]) -> dict[str, Any]:
+    if tool_call.name not in handlers:
+        raise OpenRouterError(f"Unknown sensor review tool: {tool_call.name!r}")
+    result = handlers[tool_call.name](tool_call.arguments)
+    return {
+        "role": "tool",
+        "tool_call_id": tool_call.id,
+        "name": tool_call.name,
+        "content": json.dumps(result, ensure_ascii=False),
+    }
+
+
+def review_note_batch_with_tool_calling(
+    client: OpenRouterClient,
+    batch: list[dict[str, str]],
+) -> list[NoteReview]:
+    handlers = build_sensor_review_handlers(batch)
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": MODEL_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": "Classify the current batch of operator notes and return JSON only.",
+        },
+    ]
+    for _ in range(MODEL_MAX_STEPS):
+        result = client.create_completion(messages, tools=SENSOR_REVIEW_TOOLS)
+        assistant_message: dict[str, Any] = {
+            "role": "assistant",
+            "content": result.content or "",
+        }
+        if result.tool_calls:
+            assistant_message["tool_calls"] = [
+                tool_call.to_message_dict() for tool_call in result.tool_calls
+            ]
+            messages.append(assistant_message)
+            for tool_call in result.tool_calls:
+                messages.append(execute_sensor_tool_call(tool_call, handlers))
+            continue
+        if not result.content:
+            raise OpenRouterError("OpenRouter returned no content for note review.")
+        return parse_model_review(result.content)
+    raise OpenRouterError("OpenRouter tool calling did not finish for sensor review.")
+
+
 def build_file_decisions(
     candidates: list[ModelCandidate],
     note_reviews: dict[str, NoteReview],
@@ -687,23 +808,7 @@ def review_note_candidates(
             )
 
     for batch_index, batch in enumerate(chunked(pending_payloads, batch_size), start=1):
-        prompt_payload = {"notes": batch}
-        result = client.create_completion(
-            [
-                {"role": "system", "content": MODEL_SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": (
-                        "Classify these operator notes and return JSON only.\n\n"
-                        f"{json.dumps(prompt_payload, ensure_ascii=False, indent=2)}"
-                    ),
-                },
-            ],
-            extra_payload={"response_format": {"type": "json_object"}},
-        )
-        if not result.content:
-            raise OpenRouterError(f"Batch {batch_index} returned no content.")
-        reviews = parse_model_review(result.content)
+        reviews = review_note_batch_with_tool_calling(client, batch)
         for review in reviews:
             operator_notes = unique_notes.get(review.key)
             if operator_notes is None:

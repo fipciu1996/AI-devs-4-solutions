@@ -28,7 +28,12 @@ from devs_utilities.files import resolve_path, write_json
 from devs_utilities.http import get_json as http_get_json
 from devs_utilities.http import post_json as http_post_json
 from devs_utilities.logging import configure_logging, logger as shared_logger
-from devs_utilities.openrouter import OpenRouterClient, OpenRouterConfig, extract_completion_result
+from devs_utilities.openrouter import (
+    OpenRouterClient,
+    OpenRouterConfig,
+    OpenRouterError,
+    ToolCall,
+)
 from repo_env import get_env, get_int_env, get_optional_env
 
 
@@ -44,6 +49,7 @@ OPENROUTER_TIMEOUT_SECONDS = get_int_env("OPENROUTER_TIMEOUT_SECONDS", 120) or 1
 DEFAULT_PLANTS_PATH = "findhim_locations.json"
 DEFAULT_SUSPECTS_PATH = "people_result.json"
 DEFAULT_OUTPUT_PATH = "findhim_result.json"
+MODEL_MAX_STEPS = 4
 
 
 @dataclass(slots=True)
@@ -240,7 +246,97 @@ def build_geocode_schema() -> dict[str, Any]:
     }
 
 
-def geocode_power_plants(
+FIND_AGENT_TOOLS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_power_plant_city_context",
+            "description": "Return the list of Polish cities that need approximate coordinates.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "validate_geocode_results",
+            "description": "Validate that the proposed coordinates cover all requested cities.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "plants": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "city": {"type": "string"},
+                                "latitude": {"type": "number"},
+                                "longitude": {"type": "number"},
+                            },
+                            "required": ["city", "latitude", "longitude"],
+                            "additionalProperties": False,
+                        },
+                    }
+                },
+                "required": ["plants"],
+                "additionalProperties": False,
+            },
+        },
+    },
+]
+
+
+def build_find_agent_handlers(city_names: list[str]) -> dict[str, Any]:
+    expected = {normalize_name(city) for city in city_names}
+
+    def get_power_plant_city_context(_: dict[str, Any]) -> dict[str, Any]:
+        prompt = (
+            "Dla podanych polskich miast zwrĂłÄ‡ przybliĹĽone wspĂłĹ‚rzÄ™dne geograficzne "
+            "centrĂłw tych miejscowoĹ›ci. Nie podawaj objaĹ›nieĹ„. Miasta:\n"
+            + "\n".join(f"- {city}" for city in city_names)
+        )
+        return {"prompt": prompt, "cities": city_names}
+
+    def validate_geocode_results(arguments: dict[str, Any]) -> dict[str, Any]:
+        raw_plants = arguments.get("plants")
+        if not isinstance(raw_plants, list):
+            return {"is_valid": False, "message": "plants must be a list"}
+        received = {
+            normalize_name(str(item.get("city")))
+            for item in raw_plants
+            if isinstance(item, dict) and item.get("city") is not None
+        }
+        return {
+            "is_valid": received == expected,
+            "expected_cities": sorted(expected),
+            "received_cities": sorted(received),
+        }
+
+    return {
+        "get_power_plant_city_context": get_power_plant_city_context,
+        "validate_geocode_results": validate_geocode_results,
+    }
+
+
+def execute_find_agent_tool_call(
+    tool_call: ToolCall,
+    handlers: dict[str, Any],
+) -> dict[str, Any]:
+    if tool_call.name not in handlers:
+        raise OpenRouterError(f"Unknown people.find tool call: {tool_call.name!r}")
+    result = handlers[tool_call.name](tool_call.arguments)
+    return {
+        "role": "tool",
+        "tool_call_id": tool_call.id,
+        "name": tool_call.name,
+        "content": json.dumps(result, ensure_ascii=False),
+    }
+
+
+def geocode_power_plants_legacy(
     raw_plants: dict[str, Any],
     config: AppConfig,
     openrouter_client: OpenRouterClient,
@@ -252,7 +348,7 @@ def geocode_power_plants(
         "centrów tych miejscowości. Nie podawaj objaśnień. Miasta:\n"
         + "\n".join(f"- {city}" for city in city_names)
     )
-    response = openrouter_client.create_raw_completion(
+    response = openrouter_client.create_raw_completion_legacy(
         [
             {
                 "role": "system",
@@ -267,7 +363,7 @@ def geocode_power_plants(
             },
         ],
         extra_payload={
-            "response_format": {
+            "schema_legacy": {
                 "type": "json_schema",
                 "json_schema": build_geocode_schema(),
             }
@@ -277,6 +373,78 @@ def geocode_power_plants(
     content = str(completion.content or "").strip()
     if not content:
         raise RuntimeError(f"Brak treści w odpowiedzi geokodowania: {response}")
+
+    parsed = json.loads(content)
+    coordinates_by_city = {
+        normalize_name(str(item["city"])): Coordinate(
+            latitude=float(item["latitude"]),
+            longitude=float(item["longitude"]),
+        )
+        for item in parsed["plants"]
+    }
+
+    plants: list[PowerPlant] = []
+    for city, details in plants_section.items():
+        coordinate = coordinates_by_city.get(normalize_name(city))
+        if coordinate is None:
+            raise RuntimeError(f"Brak współrzędnych dla elektrowni w mieście {city}")
+        plants.append(
+            PowerPlant(
+                city=city,
+                code=str(details["code"]),
+                coordinate=coordinate,
+            )
+        )
+    return plants
+
+
+def geocode_power_plants(
+    raw_plants: dict[str, Any],
+    config: AppConfig,
+    openrouter_client: OpenRouterClient,
+) -> list[PowerPlant]:
+    """Tool-calling wrapper for approximate power-plant geocoding."""
+
+    plants_section = raw_plants["power_plants"]
+    city_names = list(plants_section.keys())
+    handlers = build_find_agent_handlers(city_names)
+    messages: list[dict[str, Any]] = [
+        {
+            "role": "system",
+            "content": (
+                "Zwracasz tylko poprawny JSON zgodny ze schematem. "
+                "Użyj tool callingu przed finalną odpowiedzią. "
+                "Używaj współrzędnych miast w Polsce."
+            ),
+        },
+        {
+            "role": "user",
+            "content": "Przygotuj współrzędne dla miast z elektrowniami.",
+        },
+    ]
+    content = ""
+    for _ in range(MODEL_MAX_STEPS):
+        completion = openrouter_client.create_completion(
+            messages,
+            tools=FIND_AGENT_TOOLS,
+        )
+        assistant_message: dict[str, Any] = {
+            "role": "assistant",
+            "content": completion.content or "",
+        }
+        if completion.tool_calls:
+            assistant_message["tool_calls"] = [
+                tool_call.to_message_dict() for tool_call in completion.tool_calls
+            ]
+            messages.append(assistant_message)
+            for tool_call in completion.tool_calls:
+                messages.append(execute_find_agent_tool_call(tool_call, handlers))
+            continue
+        content = str(completion.content or "").strip()
+        if content:
+            break
+    if not content:
+        raise RuntimeError("Brak treści w odpowiedzi geokodowania.")
 
     parsed = json.loads(content)
     coordinates_by_city = {

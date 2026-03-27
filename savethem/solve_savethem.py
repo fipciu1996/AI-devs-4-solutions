@@ -19,7 +19,12 @@ from devs_utilities.bootstrap import bootstrap_repo
 from devs_utilities.files import write_json
 from devs_utilities.http import HttpRequestError, post_json, request_bytes
 from devs_utilities.logging import configure_logging, logger as shared_logger
-from devs_utilities.openrouter import OpenRouterClient, OpenRouterConfig, OpenRouterError
+from devs_utilities.openrouter import (
+    OpenRouterClient,
+    OpenRouterConfig,
+    OpenRouterError,
+    ToolCall,
+)
 from repo_env import get_env, get_int_env
 
 
@@ -46,6 +51,7 @@ ANSWER_PATH = OUTPUT_DIR / "solution.json"
 MODEL_ROUTE_PATH = OUTPUT_DIR / "model_route.json"
 DEFAULT_PROBE_ANSWER = ["walk"]
 EPSILON = 1e-9
+MODEL_MAX_STEPS = 6
 
 DIRS: tuple[tuple[int, int, str], ...] = (
     (-1, 0, "up"),
@@ -241,6 +247,34 @@ def preview_to_prompt(preview: PreviewState) -> str:
     return "\n".join("".join(row) for row in preview.terrain)
 
 
+def task_context_payload(
+    preview: PreviewState,
+    specs: dict[str, VehicleSpec],
+) -> dict[str, Any]:
+    return {
+        "map": preview_to_prompt(preview),
+        "start": {"row": preview.start.row + 1, "col": preview.start.col + 1},
+        "goal": {"row": preview.goal.row + 1, "col": preview.goal.col + 1},
+        "resources": {"fuel": 10, "food": 10},
+        "vehicles": {
+            name: {
+                "fuel_per_move": spec.fuel_per_move,
+                "food_per_move": spec.food_per_move,
+            }
+            for name, spec in specs.items()
+        },
+        "rules": {
+            "initial_mode_only_once": True,
+            "dismount_switches_to_walk": True,
+            "rocks_impassable": True,
+            "car_and_rocket_cannot_enter_water": True,
+            "tree_extra_fuel_non_walk": TREE_FUEL_PENALTY,
+            "goal_requires_fuel_and_food_above_zero": True,
+            "objective": "minimize food use first, then fuel use",
+        },
+    }
+
+
 def can_enter(cell: str, *, mode: str) -> bool:
     if cell == "R":
         return False
@@ -312,6 +346,21 @@ def simulate_route(
 
     reached_goal = row == preview.goal.row and col == preview.goal.col
     return reached_goal, "Goal reached." if reached_goal else "Route does not reach the goal.", 10.0 - fuel_used, 10.0 - food_used
+
+
+def normalize_answer(answer: Any) -> list[str]:
+    if not isinstance(answer, list):
+        raise OpenRouterError("Answer must be a list of strings.")
+    normalized: list[str] = []
+    for item in answer:
+        if not isinstance(item, str):
+            raise OpenRouterError("Each answer item must be a string.")
+        stripped = item.strip()
+        if stripped:
+            normalized.append(stripped)
+    if not normalized:
+        raise OpenRouterError("Answer cannot be empty.")
+    return normalized
 
 
 def find_best_route(
@@ -408,64 +457,173 @@ def find_best_route(
     raise RuntimeError("No feasible route reaches the goal within the resource limits.")
 
 
+SAVE_THEM_TOOLS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_task_context",
+            "description": "Return the map, start, goal, resource limits, vehicle specs and movement rules.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_deterministic_candidate",
+            "description": "Return the best route found by the deterministic solver.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "validate_candidate_route",
+            "description": "Validate a proposed route and report whether it reaches the goal and how many resources remain.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "answer": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Route beginning with vehicle name followed by moves and optional dismount.",
+                    }
+                },
+                "required": ["answer"],
+                "additionalProperties": False,
+            },
+        },
+    },
+]
+
+
+def build_model_tool_handlers(
+    preview: PreviewState,
+    specs: dict[str, VehicleSpec],
+    deterministic_answer: list[str],
+) -> dict[str, Any]:
+    def get_task_context(_: dict[str, Any]) -> dict[str, Any]:
+        return task_context_payload(preview, specs)
+
+    def get_deterministic_candidate(_: dict[str, Any]) -> dict[str, Any]:
+        reached_goal, message, remaining_fuel, remaining_food = simulate_route(
+            preview,
+            specs,
+            deterministic_answer,
+        )
+        return {
+            "answer": deterministic_answer,
+            "reached_goal": reached_goal,
+            "message": message,
+            "remaining_fuel": remaining_fuel,
+            "remaining_food": remaining_food,
+        }
+
+    def validate_candidate_route(arguments: dict[str, Any]) -> dict[str, Any]:
+        answer = normalize_answer(arguments.get("answer"))
+        reached_goal, message, remaining_fuel, remaining_food = simulate_route(
+            preview,
+            specs,
+            answer,
+        )
+        return {
+            "answer": answer,
+            "reached_goal": reached_goal,
+            "message": message,
+            "remaining_fuel": remaining_fuel,
+            "remaining_food": remaining_food,
+        }
+
+    return {
+        "get_task_context": get_task_context,
+        "get_deterministic_candidate": get_deterministic_candidate,
+        "validate_candidate_route": validate_candidate_route,
+    }
+
+
+def execute_model_tool_call(
+    tool_call: ToolCall,
+    handlers: dict[str, Any],
+) -> dict[str, Any]:
+    if tool_call.name not in handlers:
+        raise OpenRouterError(f"Model called unknown tool: {tool_call.name!r}")
+
+    result = handlers[tool_call.name](tool_call.arguments)
+    return {
+        "role": "tool",
+        "tool_call_id": tool_call.id,
+        "name": tool_call.name,
+        "content": json.dumps(result, ensure_ascii=False),
+    }
+
+
 def choose_route_with_openrouter(
     preview: PreviewState,
     specs: dict[str, VehicleSpec],
     deterministic_answer: list[str],
 ) -> list[str]:
     client = build_openrouter_client()
-    system_prompt = """You are helping solve a grid route-planning task.
+    handlers = build_model_tool_handlers(preview, specs, deterministic_answer)
+    system_prompt = """You are solving a grid route-planning task.
 
-Return JSON only with this schema:
-{
-  "answer": ["vehicle_name", "up", "down", "left", "right", "dismount"],
-  "reason": "short explanation"
-}
+You must work only through tool calling before giving a final answer.
 
 Rules:
-- First item must be one of: walk, horse, car, rocket.
-- You may only choose a vehicle in the first step.
+- Use tools to inspect the task context and at least validate the final route.
+- First item of the route must be one of: walk, horse, car, rocket.
+- Vehicle selection is allowed only in the first step.
 - Later you may use dismount to switch to walk.
 - Rocks are impassable.
 - Car and rocket cannot enter water.
-- Tree tiles are passable, but non-walk modes pay an extra 0.3 fuel on trees.
-- Resource limits are strict: both fuel and food must stay above zero.
-- Minimize food use first, then fuel use.
-"""
-    user_prompt = {
-        "map": preview_to_prompt(preview),
-        "start": {"row": preview.start.row + 1, "col": preview.start.col + 1},
-        "goal": {"row": preview.goal.row + 1, "col": preview.goal.col + 1},
-        "resources": {"fuel": 10, "food": 10},
-        "vehicles": {
-            name: {"fuel_per_move": spec.fuel_per_move, "food_per_move": spec.food_per_move}
-            for name, spec in specs.items()
-        },
-        "deterministic_candidate": deterministic_answer,
-    }
-    result = client.create_completion(
-        [
-            {"role": "system", "content": system_prompt},
-            {
-                "role": "user",
-                "content": (
-                    "Find the best valid route for this task. "
-                    "Use the deterministic candidate as a hint, not a constraint.\n\n"
-                    f"{json.dumps(user_prompt, ensure_ascii=False, indent=2)}"
-                ),
-            },
-        ],
-        extra_payload={"response_format": {"type": "json_object"}},
-    )
-    if not result.content:
-        raise OpenRouterError("OpenRouter did not return route content.")
+- Tree tiles are passable, but non-walk modes pay extra fuel on trees.
+- Resource limits are strict: fuel and food must stay above zero.
+- Optimize for highest remaining food first, then highest remaining fuel.
 
-    payload = json.loads(result.content)
-    write_json(MODEL_ROUTE_PATH, payload)
-    answer = payload.get("answer")
-    if not isinstance(answer, list) or not all(isinstance(item, str) for item in answer):
-        raise OpenRouterError("OpenRouter returned an invalid answer list.")
-    return [item.strip() for item in answer if item.strip()]
+Final answer format:
+Return JSON only:
+{
+  "answer": ["vehicle", "..."],
+  "reason": "short explanation"
+}
+"""
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": system_prompt},
+        {
+            "role": "user",
+            "content": "Find the best valid route for the current savethem map.",
+        },
+    ]
+
+    for _ in range(MODEL_MAX_STEPS):
+        completion = client.create_completion(messages, tools=SAVE_THEM_TOOLS)
+        assistant_message: dict[str, Any] = {
+            "role": "assistant",
+            "content": completion.content or "",
+        }
+        if completion.tool_calls:
+            assistant_message["tool_calls"] = [
+                tool_call.to_message_dict() for tool_call in completion.tool_calls
+            ]
+            messages.append(assistant_message)
+            for tool_call in completion.tool_calls:
+                messages.append(execute_model_tool_call(tool_call, handlers))
+            continue
+
+        if not completion.content:
+            raise OpenRouterError("OpenRouter returned neither content nor tool calls.")
+
+        payload = json.loads(completion.content)
+        write_json(MODEL_ROUTE_PATH, payload)
+        return normalize_answer(payload.get("answer"))
+
+    raise OpenRouterError("OpenRouter tool calling did not finish within the step limit.")
 
 
 def submit_answer(answer: list[str], *, api_key: str) -> Any:

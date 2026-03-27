@@ -20,7 +20,12 @@ from devs_utilities.files import write_json
 from devs_utilities.flags import extract_flag
 from devs_utilities.http import HttpRequestError
 from devs_utilities.logging import configure_logging, logger as shared_logger
-from devs_utilities.openrouter import OpenRouterClient, OpenRouterConfig, OpenRouterError
+from devs_utilities.openrouter import (
+    OpenRouterClient,
+    OpenRouterConfig,
+    OpenRouterError,
+    ToolCall,
+)
 from repo_env import get_env, get_int_env, get_optional_env
 
 
@@ -57,10 +62,12 @@ Goal:
 Rules:
 - Blocks move exactly one step after every command.
 - You will receive only safe candidate moves.
+- Use tool calling before the final answer.
 - Choose the best candidate move for this turn.
 - Return valid JSON only, following the provided schema.
 - Keep the reason short and concrete.
 """
+MODEL_MAX_STEPS = 4
 
 
 @dataclass(frozen=True, slots=True)
@@ -400,6 +407,40 @@ def build_decision_prompt(
     )
 
 
+REACTOR_TOOLS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_turn_context",
+            "description": "Get the current reactor board and all safe move options.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "validate_command_choice",
+            "description": "Validate that a proposed command is among the safe options for this turn.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "enum": ["left", "wait", "right"],
+                    }
+                },
+                "required": ["command"],
+                "additionalProperties": False,
+            },
+        },
+    },
+]
+
+
 def parse_model_decision(
     raw_content: str,
     *,
@@ -423,6 +464,47 @@ def parse_model_decision(
     return ModelDecision(command=command, reason=reason.strip())
 
 
+def build_reactor_tool_handlers(
+    state: ReactorState,
+    options: list[ReactorOption],
+) -> dict[str, Any]:
+    allowed_commands = {option.command for option in options}
+
+    def get_turn_context(_: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "prompt": build_decision_prompt(state, options),
+            "allowed_commands": sorted(allowed_commands),
+        }
+
+    def validate_command_choice(arguments: dict[str, Any]) -> dict[str, Any]:
+        command = str(arguments.get("command", "")).strip()
+        return {
+            "command": command,
+            "is_safe": command in allowed_commands,
+            "allowed_commands": sorted(allowed_commands),
+        }
+
+    return {
+        "get_turn_context": get_turn_context,
+        "validate_command_choice": validate_command_choice,
+    }
+
+
+def execute_reactor_tool_call(
+    tool_call: ToolCall,
+    handlers: dict[str, Any],
+) -> dict[str, Any]:
+    if tool_call.name not in handlers:
+        raise OpenRouterError(f"Unknown reactor tool call: {tool_call.name!r}")
+    result = handlers[tool_call.name](tool_call.arguments)
+    return {
+        "role": "tool",
+        "tool_call_id": tool_call.id,
+        "name": tool_call.name,
+        "content": json.dumps(result, ensure_ascii=False),
+    }
+
+
 def choose_command_with_openrouter(
     *,
     client: OpenRouterClient,
@@ -430,27 +512,35 @@ def choose_command_with_openrouter(
     options: list[ReactorOption],
 ) -> ModelDecision:
     allowed_commands = [option.command for option in options]
-    completion = client.create_completion(
-        [
-            {"role": "system", "content": MODEL_SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": build_decision_prompt(state, options),
-            },
-        ],
-        extra_payload={
-            "response_format": {
-                "type": "json_schema",
-                "json_schema": build_decision_schema(allowed_commands),
-            }
+    handlers = build_reactor_tool_handlers(state, options)
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": MODEL_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": "Choose the best reactor move for this turn.",
         },
-    )
-    if not completion.content:
-        raise OpenRouterError("OpenRouter returned no content for reactor move.")
-    return parse_model_decision(
-        completion.content,
-        allowed_commands=set(allowed_commands),
-    )
+    ]
+    for _ in range(MODEL_MAX_STEPS):
+        completion = client.create_completion(messages, tools=REACTOR_TOOLS)
+        assistant_message: dict[str, Any] = {
+            "role": "assistant",
+            "content": completion.content or "",
+        }
+        if completion.tool_calls:
+            assistant_message["tool_calls"] = [
+                tool_call.to_message_dict() for tool_call in completion.tool_calls
+            ]
+            messages.append(assistant_message)
+            for tool_call in completion.tool_calls:
+                messages.append(execute_reactor_tool_call(tool_call, handlers))
+            continue
+        if not completion.content:
+            raise OpenRouterError("OpenRouter returned no content for reactor move.")
+        return parse_model_decision(
+            completion.content,
+            allowed_commands=set(allowed_commands),
+        )
+    raise OpenRouterError("OpenRouter tool calling did not finish for reactor move.")
 
 
 def resolve_command_choice(

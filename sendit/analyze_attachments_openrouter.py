@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import json
 import mimetypes
 import sys
 from dataclasses import dataclass
@@ -17,7 +18,13 @@ if str(REPO_ROOT_HINT) not in sys.path:
 from devs_utilities.bootstrap import bootstrap_repo
 from devs_utilities.files import read_text_with_fallback, resolve_path, write_json
 from devs_utilities.logging import configure_logging, logger as shared_logger
-from devs_utilities.openrouter import OpenRouterClient, OpenRouterConfig, extract_completion_result
+from devs_utilities.openrouter import (
+    OpenRouterClient,
+    OpenRouterConfig,
+    OpenRouterError,
+    ToolCall,
+    extract_completion_result,
+)
 from repo_env import get_env, get_int_env, get_optional_env
 
 
@@ -29,6 +36,7 @@ OPENROUTER_URL = get_env("OPENROUTER_BASE_URL")
 DEFAULT_MODEL = get_env("OPENROUTER_MODEL", "openai/gpt-4.1-mini") or "openai/gpt-4.1-mini"
 DEFAULT_MAX_TEXT_CHARS = get_int_env("SENDIT_ANALYZE_MAX_TEXT_CHARS", 24_000) or 24_000
 OPENROUTER_TIMEOUT_SECONDS = get_int_env("OPENROUTER_TIMEOUT_SECONDS", 120) or 120
+MODEL_MAX_STEPS = 3
 DEFAULT_SITE_NAME = (
     get_optional_env("OPENROUTER_SITE_NAME")
     or get_optional_env("OPENROUTER_APP_TITLE")
@@ -195,6 +203,97 @@ def output_path_for(target: AnalysisTarget, output_dir: Path, output_format: str
     return output_dir / f"{target.path.stem}{extension}"
 
 
+SENDIT_ANALYZE_TOOLS: list[dict[str, object]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_analysis_target_context",
+            "description": "Return the full message payload for the current attachment analysis target.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+        },
+    }
+]
+
+
+def build_sendit_analyze_handlers(
+    target: AnalysisTarget,
+    question: str,
+    max_text_chars: int,
+) -> dict[str, object]:
+    messages = build_messages(target, question, max_text_chars)
+
+    def get_analysis_target_context(_: dict[str, object]) -> dict[str, object]:
+        return {"messages": messages, "kind": target.kind, "filename": target.path.name}
+
+    return {"get_analysis_target_context": get_analysis_target_context}
+
+
+def execute_sendit_analyze_tool_call(
+    tool_call: ToolCall,
+    handlers: dict[str, object],
+) -> dict[str, object]:
+    if tool_call.name not in handlers:
+        raise OpenRouterError(f"Unknown sendit analyze tool call: {tool_call.name!r}")
+    result = handlers[tool_call.name](tool_call.arguments)
+    return {
+        "role": "tool",
+        "tool_call_id": tool_call.id,
+        "name": tool_call.name,
+        "content": json.dumps(result, ensure_ascii=False),
+    }
+
+
+def analyze_target_with_tool_calling(
+    openrouter_client: OpenRouterClient,
+    target: AnalysisTarget,
+    question: str,
+    max_text_chars: int,
+) -> dict[str, object]:
+    handlers = build_sendit_analyze_handlers(target, question, max_text_chars)
+    messages: list[dict[str, object]] = [
+        {
+            "role": "system",
+            "content": (
+                "Analizujesz pojedynczy plik dokumentacyjny. "
+                "Użyj tool callingu przed finalną odpowiedzią."
+            ),
+        },
+        {
+            "role": "user",
+            "content": f"Przeanalizuj plik {target.path.name}.",
+        },
+    ]
+    for _ in range(MODEL_MAX_STEPS):
+        response_json = openrouter_client.create_completion(
+            messages,
+            tools=SENDIT_ANALYZE_TOOLS,
+        )
+        assistant_message: dict[str, object] = {
+            "role": "assistant",
+            "content": response_json.content or "",
+        }
+        if response_json.tool_calls:
+            assistant_message["tool_calls"] = [
+                tool_call.to_message_dict() for tool_call in response_json.tool_calls
+            ]
+            messages.append(assistant_message)
+            for tool_call in response_json.tool_calls:
+                messages.append(execute_sendit_analyze_tool_call(tool_call, handlers))
+            continue
+        return {
+            "content": response_json.content or "",
+            "raw": {
+                "content": response_json.content,
+                "tool_calls": [tool_call.to_message_dict() for tool_call in response_json.tool_calls],
+            },
+        }
+    raise OpenRouterError("OpenRouter tool calling did not finish for sendit analysis.")
+
+
 def main() -> int:
     configure_logging(name="sendit.analyze")
     if not OPENROUTER_URL:
@@ -243,16 +342,20 @@ def main() -> int:
     for target in targets:
         logger.info("Analizuje: {}", target.path.name)
         try:
-            messages = build_messages(target, args.question, args.max_text_chars)
-            response_json = openrouter_client.create_raw_completion(messages)
+            response_json = analyze_target_with_tool_calling(
+                openrouter_client,
+                target,
+                args.question,
+                args.max_text_chars,
+            )
             destination = output_path_for(target, output_dir, args.format)
             if args.format == "json":
                 write_json_report(destination, response_json)
             else:
-                completion = extract_completion_result(response_json)
-                if not completion.content:
+                content = str(response_json.get("content") or "").strip()
+                if not content:
                     raise ValueError("Nie udalo sie odczytac tresci odpowiedzi modelu.")
-                write_text_report(destination, completion.content)
+                write_text_report(destination, content)
             logger.success("Zapisano wynik do {}", destination)
         except (RuntimeError, ValueError, OSError) as error:
             failures += 1

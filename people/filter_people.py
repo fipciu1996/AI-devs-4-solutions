@@ -18,7 +18,12 @@ from devs_utilities.ag3nts import AG3NTS_VERIFY_URL, submit_task_answer
 from devs_utilities.bootstrap import bootstrap_repo
 from devs_utilities.files import resolve_path, write_json
 from devs_utilities.logging import configure_logging, logger as shared_logger
-from devs_utilities.openrouter import OpenRouterClient, OpenRouterConfig, extract_completion_result
+from devs_utilities.openrouter import (
+    OpenRouterClient,
+    OpenRouterConfig,
+    OpenRouterError,
+    ToolCall,
+)
 from repo_env import get_env, get_int_env, get_optional_env
 
 
@@ -60,6 +65,7 @@ CSV_COLUMNS = {
     "birthCountry",
     "job",
 }
+MODEL_MAX_STEPS = 4
 
 
 @dataclass(slots=True)
@@ -268,6 +274,116 @@ def build_llm_prompt(batch: list[Person]) -> str:
     )
 
 
+PEOPLE_FILTER_TOOLS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_job_batch_context",
+            "description": "Return the current batch of job descriptions and allowed tags.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "validate_tag_results",
+            "description": "Validate that the proposed tags contain all expected row_id values and only allowed tags.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "results": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "row_id": {"type": "integer"},
+                                "tags": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                },
+                            },
+                            "required": ["row_id", "tags"],
+                            "additionalProperties": False,
+                        },
+                    }
+                },
+                "required": ["results"],
+                "additionalProperties": False,
+            },
+        },
+    },
+]
+
+
+def parse_classification_result(raw_content: str) -> dict[int, list[str]]:
+    parsed = json.loads(raw_content)
+    tags_by_row_id: dict[int, list[str]] = {}
+    for item in parsed["results"]:
+        row_id = int(item["row_id"])
+        tags = [str(tag) for tag in item["tags"]]
+        tags_by_row_id[row_id] = tags
+    return tags_by_row_id
+
+
+def build_people_filter_handlers(batch: list[Person]) -> dict[str, Any]:
+    expected_ids = {person.row_id for person in batch}
+    allowed_tags = set(ALLOWED_TAGS)
+
+    def get_job_batch_context(_: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "prompt": build_llm_prompt(batch),
+            "allowed_tags": ALLOWED_TAGS,
+            "row_ids": sorted(expected_ids),
+        }
+
+    def validate_tag_results(arguments: dict[str, Any]) -> dict[str, Any]:
+        results = arguments.get("results")
+        if not isinstance(results, list):
+            return {"is_valid": False, "message": "results must be a list"}
+        received_ids: set[int] = set()
+        invalid_tags: list[str] = []
+        for item in results:
+            if not isinstance(item, dict):
+                continue
+            if isinstance(item.get("row_id"), int):
+                received_ids.add(int(item["row_id"]))
+            tags = item.get("tags")
+            if isinstance(tags, list):
+                for tag in tags:
+                    if isinstance(tag, str) and tag not in allowed_tags:
+                        invalid_tags.append(tag)
+        return {
+            "is_valid": received_ids == expected_ids and not invalid_tags,
+            "expected_row_ids": sorted(expected_ids),
+            "received_row_ids": sorted(received_ids),
+            "invalid_tags": sorted(set(invalid_tags)),
+        }
+
+    return {
+        "get_job_batch_context": get_job_batch_context,
+        "validate_tag_results": validate_tag_results,
+    }
+
+
+def execute_people_filter_tool_call(
+    tool_call: ToolCall,
+    handlers: dict[str, Any],
+) -> dict[str, Any]:
+    if tool_call.name not in handlers:
+        raise OpenRouterError(f"Unknown people.filter tool call: {tool_call.name!r}")
+    result = handlers[tool_call.name](tool_call.arguments)
+    return {
+        "role": "tool",
+        "tool_call_id": tool_call.id,
+        "name": tool_call.name,
+        "content": json.dumps(result, ensure_ascii=False),
+    }
+
+
 def classify_jobs(
     batch: list[Person],
     config: AppConfig,
@@ -277,40 +393,39 @@ def classify_jobs(
         raise ValueError(
             "Brakuje OPENROUTER_API_KEY lub openrouter_api_key w configu."
         )
-
-    response = openrouter_client.create_raw_completion(
-        [
-            {
-                "role": "system",
-                "content": (
-                    "Jesteś klasyfikatorem zawodów. "
-                    "Zwracasz wyłącznie dane zgodne ze schematem JSON."
-                ),
-            },
-            {
-                "role": "user",
-                "content": build_llm_prompt(batch),
-            },
-        ],
-        extra_payload={
-            "response_format": {
-                "type": "json_schema",
-                "json_schema": build_llm_schema(),
-            }
+    handlers = build_people_filter_handlers(batch)
+    messages: list[dict[str, Any]] = [
+        {
+            "role": "system",
+            "content": (
+                "Jesteś klasyfikatorem zawodów. "
+                "Użyj tool callingu przed finalną odpowiedzią i zwróć wyłącznie JSON."
+            ),
         },
-    )
-    completion = extract_completion_result(response)
-    raw_text = str(completion.content or "").strip()
-    if not raw_text:
-        raise RuntimeError(f"Brak treści w odpowiedzi modelu: {response}")
-
-    parsed = json.loads(raw_text)
-    tags_by_row_id: dict[int, list[str]] = {}
-    for item in parsed["results"]:
-        row_id = int(item["row_id"])
-        tags = [str(tag) for tag in item["tags"]]
-        tags_by_row_id[row_id] = tags
-    return tags_by_row_id
+        {
+            "role": "user",
+            "content": "Sklasyfikuj bieżącą partię zawodów.",
+        },
+    ]
+    for _ in range(MODEL_MAX_STEPS):
+        completion = openrouter_client.create_completion(messages, tools=PEOPLE_FILTER_TOOLS)
+        assistant_message: dict[str, Any] = {
+            "role": "assistant",
+            "content": completion.content or "",
+        }
+        if completion.tool_calls:
+            assistant_message["tool_calls"] = [
+                tool_call.to_message_dict() for tool_call in completion.tool_calls
+            ]
+            messages.append(assistant_message)
+            for tool_call in completion.tool_calls:
+                messages.append(execute_people_filter_tool_call(tool_call, handlers))
+            continue
+        raw_text = str(completion.content or "").strip()
+        if not raw_text:
+            raise RuntimeError("Brak treści w odpowiedzi modelu.")
+        return parse_classification_result(raw_text)
+    raise OpenRouterError("OpenRouter tool calling did not finish for people.filter.")
 
 
 def classify_all(

@@ -14,7 +14,12 @@ if str(REPO_ROOT_HINT) not in sys.path:
 from devs_utilities.bootstrap import bootstrap_repo
 from devs_utilities.files import read_text_with_fallback, resolve_path, write_json
 from devs_utilities.logging import configure_logging, logger as shared_logger
-from devs_utilities.openrouter import OpenRouterClient, OpenRouterConfig, extract_completion_result
+from devs_utilities.openrouter import (
+    OpenRouterClient,
+    OpenRouterConfig,
+    OpenRouterError,
+    ToolCall,
+)
 from repo_env import get_env, get_int_env, get_optional_env
 
 
@@ -32,6 +37,7 @@ DEFAULT_SITE_NAME = (
 )
 DEFAULT_SYSTEM_PROMPT_FILE = get_env("SENDIT_SYSTEM_PROMPT_FILE", "openrouter_system_prompt.txt")
 OPENROUTER_TIMEOUT_SECONDS = get_int_env("OPENROUTER_TIMEOUT_SECONDS", 120) or 120
+MODEL_MAX_STEPS = 4
 
 
 def parse_args() -> argparse.Namespace:
@@ -200,6 +206,132 @@ def parse_model_json(response_text: str) -> dict[str, object]:
     return parsed
 
 
+SENDIT_DRAFT_TOOLS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_declaration_context",
+            "description": "Return the full declaration-building context, including shipment data and documentation bundle.",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "validate_declaration_payload",
+            "description": "Validate that the proposed declaration payload has the required top-level keys.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "status": {"type": "string"},
+                    "declaration_text": {"type": "string"},
+                    "review_notes": {"type": "array", "items": {"type": "string"}},
+                    "evidence": {"type": "object"},
+                    "cheapest_legal_option_summary": {"type": "string"},
+                },
+                "required": [
+                    "status",
+                    "declaration_text",
+                    "review_notes",
+                    "evidence",
+                    "cheapest_legal_option_summary",
+                ],
+                "additionalProperties": True,
+            },
+        },
+    },
+]
+
+
+def build_sendit_draft_handlers(
+    system_prompt: str,
+    documentation_bundle: str,
+    shipment: dict[str, object],
+) -> dict[str, Any]:
+    messages = build_messages(system_prompt, documentation_bundle, shipment)
+
+    def get_declaration_context(_: dict[str, object]) -> dict[str, object]:
+        return {"messages": messages}
+
+    def validate_declaration_payload(arguments: dict[str, object]) -> dict[str, object]:
+        required = {
+            "status",
+            "declaration_text",
+            "review_notes",
+            "evidence",
+            "cheapest_legal_option_summary",
+        }
+        present = {key for key in arguments if key in required}
+        return {
+            "is_valid": present == required,
+            "missing_keys": sorted(required - present),
+        }
+
+    return {
+        "get_declaration_context": get_declaration_context,
+        "validate_declaration_payload": validate_declaration_payload,
+    }
+
+
+def execute_sendit_draft_tool_call(
+    tool_call: ToolCall,
+    handlers: dict[str, Any],
+) -> dict[str, Any]:
+    if tool_call.name not in handlers:
+        raise OpenRouterError(f"Unknown sendit draft tool call: {tool_call.name!r}")
+    result = handlers[tool_call.name](tool_call.arguments)
+    return {
+        "role": "tool",
+        "tool_call_id": tool_call.id,
+        "name": tool_call.name,
+        "content": json.dumps(result, ensure_ascii=False),
+    }
+
+
+def build_draft_with_tool_calling(
+    openrouter_client: OpenRouterClient,
+    system_prompt: str,
+    documentation_bundle: str,
+    shipment: dict[str, object],
+) -> dict[str, object]:
+    handlers = build_sendit_draft_handlers(system_prompt, documentation_bundle, shipment)
+    messages: list[dict[str, Any]] = [
+        {
+            "role": "system",
+            "content": (
+                "Budujesz roboczy draft deklaracji. "
+                "Użyj tool callingu przed finalną odpowiedzią i zwróć tylko JSON."
+            ),
+        },
+        {
+            "role": "user",
+            "content": "Przygotuj draft deklaracji dla bieżącej przesyłki.",
+        },
+    ]
+    for _ in range(MODEL_MAX_STEPS):
+        completion = openrouter_client.create_completion(messages, tools=SENDIT_DRAFT_TOOLS)
+        assistant_message: dict[str, Any] = {
+            "role": "assistant",
+            "content": completion.content or "",
+        }
+        if completion.tool_calls:
+            assistant_message["tool_calls"] = [
+                tool_call.to_message_dict() for tool_call in completion.tool_calls
+            ]
+            messages.append(assistant_message)
+            for tool_call in completion.tool_calls:
+                messages.append(execute_sendit_draft_tool_call(tool_call, handlers))
+            continue
+        if not completion.content:
+            raise ValueError("Nie udalo sie odczytac tresci odpowiedzi modelu.")
+        return parse_model_json(completion.content)
+    raise OpenRouterError("OpenRouter tool calling did not finish for sendit draft.")
+
+
 def write_outputs(
     *,
     output_dir: Path,
@@ -302,13 +434,12 @@ def main() -> int:
     logger.info("Buduje roboczy draft deklaracji na podstawie {}.", shipment_file.name)
 
     try:
-        response_json = openrouter_client.create_raw_completion(
-            build_messages(system_prompt, documentation_bundle, shipment)
+        result = build_draft_with_tool_calling(
+            openrouter_client,
+            system_prompt,
+            documentation_bundle,
+            shipment,
         )
-        completion = extract_completion_result(response_json)
-        if not completion.content:
-            raise ValueError("Nie udalo sie odczytac tresci odpowiedzi modelu.")
-        result = parse_model_json(completion.content)
         write_outputs(output_dir=output_dir, task=args.task, result=result)
     except (RuntimeError, OSError, ValueError, json.JSONDecodeError) as error:
         logger.error("Nie udalo sie przygotowac draftu: {}", error)
