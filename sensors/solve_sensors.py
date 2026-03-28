@@ -31,7 +31,14 @@ from devs_utilities.openrouter import (
     OpenRouterError,
     ToolCall,
 )
-from repo_env import get_env, get_int_env, get_optional_env
+from repo_env import (
+    get_course_api_key,
+    get_env,
+    get_int_env,
+    get_llm_api_key,
+    get_llm_base_url,
+    get_optional_env,
+)
 
 
 REPO_ROOT = bootstrap_repo(__file__)
@@ -543,8 +550,8 @@ def chunked(items: list[T], size: int) -> list[list[T]]:
 
 
 def build_openrouter_client(model_override: str | None) -> OpenRouterClient:
-    api_key = get_env("OPENROUTER_API_KEY")
-    base_url = get_env("OPENROUTER_BASE_URL")
+    api_key = get_llm_api_key()
+    base_url = get_llm_base_url()
     model = model_override or get_optional_env("OPENROUTER_MODEL") or DEFAULT_MODEL
     resolved_model = LEGACY_MODEL_ALIASES.get(model, model)
     if resolved_model != model:
@@ -564,9 +571,9 @@ def build_openrouter_client(model_override: str | None) -> OpenRouterClient:
 
     missing: list[str] = []
     if not api_key:
-        missing.append("OPENROUTER_API_KEY")
+        missing.append("LLM_API_KEY")
     if not base_url:
-        missing.append("OPENROUTER_BASE_URL")
+        missing.append("LLM_BASE_URL")
     if missing:
         raise SystemExit(f"Missing required OpenRouter settings: {', '.join(missing)}")
 
@@ -933,7 +940,7 @@ def build_final_answer(
         decision.file_id for decision in decisions if decision.is_anomaly
     )
     answer = {"recheck": sorted(final_ids)}
-    return build_task_answer_payload(get_env("AG3NTS_API_KEY"), TASK_NAME, answer)
+    return build_task_answer_payload(get_course_api_key(), TASK_NAME, answer)
 
 
 def verify_answer(payload: dict[str, Any]) -> Any:

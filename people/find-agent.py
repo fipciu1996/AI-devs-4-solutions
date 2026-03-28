@@ -34,14 +34,21 @@ from devs_utilities.openrouter import (
     OpenRouterError,
     ToolCall,
 )
-from repo_env import get_env, get_int_env, get_optional_env
+from repo_env import (
+    get_course_api_key,
+    get_env,
+    get_int_env,
+    get_llm_api_key,
+    get_llm_base_url,
+    get_optional_env,
+)
 
 
 REPO_ROOT = bootstrap_repo(__file__)
 logger = shared_logger.bind(component="people.find")
 
 
-OPENROUTER_API_URL = get_env("OPENROUTER_BASE_URL")
+OPENROUTER_API_URL = get_llm_base_url()
 TASK_NAME = "findhim"
 DEFAULT_OPENROUTER_MODEL = get_env("OPENROUTER_MODEL", "openai/gpt-4.1-mini") or "openai/gpt-4.1-mini"
 API_TIMEOUT_SECONDS = get_int_env("PEOPLE_TIMEOUT_SECONDS", 120) or 120
@@ -54,8 +61,8 @@ MODEL_MAX_STEPS = 4
 
 @dataclass(slots=True)
 class AppConfig:
-    hub_api_key: str
-    openrouter_api_key: str
+    course_api_key: str
+    llm_api_key: str
     openrouter_model: str
     site_url: str | None
     site_name: str | None
@@ -149,11 +156,11 @@ def load_config(path: Path, args: argparse.Namespace) -> AppConfig:
         payload = json.loads(path.read_text(encoding="utf-8"))
 
     hub_api_key = str(
-        payload.get("hub_api_key") or get_env("AG3NTS_API_KEY") or ""
+        payload.get("course_api_key") or get_course_api_key() or ""
     ).strip()
     openrouter_api_key = str(
-        payload.get("openrouter_api_key")
-        or get_env("OPENROUTER_API_KEY")
+        payload.get("llm_api_key")
+        or get_llm_api_key()
         or ""
     ).strip()
     openrouter_model = str(payload.get("openrouter_model") or DEFAULT_OPENROUTER_MODEL).strip()
@@ -170,13 +177,13 @@ def load_config(path: Path, args: argparse.Namespace) -> AppConfig:
         openrouter_model = args.model
 
     if not hub_api_key:
-        raise ValueError("Brakuje AG3NTS_API_KEY lub hub_api_key w configu.")
+        raise ValueError("Brakuje COURSE_API_KEY lub course_api_key w configu.")
     if not openrouter_api_key:
-        raise ValueError("Brakuje OPENROUTER_API_KEY lub openrouter_api_key w configu.")
+        raise ValueError("Brakuje LLM_API_KEY lub llm_api_key w configu.")
 
     return AppConfig(
-        hub_api_key=hub_api_key,
-        openrouter_api_key=openrouter_api_key,
+        course_api_key=hub_api_key,
+        llm_api_key=openrouter_api_key,
         openrouter_model=openrouter_model,
         site_url=site_url,
         site_name=site_name,
@@ -213,7 +220,7 @@ def load_suspects(path: Path, birth_years: dict[tuple[str, str], int]) -> list[S
 def fetch_power_plants(config: AppConfig, path: Path, refresh: bool) -> dict[str, Any]:
     if path.exists() and not refresh:
         return json.loads(path.read_text(encoding="utf-8"))
-    url = build_ag3nts_task_data_url(config.hub_api_key, "findhim_locations.json")
+    url = build_ag3nts_task_data_url(config.course_api_key, "findhim_locations.json")
     payload = http_get_json(url, timeout_seconds=API_TIMEOUT_SECONDS)
     write_json(path, payload)
     return payload
@@ -488,7 +495,7 @@ def normalize_location_entry(entry: Any) -> Coordinate | None:
 
 def fetch_person_locations(config: AppConfig, suspect: Suspect) -> list[Coordinate]:
     payload = {
-        "apikey": config.hub_api_key,
+        "apikey": config.course_api_key,
         "name": suspect.name,
         "surname": suspect.surname,
     }
@@ -523,7 +530,7 @@ def fetch_person_locations(config: AppConfig, suspect: Suspect) -> list[Coordina
 
 def fetch_access_level(config: AppConfig, suspect: Suspect) -> int:
     payload = {
-        "apikey": config.hub_api_key,
+        "apikey": config.course_api_key,
         "name": suspect.name,
         "surname": suspect.surname,
         "birthYear": suspect.birth_year,
@@ -580,7 +587,7 @@ def build_verify_payload(match: CandidateMatch, config: AppConfig) -> dict[str, 
     if match.access_level is None:
         raise ValueError("Brak access_level w najlepszym dopasowaniu.")
     return {
-        "apikey": config.hub_api_key,
+        "apikey": config.course_api_key,
         "task": TASK_NAME,
         "answer": {
             "name": match.suspect.name,
@@ -594,7 +601,7 @@ def build_verify_payload(match: CandidateMatch, config: AppConfig) -> dict[str, 
 def main() -> None:
     configure_logging(name="people.find")
     if not OPENROUTER_API_URL:
-        raise ValueError("Missing OPENROUTER_BASE_URL in .env.")
+        raise ValueError("Missing LLM_BASE_URL in the local repository config.")
     args = parse_args()
     people_dir = REPO_ROOT / "people"
     config = load_config(resolve_path(args.config, people_dir), args)
@@ -607,7 +614,7 @@ def main() -> None:
     )
     openrouter_client = OpenRouterClient(
         OpenRouterConfig(
-            api_key=config.openrouter_api_key,
+            api_key=config.llm_api_key,
             base_url=OPENROUTER_API_URL,
             model=config.openrouter_model,
             timeout_seconds=OPENROUTER_TIMEOUT_SECONDS,

@@ -22,7 +22,7 @@ from devs_utilities.ag3nts import (
 from devs_utilities.bootstrap import bootstrap_repo
 from devs_utilities.http import HttpRequestError, get_text
 from devs_utilities.logging import configure_logging, logger as shared_logger
-from repo_env import get_env, get_int_env
+from repo_env import get_course_api_key, get_env, get_int_env
 
 
 REPO_ROOT = bootstrap_repo(__file__)
@@ -48,7 +48,7 @@ class Item:
 
 
 def get_api_key() -> str:
-    return get_env("AG3NTS_API_KEY")
+    return get_course_api_key()
 
 
 def build_data_url(api_key: str) -> str:
@@ -283,7 +283,7 @@ def main() -> int:
     configure_logging(name="categorize")
     api_key = get_api_key()
     if not api_key:
-        logger.error("Missing AG3NTS_API_KEY in .env.")
+        logger.error("Missing COURSE_API_KEY in the local repository config.")
         return 1
     data_url = build_data_url(api_key)
 

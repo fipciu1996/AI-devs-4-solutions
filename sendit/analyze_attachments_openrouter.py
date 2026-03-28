@@ -25,14 +25,14 @@ from devs_utilities.openrouter import (
     ToolCall,
     extract_completion_result,
 )
-from repo_env import get_env, get_int_env, get_optional_env
+from repo_env import get_env, get_int_env, get_llm_api_key, get_llm_base_url, get_optional_env
 
 
 REPO_ROOT = bootstrap_repo(__file__)
 logger = shared_logger.bind(component="sendit.analyze")
 
 
-OPENROUTER_URL = get_env("OPENROUTER_BASE_URL")
+OPENROUTER_URL = get_llm_base_url()
 DEFAULT_MODEL = get_env("OPENROUTER_MODEL", "openai/gpt-4.1-mini") or "openai/gpt-4.1-mini"
 DEFAULT_MAX_TEXT_CHARS = get_int_env("SENDIT_ANALYZE_MAX_TEXT_CHARS", 24_000) or 24_000
 OPENROUTER_TIMEOUT_SECONDS = get_int_env("OPENROUTER_TIMEOUT_SECONDS", 120) or 120
@@ -297,7 +297,7 @@ def analyze_target_with_tool_calling(
 def main() -> int:
     configure_logging(name="sendit.analyze")
     if not OPENROUTER_URL:
-        logger.error("Brak OPENROUTER_BASE_URL w .env.")
+        logger.error("Brak LLM_BASE_URL w lokalnej konfiguracji repo.")
         return 1
     args = parse_args()
     base_dir = Path.cwd()
@@ -309,12 +309,12 @@ def main() -> int:
         logger.error("Brak katalogu wejsciowego: {}", input_dir)
         return 1
 
-    api_key = get_env("OPENROUTER_API_KEY") or None
+    api_key = get_llm_api_key() or None
 
     if not api_key:
         logger.error(
-            "Brak klucza OpenRouter. Ustaw OPENROUTER_API_KEY w {} "
-            "albo zmienna srodowiskowa OPENROUTER_API_KEY.",
+            "Brak klucza bramy LLM. Ustaw LLM_API_KEY w {} "
+            "albo zmienna srodowiskowa LLM_API_KEY.",
             project_root / ".env",
         )
         return 1

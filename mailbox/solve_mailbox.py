@@ -29,7 +29,14 @@ from devs_utilities.openrouter import (
     OpenRouterError,
     ToolCall,
 )
-from repo_env import get_env, get_int_env, get_optional_env
+from repo_env import (
+    get_course_api_key,
+    get_env,
+    get_int_env,
+    get_llm_api_key,
+    get_llm_base_url,
+    get_optional_env,
+)
 
 
 REPO_ROOT = bootstrap_repo(__file__)
@@ -154,9 +161,9 @@ def parse_args() -> argparse.Namespace:
 
 
 def build_config(args: argparse.Namespace) -> AppConfig:
-    ag3nts_api_key = get_env("AG3NTS_API_KEY")
-    openrouter_api_key = get_env("OPENROUTER_API_KEY")
-    openrouter_url = get_env("OPENROUTER_BASE_URL")
+    ag3nts_api_key = get_course_api_key()
+    openrouter_api_key = get_llm_api_key()
+    openrouter_url = get_llm_base_url()
     model = (args.model or DEFAULT_MODEL).strip()
     zmail_url = DEFAULT_ZMAIL_URL
 
@@ -180,11 +187,11 @@ def build_config(args: argparse.Namespace) -> AppConfig:
 
     missing: list[str] = []
     if not ag3nts_api_key:
-        missing.append("AG3NTS_API_KEY")
+        missing.append("COURSE_API_KEY")
     if not openrouter_api_key:
-        missing.append("OPENROUTER_API_KEY")
+        missing.append("LLM_API_KEY")
     if not openrouter_url:
-        missing.append("OPENROUTER_BASE_URL")
+        missing.append("LLM_BASE_URL")
 
     if missing:
         joined = ", ".join(missing)

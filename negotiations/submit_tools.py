@@ -8,7 +8,8 @@ from pathlib import Path
 from urllib.parse import urljoin
 
 from devs_utilities.ag3nts import AG3NTS_VERIFY_URL, submit_task_answer
-from devs_utilities.env import get_env, load_repo_env
+from devs_utilities.env import load_repo_env
+from repo_env import get_course_api_key
 
 
 TASK_NAME = "negotiations"
@@ -46,7 +47,7 @@ def main() -> None:
 
     repo_root = Path(__file__).resolve().parents[1]
     load_repo_env(repo_root)
-    api_key = get_env("AG3NTS_API_KEY")
+    api_key = get_course_api_key()
 
     if args.check:
         answer = {"action": "check"}

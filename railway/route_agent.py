@@ -20,14 +20,21 @@ from devs_utilities.bootstrap import bootstrap_repo
 from devs_utilities.http import HttpRequestError, post_json
 from devs_utilities.logging import configure_logging, logger as shared_logger
 from devs_utilities.openrouter import OpenRouterClient, OpenRouterConfig, OpenRouterError, ToolCall
-from repo_env import get_env, get_int_env, get_optional_env
+from repo_env import (
+    get_course_api_key,
+    get_env,
+    get_int_env,
+    get_llm_api_key,
+    get_llm_base_url,
+    get_optional_env,
+)
 
 
 REPO_ROOT = bootstrap_repo(__file__)
 logger = shared_logger.bind(component="railway")
 
 
-OPENROUTER_API_URL = get_env("OPENROUTER_BASE_URL")
+OPENROUTER_API_URL = get_llm_base_url()
 DEFAULT_MODEL = get_env("OPENROUTER_MODEL", "openrouter/healer-alpha") or "openrouter/healer-alpha"
 DEFAULT_MAX_STEPS = get_int_env("RAILWAY_MAX_STEPS", 8) or 8
 DEFAULT_RAILWAY_RETRY_ATTEMPTS = get_int_env("RAILWAY_RETRY_ATTEMPTS", 3) or 3
@@ -85,11 +92,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--railway-api-key",
-        help="Klucz API tras. Domyslnie: AG3NTS_API_KEY z .env.",
+        help="Klucz API tras. Domyslnie: COURSE_API_KEY z lokalnej konfiguracji repo.",
     )
     parser.add_argument(
         "--openrouter-api-key",
-        help="Klucz OpenRouter. Mozna tez ustawic OPENROUTER_API_KEY.",
+        help="Klucz bramy LLM. Mozna tez ustawic LLM_API_KEY.",
     )
     parser.add_argument(
         "--model",
@@ -121,21 +128,21 @@ def parse_args() -> argparse.Namespace:
 
 
 def build_config(args: argparse.Namespace) -> AppConfig:
-    def read_value(cli_value: str | None, env_name: str) -> str:
-        return (cli_value or get_env(env_name)).strip()
+    def read_value(cli_value: str | None, fallback: str) -> str:
+        return (cli_value or fallback).strip()
 
     railway_api_url = (args.railway_api_url or AG3NTS_RAILWAY_URL).strip()
-    railway_api_key = read_value(args.railway_api_key, "AG3NTS_API_KEY")
-    openrouter_api_key = read_value(args.openrouter_api_key, "OPENROUTER_API_KEY")
+    railway_api_key = read_value(args.railway_api_key, get_course_api_key())
+    openrouter_api_key = read_value(args.openrouter_api_key, get_llm_api_key())
     model = (args.model or DEFAULT_MODEL).strip()
     site_url = (args.site_url or get_optional_env("OPENROUTER_SITE_URL") or "").strip() or None
     site_name = (args.site_name or get_optional_env("OPENROUTER_SITE_NAME") or "").strip() or None
 
     missing: list[str] = []
     if not railway_api_key:
-        missing.append("AG3NTS_API_KEY")
+        missing.append("COURSE_API_KEY")
     if not openrouter_api_key:
-        missing.append("OPENROUTER_API_KEY")
+        missing.append("LLM_API_KEY")
 
     if missing:
         joined = ", ".join(missing)
@@ -477,7 +484,7 @@ def main() -> int:
     args = parse_args()
     configure_logging(name="railway", verbose=args.show_tool_results)
     if not OPENROUTER_API_URL:
-        logger.error("Brakuje OPENROUTER_BASE_URL w .env.")
+        logger.error("Brakuje LLM_BASE_URL w lokalnej konfiguracji repo.")
         return 1
     config = build_config(args)
     prompt = " ".join(args.prompt).strip()

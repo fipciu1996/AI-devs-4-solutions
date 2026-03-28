@@ -13,7 +13,14 @@ if str(REPO_ROOT_HINT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT_HINT))
 
 from devs_utilities.bootstrap import bootstrap_repo
-from repo_env import get_env, load_repo_env
+from repo_env import (
+    get_env,
+    get_llm_api_key,
+    get_llm_base_url,
+    get_package_service_key,
+    get_package_service_url,
+    load_repo_env,
+)
 
 
 DEFAULT_SYSTEM_PROMPT_RESOURCE = "prompts/system_prompt.txt"
@@ -127,17 +134,17 @@ def load_settings() -> Settings:
         or "conversation.log"
     )
 
-    openrouter_api_key = get_env("OPENROUTER_API_KEY")
+    openrouter_api_key = get_llm_api_key()
     if not openrouter_api_key:
-        raise RuntimeError("Missing OPENROUTER_API_KEY.")
+        raise RuntimeError("Missing LLM_API_KEY.")
 
     openrouter_model = get_env("OPENROUTER_MODEL", "openai/gpt-4.1-mini")
     if not openrouter_model:
         raise RuntimeError("OPENROUTER_MODEL must not be empty.")
 
-    openrouter_base_url = get_env("OPENROUTER_BASE_URL")
+    openrouter_base_url = get_llm_base_url()
     if not openrouter_base_url:
-        raise RuntimeError("OPENROUTER_BASE_URL must not be empty.")
+        raise RuntimeError("LLM_BASE_URL must not be empty.")
 
     openrouter_timeout_seconds = _parse_float(
         get_env("OPENROUTER_TIMEOUT_SECONDS"),
@@ -167,13 +174,13 @@ def load_settings() -> Settings:
     app_url = get_env("OPENROUTER_APP_URL") or None
     app_title = get_env("OPENROUTER_APP_TITLE") or None
 
-    packages_api_key = get_env("PACKAGES_API_KEY")
+    packages_api_key = get_package_service_key()
     if not packages_api_key:
-        raise RuntimeError("Missing PACKAGES_API_KEY.")
+        raise RuntimeError("Missing PACKAGE_SERVICE_KEY.")
 
-    packages_api_url = get_env("PACKAGES_API_URL")
+    packages_api_url = get_package_service_url()
     if not packages_api_url:
-        raise RuntimeError("PACKAGES_API_URL must not be empty.")
+        raise RuntimeError("PACKAGE_SERVICE_URL must not be empty.")
 
     packages_timeout_seconds = _parse_float(
         get_env("PACKAGES_TIMEOUT_SECONDS"),

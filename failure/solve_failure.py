@@ -24,7 +24,7 @@ from devs_utilities.files import write_json
 from devs_utilities.flags import extract_flag
 from devs_utilities.http import HttpRequestError, get_text
 from devs_utilities.logging import configure_logging, logger as shared_logger
-from repo_env import get_env, get_int_env
+from repo_env import get_course_api_key, get_env, get_int_env
 
 
 REPO_ROOT = bootstrap_repo(__file__)
@@ -319,9 +319,9 @@ def parse_args() -> argparse.Namespace:
 
 
 def get_api_key() -> str:
-    api_key = get_env("AG3NTS_API_KEY")
+    api_key = get_course_api_key()
     if not api_key:
-        raise ValueError("Missing AG3NTS_API_KEY in .env.")
+        raise ValueError("Missing COURSE_API_KEY in the local repository config.")
     return api_key
 
 

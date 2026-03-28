@@ -24,14 +24,21 @@ from devs_utilities.openrouter import (
     OpenRouterError,
     ToolCall,
 )
-from repo_env import get_env, get_int_env, get_optional_env
+from repo_env import (
+    get_course_api_key,
+    get_env,
+    get_int_env,
+    get_llm_api_key,
+    get_llm_base_url,
+    get_optional_env,
+)
 
 
 REPO_ROOT = bootstrap_repo(__file__)
 logger = shared_logger.bind(component="people.filter")
 
 
-OPENROUTER_API_URL = get_env("OPENROUTER_BASE_URL")
+OPENROUTER_API_URL = get_llm_base_url()
 TASK_NAME = "people"
 REFERENCE_DATE = date.fromisoformat(get_env("PEOPLE_REFERENCE_DATE", "2026-03-10"))
 DEFAULT_OPENROUTER_MODEL = get_env("OPENROUTER_MODEL", "openai/gpt-4.1-mini") or "openai/gpt-4.1-mini"
@@ -94,8 +101,8 @@ class Person:
 
 @dataclass(slots=True)
 class AppConfig:
-    hub_api_key: str
-    openrouter_api_key: str
+    course_api_key: str
+    llm_api_key: str
     openrouter_model: str
     site_url: str | None
     site_name: str | None
@@ -148,11 +155,11 @@ def load_config(path: Path, args: argparse.Namespace) -> AppConfig:
         payload = json.loads(path.read_text(encoding="utf-8"))
 
     hub_api_key = str(
-        payload.get("hub_api_key") or get_env("AG3NTS_API_KEY") or ""
+        payload.get("course_api_key") or get_course_api_key() or ""
     ).strip()
     openrouter_api_key = str(
-        payload.get("openrouter_api_key")
-        or get_env("OPENROUTER_API_KEY")
+        payload.get("llm_api_key")
+        or get_llm_api_key()
         or ""
     ).strip()
     openrouter_model = str(payload.get("openrouter_model") or DEFAULT_OPENROUTER_MODEL).strip()
@@ -166,8 +173,8 @@ def load_config(path: Path, args: argparse.Namespace) -> AppConfig:
         batch_size = args.batch_size
 
     return AppConfig(
-        hub_api_key=hub_api_key,
-        openrouter_api_key=openrouter_api_key,
+        course_api_key=hub_api_key,
+        llm_api_key=openrouter_api_key,
         openrouter_model=openrouter_model,
         site_url=site_url,
         site_name=site_name,
@@ -389,10 +396,8 @@ def classify_jobs(
     config: AppConfig,
     openrouter_client: OpenRouterClient,
 ) -> dict[int, list[str]]:
-    if not config.openrouter_api_key:
-        raise ValueError(
-            "Brakuje OPENROUTER_API_KEY lub openrouter_api_key w configu."
-        )
+    if not config.llm_api_key:
+        raise ValueError("Brakuje LLM_API_KEY lub llm_api_key w configu.")
     handlers = build_people_filter_handlers(batch)
     messages: list[dict[str, Any]] = [
         {
@@ -464,7 +469,7 @@ def build_answer(candidates: list[Person], tags_by_row_id: dict[int, list[str]])
 
 def build_verify_payload(answer: list[dict[str, Any]], hub_api_key: str) -> dict[str, Any]:
     if not hub_api_key:
-        raise ValueError("Brakuje AG3NTS_API_KEY lub hub_api_key w configu.")
+        raise ValueError("Brakuje COURSE_API_KEY lub course_api_key w configu.")
     return {
         "apikey": hub_api_key,
         "task": TASK_NAME,
@@ -475,7 +480,7 @@ def build_verify_payload(answer: list[dict[str, Any]], hub_api_key: str) -> dict
 def main() -> None:
     configure_logging(name="people.filter")
     if not OPENROUTER_API_URL:
-        raise ValueError("Missing OPENROUTER_BASE_URL in .env.")
+        raise ValueError("Missing LLM_BASE_URL in the local repository config.")
     args = parse_args()
     config_path = resolve_path(args.config, REPO_ROOT / "people")
     csv_path = resolve_path(args.csv, REPO_ROOT / "people")
@@ -484,7 +489,7 @@ def main() -> None:
     candidates = filter_candidates(people)
     openrouter_client = OpenRouterClient(
         OpenRouterConfig(
-            api_key=config.openrouter_api_key,
+            api_key=config.llm_api_key,
             base_url=OPENROUTER_API_URL,
             model=config.openrouter_model,
             timeout_seconds=OPENROUTER_TIMEOUT_SECONDS,
@@ -515,7 +520,7 @@ def main() -> None:
 
     tags_by_row_id = classify_all(candidates, config, openrouter_client)
     answer = build_answer(candidates, tags_by_row_id)
-    payload = build_verify_payload(answer, config.hub_api_key)
+    payload = build_verify_payload(answer, config.course_api_key)
     output_path = resolve_path(args.output, REPO_ROOT / "people")
     write_json(output_path, payload)
     logger.info("Payload:\n{}", json.dumps(payload, ensure_ascii=False, indent=2))
@@ -523,7 +528,7 @@ def main() -> None:
     if args.verify:
         verify_response = submit_task_answer(
             AG3NTS_VERIFY_URL,
-            api_key=config.hub_api_key,
+            api_key=config.course_api_key,
             task=TASK_NAME,
             answer=answer,
             timeout_seconds=API_TIMEOUT_SECONDS,
