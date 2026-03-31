@@ -24,8 +24,9 @@ from devs_utilities.flags import extract_flag
 from devs_utilities.http import HttpRequestError, JsonResponseError, post_json
 from devs_utilities.logging import configure_logging, logger as shared_logger
 from devs_utilities.openrouter import (
+    build_task_site_name,
+    build_task_openrouter_client,
     OpenRouterClient,
-    OpenRouterConfig,
     OpenRouterError,
     ToolCall,
 )
@@ -200,7 +201,7 @@ def build_config(args: argparse.Namespace) -> AppConfig:
         raise SystemExit("--max-steps must be a positive integer.")
 
     site_url = get_optional_env("OPENROUTER_SITE_URL") or get_optional_env("OPENROUTER_APP_URL")
-    site_name = get_optional_env("OPENROUTER_SITE_NAME") or get_optional_env("OPENROUTER_APP_TITLE")
+    site_name = build_task_site_name(__file__)
 
     return AppConfig(
         ag3nts_api_key=ag3nts_api_key,
@@ -561,15 +562,14 @@ def run_agent(
     transcript_path: Path,
 ) -> tuple[str, AgentState, list[dict[str, Any]]]:
     state = AgentState()
-    openrouter_client = OpenRouterClient(
-        OpenRouterConfig(
-            api_key=config.openrouter_api_key,
-            base_url=config.openrouter_url,
-            model=config.model,
-            timeout_seconds=config.openrouter_timeout_seconds,
-            site_url=config.site_url,
-            site_name=config.site_name,
-        )
+    openrouter_client = build_task_openrouter_client(
+        __file__,
+        api_key=config.openrouter_api_key,
+        base_url=config.openrouter_url,
+        model=config.model,
+        timeout_seconds=config.openrouter_timeout_seconds,
+        site_url=config.site_url,
+        site_name=config.site_name,
     )
     zmail_client = ZmailClient(config)
     verify_client = VerifyClient(config)

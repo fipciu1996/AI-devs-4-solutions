@@ -29,8 +29,9 @@ from devs_utilities.http import get_json as http_get_json
 from devs_utilities.http import post_json as http_post_json
 from devs_utilities.logging import configure_logging, logger as shared_logger
 from devs_utilities.openrouter import (
+    build_task_openrouter_client,
+    build_task_site_name,
     OpenRouterClient,
-    OpenRouterConfig,
     OpenRouterError,
     ToolCall,
 )
@@ -168,10 +169,7 @@ def load_config(path: Path, args: argparse.Namespace) -> AppConfig:
         str(payload.get("site_url") or get_optional_env("OPENROUTER_SITE_URL") or "").strip()
         or None
     )
-    site_name = (
-        str(payload.get("site_name") or get_optional_env("OPENROUTER_SITE_NAME") or "").strip()
-        or None
-    )
+    site_name = build_task_site_name(__file__)
 
     if args.model:
         openrouter_model = args.model
@@ -612,15 +610,14 @@ def main() -> None:
         resolve_path(args.plants, people_dir),
         args.refresh_plants,
     )
-    openrouter_client = OpenRouterClient(
-        OpenRouterConfig(
-            api_key=config.llm_api_key,
-            base_url=OPENROUTER_API_URL,
-            model=config.openrouter_model,
-            timeout_seconds=OPENROUTER_TIMEOUT_SECONDS,
-            site_url=config.site_url,
-            site_name=config.site_name,
-        )
+    openrouter_client = build_task_openrouter_client(
+        __file__,
+        api_key=config.llm_api_key,
+        base_url=OPENROUTER_API_URL,
+        model=config.openrouter_model,
+        timeout_seconds=OPENROUTER_TIMEOUT_SECONDS,
+        site_url=config.site_url,
+        site_name=config.site_name,
     )
     plants = geocode_power_plants(raw_plants, config, openrouter_client)
     best_match = find_best_match(suspects, plants, config)

@@ -26,8 +26,9 @@ from devs_utilities.files import write_json
 from devs_utilities.http import HttpRequestError, get_bytes
 from devs_utilities.logging import configure_logging, logger as shared_logger
 from devs_utilities.openrouter import (
+    build_task_openrouter_client,
+    build_task_site_name,
     OpenRouterClient,
-    OpenRouterConfig,
     OpenRouterError,
     ToolCall,
 )
@@ -577,17 +578,12 @@ def build_openrouter_client(model_override: str | None) -> OpenRouterClient:
     if missing:
         raise SystemExit(f"Missing required OpenRouter settings: {', '.join(missing)}")
 
-    return OpenRouterClient(
-        OpenRouterConfig(
-            api_key=api_key,
-            base_url=base_url,
-            model=model,
-            timeout_seconds=timeout_seconds,
-            site_url=get_optional_env("OPENROUTER_SITE_URL")
-            or get_optional_env("OPENROUTER_APP_URL"),
-            site_name=get_optional_env("OPENROUTER_SITE_NAME")
-            or get_optional_env("OPENROUTER_APP_TITLE"),
-        )
+    return build_task_openrouter_client(
+        __file__,
+        api_key=api_key,
+        base_url=base_url,
+        model=model,
+        timeout_seconds=timeout_seconds,
     )
 
 

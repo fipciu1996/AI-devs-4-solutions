@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
+from .env import get_optional_env
 from .http import HttpRequestError, JsonResponseError, post_json
 
 
@@ -21,6 +23,43 @@ class OpenRouterConfig:
     timeout_seconds: float = 120.0
     site_url: str | None = None
     site_name: str | None = None
+
+
+def build_task_site_name(source_path: str | Path) -> str:
+    """Build the standard X-Title header for a task script."""
+
+    task_dir_name = Path(source_path).resolve().parent.name
+    return f"AI Devs 4 - {task_dir_name}"
+
+
+def get_default_openrouter_site_url() -> str | None:
+    """Read the standard optional site URL headers for OpenRouter."""
+
+    return get_optional_env("OPENROUTER_SITE_URL") or get_optional_env("OPENROUTER_APP_URL")
+
+
+def build_task_openrouter_client(
+    source_path: str | Path,
+    *,
+    api_key: str,
+    base_url: str,
+    model: str,
+    timeout_seconds: float = 120.0,
+    site_url: str | None = None,
+    site_name: str | None = None,
+) -> "OpenRouterClient":
+    """Create a task-scoped OpenRouter client with standard headers."""
+
+    return OpenRouterClient(
+        OpenRouterConfig(
+            api_key=api_key,
+            base_url=base_url,
+            model=model,
+            timeout_seconds=timeout_seconds,
+            site_url=site_url if site_url is not None else get_default_openrouter_site_url(),
+            site_name=site_name if site_name is not None else build_task_site_name(source_path),
+        )
+    )
 
 
 @dataclass(frozen=True, slots=True)

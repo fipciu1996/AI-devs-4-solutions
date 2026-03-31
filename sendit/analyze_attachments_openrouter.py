@@ -19,8 +19,9 @@ from devs_utilities.bootstrap import bootstrap_repo
 from devs_utilities.files import read_text_with_fallback, resolve_path, write_json
 from devs_utilities.logging import configure_logging, logger as shared_logger
 from devs_utilities.openrouter import (
+    build_task_openrouter_client,
+    build_task_site_name,
     OpenRouterClient,
-    OpenRouterConfig,
     OpenRouterError,
     ToolCall,
     extract_completion_result,
@@ -37,11 +38,7 @@ DEFAULT_MODEL = get_env("OPENROUTER_MODEL", "openai/gpt-4.1-mini") or "openai/gp
 DEFAULT_MAX_TEXT_CHARS = get_int_env("SENDIT_ANALYZE_MAX_TEXT_CHARS", 24_000) or 24_000
 OPENROUTER_TIMEOUT_SECONDS = get_int_env("OPENROUTER_TIMEOUT_SECONDS", 120) or 120
 MODEL_MAX_STEPS = 3
-DEFAULT_SITE_NAME = (
-    get_optional_env("OPENROUTER_SITE_NAME")
-    or get_optional_env("OPENROUTER_APP_TITLE")
-    or "sendit-local-analyzer"
-)
+DEFAULT_SITE_NAME = build_task_site_name(__file__)
 TEXT_EXTENSIONS = {".md", ".txt", ".csv", ".json", ".yaml", ".yml"}
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
 
@@ -319,15 +316,14 @@ def main() -> int:
         )
         return 1
 
-    openrouter_client = OpenRouterClient(
-        OpenRouterConfig(
-            api_key=api_key,
-            base_url=OPENROUTER_URL,
-            model=args.model,
-            timeout_seconds=OPENROUTER_TIMEOUT_SECONDS,
-            site_url=args.site_url,
-            site_name=args.site_name,
-        )
+    openrouter_client = build_task_openrouter_client(
+        __file__,
+        api_key=api_key,
+        base_url=OPENROUTER_URL,
+        model=args.model,
+        timeout_seconds=OPENROUTER_TIMEOUT_SECONDS,
+        site_url=args.site_url,
+        site_name=args.site_name,
     )
 
     targets = collect_targets(input_dir, args.glob)

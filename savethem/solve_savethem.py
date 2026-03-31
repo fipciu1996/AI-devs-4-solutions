@@ -20,8 +20,9 @@ from devs_utilities.files import write_json
 from devs_utilities.http import HttpRequestError, post_json, request_bytes
 from devs_utilities.logging import configure_logging, logger as shared_logger
 from devs_utilities.openrouter import (
+    build_task_openrouter_client,
+    build_task_site_name,
     OpenRouterClient,
-    OpenRouterConfig,
     OpenRouterError,
     ToolCall,
 )
@@ -118,15 +119,12 @@ def build_openrouter_client() -> OpenRouterClient:
     if not api_key or not base_url:
         raise RuntimeError("Missing OPENROUTER_API_KEY or OPENROUTER_BASE_URL in .env.")
 
-    return OpenRouterClient(
-        OpenRouterConfig(
-            api_key=api_key,
-            base_url=base_url,
-            model=model,
-            timeout_seconds=OPENROUTER_TIMEOUT_SECONDS,
-            site_url=get_env("OPENROUTER_SITE_URL") or get_env("OPENROUTER_APP_URL") or None,
-            site_name=get_env("OPENROUTER_SITE_NAME") or get_env("OPENROUTER_APP_TITLE") or None,
-        )
+    return build_task_openrouter_client(
+        __file__,
+        api_key=api_key,
+        base_url=base_url,
+        model=model,
+        timeout_seconds=OPENROUTER_TIMEOUT_SECONDS,
     )
 
 

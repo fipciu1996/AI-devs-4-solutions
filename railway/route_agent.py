@@ -19,7 +19,13 @@ from devs_utilities.ag3nts import AG3NTS_RAILWAY_URL
 from devs_utilities.bootstrap import bootstrap_repo
 from devs_utilities.http import HttpRequestError, post_json
 from devs_utilities.logging import configure_logging, logger as shared_logger
-from devs_utilities.openrouter import OpenRouterClient, OpenRouterConfig, OpenRouterError, ToolCall
+from devs_utilities.openrouter import (
+    build_task_openrouter_client,
+    build_task_site_name,
+    OpenRouterClient,
+    OpenRouterError,
+    ToolCall,
+)
 from repo_env import (
     get_course_api_key,
     get_env,
@@ -136,7 +142,7 @@ def build_config(args: argparse.Namespace) -> AppConfig:
     openrouter_api_key = read_value(args.openrouter_api_key, get_llm_api_key())
     model = (args.model or DEFAULT_MODEL).strip()
     site_url = (args.site_url or get_optional_env("OPENROUTER_SITE_URL") or "").strip() or None
-    site_name = (args.site_name or get_optional_env("OPENROUTER_SITE_NAME") or "").strip() or None
+    site_name = build_task_site_name(__file__)
 
     missing: list[str] = []
     if not railway_api_key:
@@ -430,15 +436,14 @@ def run_agent(
     show_tool_results: bool,
 ) -> str:
     handlers = build_tool_handlers(client)
-    openrouter_client = OpenRouterClient(
-        OpenRouterConfig(
-            api_key=config.openrouter_api_key,
-            base_url=OPENROUTER_API_URL,
-            model=config.model,
-            timeout_seconds=OPENROUTER_TIMEOUT_SECONDS,
-            site_url=config.site_url,
-            site_name=config.site_name,
-        )
+    openrouter_client = build_task_openrouter_client(
+        __file__,
+        api_key=config.openrouter_api_key,
+        base_url=OPENROUTER_API_URL,
+        model=config.model,
+        timeout_seconds=OPENROUTER_TIMEOUT_SECONDS,
+        site_url=config.site_url,
+        site_name=config.site_name,
     )
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": SYSTEM_PROMPT},
