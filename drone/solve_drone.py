@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import sys
 from pathlib import Path
@@ -18,7 +19,13 @@ from devs_utilities.files import write_json
 from devs_utilities.flags import extract_flag
 from devs_utilities.http import HttpRequestError
 from devs_utilities.logging import configure_logging, logger as shared_logger
-from repo_env import get_course_api_key, get_env, get_int_env
+from devs_utilities.openrouter import (
+    build_task_openrouter_client,
+    OpenRouterClient,
+    OpenRouterError,
+    parse_json_object_content,
+)
+from repo_env import get_course_api_key, get_env, get_int_env, get_optional_env
 
 
 REPO_ROOT = bootstrap_repo(__file__)
@@ -29,6 +36,25 @@ TASK_NAME = "drone"
 OUTPUT_DIR = Path(__file__).resolve().parent
 LAST_RESPONSE_PATH = OUTPUT_DIR / "last_verify_response.json"
 LAST_PROBE_PATH = OUTPUT_DIR / "grid_probe_results.json"
+LAST_MODEL_PLAN_PATH = OUTPUT_DIR / "last_model_target.json"
+MAP_IMAGE_PATH = OUTPUT_DIR / "drone.png"
+DEFAULT_MODEL = (
+    get_optional_env("OPENROUTER_MODEL")
+    or get_optional_env("LLM_MODEL")
+    or "openai/gpt-4.1-mini"
+)
+DEFAULT_OPENROUTER_TIMEOUT_SECONDS = get_int_env("OPENROUTER_TIMEOUT_SECONDS", 60) or 60
+VISION_SYSTEM_PROMPT = """You analyze a 3x4 tactical grid map for a drone mission.
+
+Task:
+- Inspect the map image.
+- Find the sector containing the dam, not the power plant.
+- Return the target sector as 1-based grid coordinates.
+- The grid has 3 columns and 4 rows.
+
+Return JSON only:
+{"sector_x":2,"sector_y":4,"reason":"short explanation"}
+"""
 
 # The map analysis plus API feedback narrows the dam to column 2, row 4
 # on a 3x4 grid. The destination object is the Żarnowiec plant code from
@@ -77,6 +103,16 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print the instructions without sending them to the hub.",
     )
+    parser.add_argument(
+        "--skip-model",
+        action="store_true",
+        help="Disable OpenRouter map analysis and use the deterministic target sector.",
+    )
+    parser.add_argument(
+        "--model",
+        default=None,
+        help=f"OpenRouter model override. Default: {DEFAULT_MODEL}.",
+    )
     return parser.parse_args()
 
 
@@ -98,6 +134,34 @@ def post_json(url: str, payload: dict[str, Any]) -> Any:
         )
     except HttpRequestError as exc:
         return exc.to_response_dict()
+
+
+def build_optional_openrouter_client(args: argparse.Namespace) -> OpenRouterClient | None:
+    if args.skip_model:
+        return None
+
+    api_key = (
+        get_optional_env("OPENROUTER_API_KEY")
+        or get_optional_env("LLM_API_KEY")
+        or ""
+    ).strip()
+    base_url = (
+        get_optional_env("OPENROUTER_BASE_URL")
+        or get_optional_env("LLM_BASE_URL")
+        or ""
+    ).strip()
+    model = (args.model or DEFAULT_MODEL).strip()
+    if not api_key or not base_url or not model:
+        return None
+
+    return build_task_openrouter_client(
+        __file__,
+        api_key=api_key,
+        base_url=base_url,
+        model=model,
+        task_name=TASK_NAME,
+        timeout_seconds=float(max(30, DEFAULT_OPENROUTER_TIMEOUT_SECONDS)),
+    )
 
 
 def build_final_instructions(
@@ -131,6 +195,58 @@ def build_probe_instructions(*, destination: str, sector_x: int, sector_y: int) 
         "set(destroy)",
         "flyToLocation",
     ]
+
+
+def validate_target_sector(raw_payload: dict[str, Any]) -> tuple[int, int, str]:
+    sector_x = int(raw_payload.get("sector_x"))
+    sector_y = int(raw_payload.get("sector_y"))
+    if not 1 <= sector_x <= GRID_COLUMNS or not 1 <= sector_y <= GRID_ROWS:
+        raise OpenRouterError(
+            f"Model target sector is outside the {GRID_COLUMNS}x{GRID_ROWS} grid."
+        )
+    reason = str(raw_payload.get("reason", "")).strip() or "OpenRouter analyzed the tactical map."
+    return sector_x, sector_y, reason
+
+
+def choose_target_sector(
+    args: argparse.Namespace,
+    client: OpenRouterClient | None,
+) -> tuple[int, int, str, str]:
+    if args.x != DAM_SECTOR_X or args.y != DAM_SECTOR_Y:
+        return args.x, args.y, "explicit", "Command-line sector override."
+    if client is None or not MAP_IMAGE_PATH.exists():
+        return args.x, args.y, "deterministic", "OpenRouter unavailable."
+
+    encoded = base64.b64encode(MAP_IMAGE_PATH.read_bytes()).decode("ascii")
+    completion = client.create_completion(
+        [
+            {"role": "system", "content": VISION_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Find the dam sector on this drone map."},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{encoded}"},
+                    },
+                ],
+            },
+        ]
+    )
+    if not completion.content:
+        raise OpenRouterError("Drone map analysis returned no content.")
+    payload = parse_json_object_content(completion.content)
+    sector_x, sector_y, reason = validate_target_sector(payload)
+    write_json(
+        LAST_MODEL_PLAN_PATH,
+        {
+            "source": "openrouter",
+            "sector_x": sector_x,
+            "sector_y": sector_y,
+            "reason": reason,
+        },
+    )
+    return sector_x, sector_y, "openrouter", reason
 
 
 def submit_instructions(api_key: str, instructions: list[str]) -> Any:
@@ -175,17 +291,36 @@ def main() -> int:
     configure_logging(name="drone")
     args = parse_args()
     api_key = get_api_key()
+    sector_x = args.x
+    sector_y = args.y
+    target_source = "deterministic"
+    target_reason = "Configured default sector."
+    try:
+        sector_x, sector_y, target_source, target_reason = choose_target_sector(
+            args,
+            build_optional_openrouter_client(args),
+        )
+    except (OpenRouterError, ValueError) as exc:
+        logger.warning("Map analysis failed, using deterministic target sector: {}", exc)
 
     instructions = build_final_instructions(
         destination=DESTINATION_OBJECT,
-        sector_x=args.x,
-        sector_y=args.y,
+        sector_x=sector_x,
+        sector_y=sector_y,
         power=args.power,
         height=args.height,
     )
 
     if args.probe_grid:
         return probe_grid(api_key)
+
+    logger.info(
+        "Target sector: ({}, {}) via {} ({})",
+        sector_x,
+        sector_y,
+        target_source,
+        target_reason,
+    )
 
     if args.dry_run:
         logger.info("Instructions:\n{}", json.dumps(instructions, ensure_ascii=False, indent=2))

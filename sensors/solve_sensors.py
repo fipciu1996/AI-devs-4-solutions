@@ -583,6 +583,7 @@ def build_openrouter_client(model_override: str | None) -> OpenRouterClient:
         api_key=api_key,
         base_url=base_url,
         model=model,
+        task_name=TASK_NAME,
         timeout_seconds=timeout_seconds,
     )
 

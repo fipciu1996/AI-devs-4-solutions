@@ -142,7 +142,7 @@ def build_config(args: argparse.Namespace) -> AppConfig:
     openrouter_api_key = read_value(args.openrouter_api_key, get_llm_api_key())
     model = (args.model or DEFAULT_MODEL).strip()
     site_url = (args.site_url or get_optional_env("OPENROUTER_SITE_URL") or "").strip() or None
-    site_name = build_task_site_name(__file__)
+    site_name = build_task_site_name(__file__, task_name=RAILWAY_TASK_NAME)
 
     missing: list[str] = []
     if not railway_api_key:
@@ -441,6 +441,7 @@ def run_agent(
         api_key=config.openrouter_api_key,
         base_url=OPENROUTER_API_URL,
         model=config.model,
+        task_name=RAILWAY_TASK_NAME,
         timeout_seconds=OPENROUTER_TIMEOUT_SECONDS,
         site_url=config.site_url,
         site_name=config.site_name,

@@ -201,7 +201,7 @@ def build_config(args: argparse.Namespace) -> AppConfig:
         raise SystemExit("--max-steps must be a positive integer.")
 
     site_url = get_optional_env("OPENROUTER_SITE_URL") or get_optional_env("OPENROUTER_APP_URL")
-    site_name = build_task_site_name(__file__)
+    site_name = build_task_site_name(__file__, task_name=TASK_NAME)
 
     return AppConfig(
         ag3nts_api_key=ag3nts_api_key,
@@ -567,6 +567,7 @@ def run_agent(
         api_key=config.openrouter_api_key,
         base_url=config.openrouter_url,
         model=config.model,
+        task_name=TASK_NAME,
         timeout_seconds=config.openrouter_timeout_seconds,
         site_url=config.site_url,
         site_name=config.site_name,

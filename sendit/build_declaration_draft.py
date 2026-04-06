@@ -31,7 +31,7 @@ logger = shared_logger.bind(component="sendit.draft")
 OPENROUTER_URL = get_llm_base_url()
 DEFAULT_MODEL = get_env("OPENROUTER_MODEL", "openai/gpt-4.1-mini") or "openai/gpt-4.1-mini"
 DEFAULT_TASK_NAME = get_env("SENDIT_TASK_NAME", "sendit") or "sendit"
-DEFAULT_SITE_NAME = build_task_site_name(__file__)
+DEFAULT_SITE_NAME = build_task_site_name(__file__, task_name=DEFAULT_TASK_NAME)
 DEFAULT_SYSTEM_PROMPT_FILE = get_env("SENDIT_SYSTEM_PROMPT_FILE", "openrouter_system_prompt.txt")
 OPENROUTER_TIMEOUT_SECONDS = get_int_env("OPENROUTER_TIMEOUT_SECONDS", 120) or 120
 MODEL_MAX_STEPS = 4
@@ -86,7 +86,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--site-name",
-        default=DEFAULT_SITE_NAME,
+        default=None,
         help="Opcjonalny naglowek X-Title dla OpenRouter.",
     )
     parser.add_argument(
@@ -411,9 +411,10 @@ def main() -> int:
         api_key=api_key,
         base_url=OPENROUTER_URL,
         model=args.model,
+        task_name=args.task,
         timeout_seconds=OPENROUTER_TIMEOUT_SECONDS,
         site_url=args.site_url,
-        site_name=args.site_name,
+        site_name=args.site_name or build_task_site_name(__file__, task_name=args.task),
     )
 
     analysis_bundle = load_bundle(analysis_dir, "*.md")

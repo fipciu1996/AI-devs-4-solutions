@@ -34,11 +34,12 @@ logger = shared_logger.bind(component="sendit.analyze")
 
 
 OPENROUTER_URL = get_llm_base_url()
+TASK_NAME = "sendit"
 DEFAULT_MODEL = get_env("OPENROUTER_MODEL", "openai/gpt-4.1-mini") or "openai/gpt-4.1-mini"
 DEFAULT_MAX_TEXT_CHARS = get_int_env("SENDIT_ANALYZE_MAX_TEXT_CHARS", 24_000) or 24_000
 OPENROUTER_TIMEOUT_SECONDS = get_int_env("OPENROUTER_TIMEOUT_SECONDS", 120) or 120
 MODEL_MAX_STEPS = 3
-DEFAULT_SITE_NAME = build_task_site_name(__file__)
+DEFAULT_SITE_NAME = build_task_site_name(__file__, task_name=TASK_NAME)
 TEXT_EXTENSIONS = {".md", ".txt", ".csv", ".json", ".yaml", ".yml"}
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
 
@@ -321,6 +322,7 @@ def main() -> int:
         api_key=api_key,
         base_url=OPENROUTER_URL,
         model=args.model,
+        task_name=TASK_NAME,
         timeout_seconds=OPENROUTER_TIMEOUT_SECONDS,
         site_url=args.site_url,
         site_name=args.site_name,

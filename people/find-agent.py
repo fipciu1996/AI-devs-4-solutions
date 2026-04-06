@@ -169,7 +169,7 @@ def load_config(path: Path, args: argparse.Namespace) -> AppConfig:
         str(payload.get("site_url") or get_optional_env("OPENROUTER_SITE_URL") or "").strip()
         or None
     )
-    site_name = build_task_site_name(__file__)
+    site_name = build_task_site_name(__file__, task_name=TASK_NAME)
 
     if args.model:
         openrouter_model = args.model
@@ -615,6 +615,7 @@ def main() -> None:
         api_key=config.llm_api_key,
         base_url=OPENROUTER_API_URL,
         model=config.openrouter_model,
+        task_name=TASK_NAME,
         timeout_seconds=OPENROUTER_TIMEOUT_SECONDS,
         site_url=config.site_url,
         site_name=config.site_name,

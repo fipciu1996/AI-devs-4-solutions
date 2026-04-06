@@ -120,7 +120,7 @@ def build_config(args: argparse.Namespace) -> AppConfig:
     openrouter_url = (get_env("OPENROUTER_BASE_URL") or "").strip()
     model = (args.model or DEFAULT_MODEL).strip()
     site_url = get_optional_env("OPENROUTER_SITE_URL") or get_optional_env("OPENROUTER_APP_URL")
-    site_name = build_task_site_name(__file__)
+    site_name = build_task_site_name(__file__, task_name=TASK_NAME)
 
     missing: list[str] = []
     if not ag3nts_api_key:
@@ -1101,6 +1101,7 @@ def run_agent(config: AppConfig) -> tuple[list[dict[str, Any]], AgentState]:
         api_key=config.openrouter_api_key,
         base_url=config.openrouter_url,
         model=config.model,
+        task_name=TASK_NAME,
         timeout_seconds=DEFAULT_OPENROUTER_TIMEOUT_SECONDS,
         site_url=config.site_url,
         site_name=config.site_name,

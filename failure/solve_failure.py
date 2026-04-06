@@ -24,7 +24,13 @@ from devs_utilities.files import write_json
 from devs_utilities.flags import extract_flag
 from devs_utilities.http import HttpRequestError, get_text
 from devs_utilities.logging import configure_logging, logger as shared_logger
-from repo_env import get_course_api_key, get_env, get_int_env
+from devs_utilities.openrouter import (
+    build_task_openrouter_client,
+    OpenRouterClient,
+    OpenRouterError,
+    parse_json_object_content,
+)
+from repo_env import get_course_api_key, get_env, get_int_env, get_optional_env
 
 
 REPO_ROOT = bootstrap_repo(__file__)
@@ -33,6 +39,12 @@ logger = shared_logger.bind(component="failure")
 
 TASK_NAME = "failure"
 REQUEST_TIMEOUT_SECONDS = get_int_env("FAILURE_TIMEOUT_SECONDS", 60) or 60
+DEFAULT_MODEL = (
+    get_optional_env("OPENROUTER_MODEL")
+    or get_optional_env("LLM_MODEL")
+    or "openai/gpt-4.1-mini"
+)
+DEFAULT_OPENROUTER_TIMEOUT_SECONDS = get_int_env("OPENROUTER_TIMEOUT_SECONDS", 60) or 60
 LOG_PATTERN = re.compile(
     r"^\[(?P<timestamp>[^\]]+)\] \[(?P<level>[^\]]+)\] (?P<message>.*)$"
 )
@@ -40,6 +52,21 @@ LOG_PATTERN = re.compile(
 RAW_LOG_PATH = Path(__file__).with_name("failure.log")
 CONDENSED_LOG_PATH = Path(__file__).with_name("final_logs.txt")
 RESPONSE_PATH = Path(__file__).with_name("submission_response.json")
+MODEL_PLAN_PATH = Path(__file__).with_name("last_model_logs.json")
+MODEL_SYSTEM_PROMPT = """You compress already-selected outage log lines.
+
+Rules:
+- Do not invent, remove, reorder, or merge distinct incidents unless the meaning
+  stays exactly intact.
+- Keep one incident per output line.
+- Preserve the leading timestamp and level block in each line.
+- Keep component names and causal facts.
+- Make wording shorter and more technical.
+- Stay within 1500 tokens total.
+
+Return JSON only:
+{"logs":["[2026-04-01 10:15] [ERROR] ..."],"reason":"short explanation"}
+"""
 
 EXCLUDED_MESSAGES = {
     "Pressure jitter near STMTURB12 is above baseline. Automatic damping remains engaged.",
@@ -315,6 +342,16 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Submit the condensed logs to the AG3NTS verify endpoint.",
     )
+    parser.add_argument(
+        "--skip-model",
+        action="store_true",
+        help="Disable OpenRouter log compression and use deterministic condensation only.",
+    )
+    parser.add_argument(
+        "--model",
+        default=None,
+        help=f"OpenRouter model override. Default: {DEFAULT_MODEL}.",
+    )
     return parser.parse_args()
 
 
@@ -374,6 +411,34 @@ def estimate_tokens(text: str) -> int:
     return max(1, (len(text) + 3) // 4)
 
 
+def build_optional_openrouter_client(args: argparse.Namespace) -> OpenRouterClient | None:
+    if args.skip_model:
+        return None
+
+    api_key = (
+        get_optional_env("OPENROUTER_API_KEY")
+        or get_optional_env("LLM_API_KEY")
+        or ""
+    ).strip()
+    base_url = (
+        get_optional_env("OPENROUTER_BASE_URL")
+        or get_optional_env("LLM_BASE_URL")
+        or ""
+    ).strip()
+    model = (args.model or DEFAULT_MODEL).strip()
+    if not api_key or not base_url or not model:
+        return None
+
+    return build_task_openrouter_client(
+        __file__,
+        api_key=api_key,
+        base_url=base_url,
+        model=model,
+        task_name=TASK_NAME,
+        timeout_seconds=float(max(30, DEFAULT_OPENROUTER_TIMEOUT_SECONDS)),
+    )
+
+
 def select_relevant_entries(entries: list[LogEntry]) -> list[LogEntry]:
     seen_messages: set[str] = set()
     selected: list[LogEntry] = []
@@ -399,13 +464,59 @@ def compress_message(message: str) -> str:
     return compressed
 
 
-def build_condensed_logs(entries: list[LogEntry]) -> str:
+def build_condensed_log_lines(entries: list[LogEntry]) -> list[str]:
     selected = select_relevant_entries(entries)
-    condensed_lines = [
+    return [
         f"[{entry.minute_timestamp}] [{entry.level}] {compress_message(entry.message)}"
         for entry in selected
     ]
-    return "\n".join(condensed_lines)
+
+
+def build_condensed_logs(entries: list[LogEntry]) -> str:
+    return "\n".join(build_condensed_log_lines(entries))
+
+
+def validate_model_log_lines(raw_lines: Any) -> list[str]:
+    if not isinstance(raw_lines, list) or not raw_lines:
+        raise OpenRouterError("Model log payload must be a non-empty list.")
+    normalized: list[str] = []
+    for line in raw_lines:
+        if not isinstance(line, str):
+            raise OpenRouterError("Every condensed log line must be a string.")
+        stripped = " ".join(line.split())
+        if not stripped or not stripped.startswith("["):
+            raise OpenRouterError("Condensed log line must preserve the log prefix.")
+        normalized.append(stripped)
+    if estimate_tokens("\n".join(normalized)) > 1500:
+        raise OpenRouterError("Model-condensed logs exceeded the 1500-token budget.")
+    return normalized
+
+
+def condense_logs_with_openrouter(
+    condensed_lines: list[str],
+    client: OpenRouterClient | None,
+) -> tuple[list[str], str, str]:
+    if client is None:
+        return condensed_lines, "deterministic", "OpenRouter unavailable."
+
+    completion = client.create_completion(
+        [
+            {"role": "system", "content": MODEL_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": (
+                    "Condense these outage log lines without changing their meaning:\n"
+                    + "\n".join(condensed_lines)
+                ),
+            },
+        ]
+    )
+    if not completion.content:
+        raise OpenRouterError("Log compressor returned no content.")
+    payload = parse_json_object_content(completion.content)
+    model_lines = validate_model_log_lines(payload.get("logs"))
+    reason = str(payload.get("reason", "")).strip() or "OpenRouter compressed the selected logs."
+    return model_lines, "openrouter", reason
 
 
 def summarize_source(entries: list[LogEntry], raw_text: str, condensed_logs: str) -> str:
@@ -433,13 +544,36 @@ def main() -> int:
     api_key = get_api_key()
     raw_text = http_get_text(build_log_url(api_key))
     entries = parse_entries(raw_text)
-    condensed_logs = build_condensed_logs(entries)
+    condensed_lines = build_condensed_log_lines(entries)
+    condensed_logs = "\n".join(condensed_lines)
+
+    log_source = "deterministic"
+    log_reason = "Deterministic condensation."
+    try:
+        condensed_lines, log_source, log_reason = condense_logs_with_openrouter(
+            condensed_lines,
+            build_optional_openrouter_client(args),
+        )
+        condensed_logs = "\n".join(condensed_lines)
+    except OpenRouterError as exc:
+        logger.warning("OpenRouter condensation failed, using deterministic logs: {}", exc)
+
+    write_json(
+        MODEL_PLAN_PATH,
+        {
+            "source": log_source,
+            "reason": log_reason,
+            "estimated_tokens": estimate_tokens(condensed_logs),
+            "line_count": len(condensed_lines),
+        },
+    )
 
     if args.save_raw:
         RAW_LOG_PATH.write_text(raw_text, encoding="utf-8")
 
     CONDENSED_LOG_PATH.write_text(condensed_logs + "\n", encoding="utf-8")
     logger.info("Summary:\n{}", summarize_source(entries, raw_text, condensed_logs))
+    logger.info("Condensation source: {} ({})", log_source, log_reason)
 
     if args.print_logs:
         logger.info("Condensed logs:\n{}", condensed_logs)

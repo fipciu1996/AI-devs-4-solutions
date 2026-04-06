@@ -4,7 +4,9 @@ version = "0.1.0"
 description = "HTTP tool server for the AG3NTS negotiations task"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "ngrok>=1.4.0",
+]
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]

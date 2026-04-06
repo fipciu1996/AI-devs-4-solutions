@@ -124,6 +124,7 @@ def build_openrouter_client() -> OpenRouterClient:
         api_key=api_key,
         base_url=base_url,
         model=model,
+        task_name=TASK_NAME,
         timeout_seconds=OPENROUTER_TIMEOUT_SECONDS,
     )
 

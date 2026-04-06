@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import sys
 from pathlib import Path
@@ -21,7 +22,13 @@ from devs_utilities.bootstrap import bootstrap_repo
 from devs_utilities.flags import extract_flag
 from devs_utilities.http import HttpRequestError, get_bytes
 from devs_utilities.logging import configure_logging, logger as shared_logger
-from repo_env import get_course_api_key, get_env, get_int_env
+from devs_utilities.openrouter import (
+    build_task_openrouter_client,
+    OpenRouterClient,
+    OpenRouterError,
+    parse_json_object_content,
+)
+from repo_env import get_course_api_key, get_env, get_int_env, get_optional_env
 
 
 REPO_ROOT = bootstrap_repo(__file__)
@@ -30,6 +37,16 @@ logger = shared_logger.bind(component="electricity")
 
 TASK_NAME = "electricity"
 REQUEST_TIMEOUT_SECONDS = get_int_env("AG3NTS_TIMEOUT_SECONDS", 30) or 30
+DEFAULT_MODEL = (
+    get_optional_env("OPENROUTER_MODEL")
+    or get_optional_env("LLM_MODEL")
+    or "openai/gpt-4.1-mini"
+)
+DEFAULT_OPENROUTER_TIMEOUT_SECONDS = get_int_env("OPENROUTER_TIMEOUT_SECONDS", 60) or 60
+OUTPUT_DIR = Path(__file__).resolve().parent
+CURRENT_BOARD_PATH = OUTPUT_DIR / "current.png"
+SOLVED_BOARD_PATH = OUTPUT_DIR / "solved.png"
+MODEL_PLAN_PATH = OUTPUT_DIR / "last_model_plan.json"
 
 ROTATION_SEQUENCE = [
     token.strip()
@@ -39,6 +56,18 @@ ROTATION_SEQUENCE = [
     ).split(",")
     if token.strip()
 ]
+VISION_SYSTEM_PROMPT = """You solve a 3x3 rotate-only cable puzzle.
+
+Task:
+- Inspect the current board image.
+- Optionally compare it with the solved reference image.
+- Output the shortest plausible sequence of rotations needed to reach the solved state.
+- Each move rotates one tile 90 degrees clockwise.
+- Coordinates use row x column format like 1x2, 3x1.
+
+Return JSON only:
+{"rotations":["1x2","2x3"],"reason":"short explanation"}
+"""
 
 
 def get_api_key() -> str:
@@ -103,7 +132,127 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print the planned rotations without sending them to the hub.",
     )
+    parser.add_argument(
+        "--skip-model",
+        action="store_true",
+        help="Disable OpenRouter board analysis and use the deterministic sequence only.",
+    )
+    parser.add_argument(
+        "--model",
+        default=None,
+        help=f"OpenRouter model override. Default: {DEFAULT_MODEL}.",
+    )
     return parser.parse_args()
+
+
+def build_optional_openrouter_client(args: argparse.Namespace) -> OpenRouterClient | None:
+    if args.skip_model:
+        return None
+
+    api_key = (
+        get_optional_env("OPENROUTER_API_KEY")
+        or get_optional_env("LLM_API_KEY")
+        or ""
+    ).strip()
+    base_url = (
+        get_optional_env("OPENROUTER_BASE_URL")
+        or get_optional_env("LLM_BASE_URL")
+        or ""
+    ).strip()
+    model = (args.model or DEFAULT_MODEL).strip()
+    if not api_key or not base_url or not model:
+        return None
+
+    return build_task_openrouter_client(
+        __file__,
+        api_key=api_key,
+        base_url=base_url,
+        model=model,
+        task_name=TASK_NAME,
+        timeout_seconds=float(max(30, DEFAULT_OPENROUTER_TIMEOUT_SECONDS)),
+    )
+
+
+def normalize_rotation_token(raw_value: str) -> str:
+    normalized = raw_value.strip()
+    if not normalized:
+        raise OpenRouterError("Rotation token cannot be empty.")
+    row_text, separator, column_text = normalized.partition("x")
+    if separator != "x":
+        raise OpenRouterError(f"Rotation token must use row x column format, got: {raw_value!r}")
+    row = int(row_text)
+    column = int(column_text)
+    if not 1 <= row <= 3 or not 1 <= column <= 3:
+        raise OpenRouterError(f"Rotation token is outside the 3x3 board: {raw_value!r}")
+    return f"{row}x{column}"
+
+
+def validate_rotation_sequence(raw_rotations: Any) -> list[str]:
+    if not isinstance(raw_rotations, list) or not raw_rotations:
+        raise OpenRouterError("Rotation plan must be a non-empty list.")
+    normalized = [normalize_rotation_token(str(item)) for item in raw_rotations]
+    if len(normalized) > 20:
+        raise OpenRouterError("Rotation plan is unexpectedly long.")
+    return normalized
+
+
+def load_board_image_bytes(api_key: str) -> bytes:
+    try:
+        board_bytes = http_get(build_board_url(api_key))
+        CURRENT_BOARD_PATH.write_bytes(board_bytes)
+        return board_bytes
+    except HttpRequestError:
+        if CURRENT_BOARD_PATH.exists():
+            return CURRENT_BOARD_PATH.read_bytes()
+        raise
+
+
+def build_image_content(label: str, image_bytes: bytes) -> list[dict[str, Any]]:
+    encoded = base64.b64encode(image_bytes).decode("ascii")
+    return [
+        {"type": "text", "text": label},
+        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{encoded}"}},
+    ]
+
+
+def choose_rotation_sequence(
+    api_key: str,
+    client: OpenRouterClient | None,
+) -> tuple[list[str], str, str]:
+    if client is None:
+        return ROTATION_SEQUENCE, "deterministic", "OpenRouter unavailable."
+
+    current_board = load_board_image_bytes(api_key)
+    content: list[dict[str, Any]] = []
+    content.extend(build_image_content("Current board:", current_board))
+    if SOLVED_BOARD_PATH.exists():
+        content.extend(build_image_content("Solved reference board:", SOLVED_BOARD_PATH.read_bytes()))
+
+    completion = client.create_completion(
+        [
+            {"role": "system", "content": VISION_SYSTEM_PROMPT},
+            {"role": "user", "content": content},
+        ]
+    )
+    if not completion.content:
+        raise OpenRouterError("Board analysis returned no content.")
+    payload = parse_json_object_content(completion.content)
+    rotations = validate_rotation_sequence(payload.get("rotations"))
+    reason = str(payload.get("reason", "")).strip() or "OpenRouter analyzed the board image."
+    MODEL_PLAN_PATH.write_text(
+        json.dumps(
+            {
+                "source": "openrouter",
+                "reason": reason,
+                "rotations": rotations,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return rotations, "openrouter", reason
 
 
 def main() -> int:
@@ -111,18 +260,30 @@ def main() -> int:
     args = parse_args()
     api_key = get_api_key()
 
-    logger.info("Planned rotations: {}", " ".join(ROTATION_SEQUENCE))
-
-    if args.dry_run:
-        return 0
-
     if args.reset:
         logger.info("Resetting board...")
         reset_board(api_key)
 
-    for index, position in enumerate(ROTATION_SEQUENCE, start=1):
+    rotation_sequence = ROTATION_SEQUENCE
+    rotation_source = "deterministic"
+    rotation_reason = "Fallback sequence."
+    try:
+        rotation_sequence, rotation_source, rotation_reason = choose_rotation_sequence(
+            api_key,
+            build_optional_openrouter_client(args),
+        )
+    except (HttpRequestError, OpenRouterError, ValueError) as exc:
+        logger.warning("Board analysis failed, using deterministic sequence: {}", exc)
+
+    logger.info("Planned rotations: {}", " ".join(rotation_sequence))
+    logger.info("Rotation source: {} ({})", rotation_source, rotation_reason)
+
+    if args.dry_run:
+        return 0
+
+    for index, position in enumerate(rotation_sequence, start=1):
         response = rotate_once(api_key, position)
-        logger.info("[{}/{}] rotate {} -> {}", index, len(ROTATION_SEQUENCE), position, response)
+        logger.info("[{}/{}] rotate {} -> {}", index, len(rotation_sequence), position, response)
         flag = extract_flag(response)
         if flag:
             logger.success("Flag: {}", flag)

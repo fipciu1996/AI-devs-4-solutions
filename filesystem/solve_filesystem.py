@@ -22,7 +22,13 @@ from devs_utilities.bootstrap import bootstrap_repo
 from devs_utilities.files import write_json
 from devs_utilities.http import HttpRequestError, RAW_TEXT, get_bytes, post_json
 from devs_utilities.logging import configure_logging, logger as shared_logger
-from repo_env import get_env, get_int_env
+from devs_utilities.openrouter import (
+    build_task_openrouter_client,
+    OpenRouterClient,
+    OpenRouterError,
+    parse_json_object_content,
+)
+from repo_env import get_env, get_int_env, get_optional_env
 
 
 REPO_ROOT = bootstrap_repo(__file__)
@@ -35,10 +41,36 @@ LAST_BATCH_PATH = OUTPUT_DIR / "last_batch.json"
 LAST_UPLOAD_RESPONSE_PATH = OUTPUT_DIR / "last_upload_response.json"
 LAST_DONE_RESPONSE_PATH = OUTPUT_DIR / "last_done_response.json"
 LAST_HELP_RESPONSE_PATH = OUTPUT_DIR / "last_help_response.json"
+MODEL_ANALYSIS_PATH = OUTPUT_DIR / "last_model_analysis.json"
 
 REQUEST_TIMEOUT_SECONDS = get_int_env("AG3NTS_TIMEOUT_SECONDS", 30) or 30
+DEFAULT_MODEL = (
+    get_optional_env("OPENROUTER_MODEL")
+    or get_optional_env("LLM_MODEL")
+    or "openai/gpt-4.1-mini"
+)
+DEFAULT_OPENROUTER_TIMEOUT_SECONDS = get_int_env("OPENROUTER_TIMEOUT_SECONDS", 60) or 60
 NOTES_ZIP_URL = build_ag3nts_public_data_url("natan_notes.zip")
 NAME_PATTERN = re.compile(r"^[a-z0-9_]+$")
+MODEL_SYSTEM_PROMPT = """You extract structured marketplace facts from Polish logistics notes.
+
+Focus only on:
+- city manager full names from the conversations note
+- goods_sources from the transactions note
+
+Normalization rules:
+- city keys must use slugs exactly as provided in the allowed list
+- goods must use canonical singular slugs
+- goods_sources values must be lists of city slugs sorted alphabetically
+- deduplicate everything
+
+Return JSON only:
+{
+  "city_managers":{"domatowo":"Natan Rams"},
+  "goods_sources":{"chleb":["brudzewo","domatowo"]},
+  "reason":"short explanation"
+}
+"""
 
 CITY_DISPLAY_NAMES = {
     "brudzewo": "Brudzewo",
@@ -192,6 +224,34 @@ class MarketplaceData:
     goods_sources: dict[str, list[str]]
 
 
+def build_optional_openrouter_client(args: argparse.Namespace) -> OpenRouterClient | None:
+    if args.skip_model:
+        return None
+
+    api_key = (
+        get_optional_env("OPENROUTER_API_KEY")
+        or get_optional_env("LLM_API_KEY")
+        or ""
+    ).strip()
+    base_url = (
+        get_optional_env("OPENROUTER_BASE_URL")
+        or get_optional_env("LLM_BASE_URL")
+        or ""
+    ).strip()
+    model = (args.model or DEFAULT_MODEL).strip()
+    if not api_key or not base_url or not model:
+        return None
+
+    return build_task_openrouter_client(
+        __file__,
+        api_key=api_key,
+        base_url=base_url,
+        model=model,
+        task_name=TASK_NAME,
+        timeout_seconds=float(max(30, DEFAULT_OPENROUTER_TIMEOUT_SECONDS)),
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -214,6 +274,16 @@ def parse_args() -> argparse.Namespace:
         "--help-api",
         action="store_true",
         help="Print the remote filesystem API manual from the hub.",
+    )
+    parser.add_argument(
+        "--skip-model",
+        action="store_true",
+        help="Disable OpenRouter note analysis and use deterministic parsing only.",
+    )
+    parser.add_argument(
+        "--model",
+        default=None,
+        help=f"OpenRouter model override. Default: {DEFAULT_MODEL}.",
     )
     return parser.parse_args()
 
@@ -407,6 +477,126 @@ def build_marketplace_data(notes: NotesBundle) -> MarketplaceData:
     )
 
 
+def validate_model_analysis(raw_payload: dict[str, Any]) -> tuple[dict[str, str], dict[str, list[str]], str]:
+    raw_city_managers = raw_payload.get("city_managers")
+    raw_goods_sources = raw_payload.get("goods_sources")
+    if not isinstance(raw_city_managers, dict):
+        raise OpenRouterError("Model analysis is missing city_managers.")
+    if not isinstance(raw_goods_sources, dict):
+        raise OpenRouterError("Model analysis is missing goods_sources.")
+
+    city_managers: dict[str, str] = {}
+    for city_slug, full_name in raw_city_managers.items():
+        if city_slug not in CITY_DISPLAY_NAMES:
+            raise OpenRouterError(f"Unknown city slug in city_managers: {city_slug!r}")
+        manager_name = str(full_name).strip()
+        if not manager_name:
+            raise OpenRouterError(f"Empty manager name for {city_slug!r}")
+        city_managers[str(city_slug)] = manager_name
+
+    goods_sources: dict[str, list[str]] = {}
+    allowed_goods = set(GOOD_ALIASES.values())
+    for good_slug, raw_sources in raw_goods_sources.items():
+        if good_slug not in allowed_goods:
+            raise OpenRouterError(f"Unknown good slug in goods_sources: {good_slug!r}")
+        if not isinstance(raw_sources, list) or not raw_sources:
+            raise OpenRouterError(f"Invalid source list for {good_slug!r}")
+        normalized_sources = sorted(
+            {
+                str(city_slug).strip()
+                for city_slug in raw_sources
+                if str(city_slug).strip()
+            }
+        )
+        if any(city_slug not in CITY_DISPLAY_NAMES for city_slug in normalized_sources):
+            raise OpenRouterError(f"Unknown city slug in goods_sources[{good_slug!r}]")
+        goods_sources[str(good_slug)] = normalized_sources
+
+    reason = str(raw_payload.get("reason", "")).strip() or "OpenRouter analyzed the notes."
+    return city_managers, goods_sources, reason
+
+
+def analyze_notes_with_openrouter(
+    notes: NotesBundle,
+    client: OpenRouterClient | None,
+) -> tuple[dict[str, str], dict[str, list[str]], str] | None:
+    if client is None:
+        return None
+
+    allowed_cities = ", ".join(sorted(CITY_DISPLAY_NAMES))
+    allowed_goods = ", ".join(sorted(set(GOOD_ALIASES.values())))
+    completion = client.create_completion(
+        [
+            {"role": "system", "content": MODEL_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": (
+                    f"Allowed city slugs: {allowed_cities}\n"
+                    f"Allowed good slugs: {allowed_goods}\n\n"
+                    f"Conversations note:\n{notes.conversations}\n\n"
+                    f"Transactions note:\n{notes.transactions}"
+                ),
+            },
+        ]
+    )
+    if not completion.content:
+        raise OpenRouterError("Filesystem note analysis returned no content.")
+    payload = parse_json_object_content(completion.content)
+    return validate_model_analysis(payload)
+
+
+def resolve_marketplace_data(
+    notes: NotesBundle,
+    client: OpenRouterClient | None,
+) -> tuple[MarketplaceData, dict[str, Any]]:
+    city_needs = parse_city_needs(notes.announcements)
+    deterministic_error: str | None = None
+    deterministic_data: MarketplaceData | None = None
+    try:
+        deterministic_data = MarketplaceData(
+            city_needs=city_needs,
+            city_managers=infer_city_managers(notes.conversations),
+            goods_sources=parse_goods_sources(notes.transactions),
+        )
+    except ValueError as exc:
+        deterministic_error = str(exc)
+
+    model_analysis = analyze_notes_with_openrouter(notes, client)
+    if model_analysis is None:
+        if deterministic_data is None:
+            raise ValueError(deterministic_error or "Failed to parse marketplace data.")
+        return deterministic_data, {
+            "source": "deterministic",
+            "reason": "OpenRouter unavailable.",
+        }
+
+    model_city_managers, model_goods_sources, reason = model_analysis
+    if deterministic_data is None:
+        return (
+            MarketplaceData(
+                city_needs=city_needs,
+                city_managers=model_city_managers,
+                goods_sources=model_goods_sources,
+            ),
+            {
+                "source": "openrouter_fallback",
+                "reason": reason,
+                "deterministic_error": deterministic_error,
+            },
+        )
+
+    return deterministic_data, {
+        "source": "openrouter_crosscheck",
+        "reason": reason,
+        "matches_deterministic": (
+            model_city_managers == deterministic_data.city_managers
+            and model_goods_sources == deterministic_data.goods_sources
+        ),
+        "model_city_managers": model_city_managers,
+        "model_goods_sources": model_goods_sources,
+    }
+
+
 def build_city_link(city_slug: str) -> str:
     """Render a markdown link to a city file in the virtual filesystem."""
 
@@ -509,11 +699,27 @@ def main() -> int:
         return 0
 
     notes = load_notes(args.notes_dir)
-    data = build_marketplace_data(notes)
+    model_client = build_optional_openrouter_client(args)
+    model_metadata: dict[str, Any] = {
+        "source": "deterministic",
+        "reason": "Deterministic parsing only.",
+    }
+    try:
+        data, model_metadata = resolve_marketplace_data(notes, model_client)
+    except OpenRouterError as exc:
+        model_metadata = {
+            "source": "deterministic",
+            "reason": f"OpenRouter analysis failed: {exc}",
+        }
+        logger.warning("OpenRouter note analysis failed, using deterministic parsing: {}", exc)
+        data = build_marketplace_data(notes)
+
+    write_json(MODEL_ANALYSIS_PATH, model_metadata, ensure_ascii=False)
     batch_actions = build_batch_actions(data)
     write_json(LAST_BATCH_PATH, batch_actions, ensure_ascii=False)
 
     logger.info("Prepared filesystem batch: {}", dump_preview(data))
+    logger.info("Parsing source: {} ({})", model_metadata["source"], model_metadata["reason"])
 
     if args.dry_run:
         print(json.dumps(batch_actions, ensure_ascii=False, indent=2))

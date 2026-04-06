@@ -26,8 +26,8 @@ from devs_utilities.files import write_json
 from devs_utilities.http import HttpRequestError
 from devs_utilities.logging import configure_logging, logger as shared_logger
 from devs_utilities.openrouter import (
+    build_task_openrouter_client,
     OpenRouterClient,
-    OpenRouterConfig,
     OpenRouterError,
 )
 from repo_env import get_env, get_int_env, get_optional_env
@@ -220,13 +220,13 @@ def request_task(answer: dict[str, Any]) -> dict[str, Any]:
 
 
 def build_openrouter_client(model: str) -> OpenRouterClient:
-    return OpenRouterClient(
-        OpenRouterConfig(
-            api_key=get_openrouter_api_key(),
-            base_url=get_openrouter_base_url(),
-            model=model,
-            timeout_seconds=float(max(30, OPENROUTER_TIMEOUT_SECONDS)),
-        )
+    return build_task_openrouter_client(
+        __file__,
+        api_key=get_openrouter_api_key(),
+        base_url=get_openrouter_base_url(),
+        model=model,
+        task_name=TASK_NAME,
+        timeout_seconds=float(max(30, OPENROUTER_TIMEOUT_SECONDS)),
     )
 
 

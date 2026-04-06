@@ -23,13 +23,27 @@ class OpenRouterConfig:
     timeout_seconds: float = 120.0
     site_url: str | None = None
     site_name: str | None = None
+    usage_output_path: Path | None = None
+    usage_task_name: str | None = None
 
 
-def build_task_site_name(source_path: str | Path) -> str:
+def build_task_site_name(source_path: str | Path, *, task_name: str | None = None) -> str:
     """Build the standard X-Title header for a task script."""
 
-    task_dir_name = Path(source_path).resolve().parent.name
-    return f"AI Devs 4 - {task_dir_name}"
+    normalized_task_name = (task_name or "").strip()
+    if not normalized_task_name:
+        normalized_task_name = Path(source_path).resolve().parent.name
+    return f"AI Devs 4 - {normalized_task_name}"
+
+
+def build_task_usage_output_path(source_path: str | Path, *, task_name: str | None = None) -> Path:
+    """Build the standard per-task OpenRouter usage report path."""
+
+    task_dir = Path(source_path).resolve().parent
+    normalized_task_name = (task_name or "").strip()
+    if not normalized_task_name or normalized_task_name == task_dir.name:
+        return task_dir / "openrouter_usage.json"
+    return task_dir / f"openrouter_usage_{normalized_task_name}.json"
 
 
 def get_default_openrouter_site_url() -> str | None:
@@ -44,6 +58,7 @@ def build_task_openrouter_client(
     api_key: str,
     base_url: str,
     model: str,
+    task_name: str | None = None,
     timeout_seconds: float = 120.0,
     site_url: str | None = None,
     site_name: str | None = None,
@@ -57,7 +72,9 @@ def build_task_openrouter_client(
             model=model,
             timeout_seconds=timeout_seconds,
             site_url=site_url if site_url is not None else get_default_openrouter_site_url(),
-            site_name=site_name if site_name is not None else build_task_site_name(source_path),
+            site_name=site_name if site_name is not None else build_task_site_name(source_path, task_name=task_name),
+            usage_output_path=build_task_usage_output_path(source_path, task_name=task_name),
+            usage_task_name=(task_name or "").strip() or Path(source_path).resolve().parent.name,
         )
     )
 
@@ -85,11 +102,171 @@ class ChatCompletionResult:
     tool_calls: list[ToolCall]
 
 
+@dataclass(frozen=True, slots=True)
+class OpenRouterUsageSnapshot:
+    input_tokens: int
+    output_tokens: int
+    cached_tokens: int
+    reasoning_tokens: int
+    cache_write_tokens: int
+    total_tokens: int
+
+    def as_dict(self) -> dict[str, int]:
+        return {
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "cached_tokens": self.cached_tokens,
+            "reasoning_tokens": self.reasoning_tokens,
+            "cache_write_tokens": self.cache_write_tokens,
+            "total_tokens": self.total_tokens,
+        }
+
+
+def _coerce_int(value: Any) -> int:
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.isdigit():
+            return int(stripped)
+    return 0
+
+
+def extract_usage_snapshot(payload: dict[str, Any]) -> OpenRouterUsageSnapshot:
+    """Extract token-usage details from an OpenRouter response payload."""
+
+    usage = payload.get("usage")
+    if not isinstance(usage, dict):
+        return OpenRouterUsageSnapshot(
+            input_tokens=0,
+            output_tokens=0,
+            cached_tokens=0,
+            reasoning_tokens=0,
+            cache_write_tokens=0,
+            total_tokens=0,
+        )
+
+    prompt_details = usage.get("prompt_tokens_details")
+    if not isinstance(prompt_details, dict):
+        prompt_details = {}
+
+    completion_details = usage.get("completion_tokens_details")
+    if not isinstance(completion_details, dict):
+        completion_details = {}
+
+    input_tokens = _coerce_int(usage.get("prompt_tokens"))
+    output_tokens = _coerce_int(usage.get("completion_tokens"))
+    cached_tokens = _coerce_int(prompt_details.get("cached_tokens"))
+    reasoning_tokens = _coerce_int(completion_details.get("reasoning_tokens"))
+    cache_write_tokens = _coerce_int(prompt_details.get("cache_write_tokens"))
+    total_tokens = _coerce_int(usage.get("total_tokens")) or (input_tokens + output_tokens)
+    return OpenRouterUsageSnapshot(
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cached_tokens=cached_tokens,
+        reasoning_tokens=reasoning_tokens,
+        cache_write_tokens=cache_write_tokens,
+        total_tokens=total_tokens,
+    )
+
+
+class _UsageTracker:
+    """Aggregate OpenRouter token usage for one solver invocation."""
+
+    def __init__(self, *, output_path: Path, task_name: str | None) -> None:
+        self.output_path = output_path
+        self.task_name = task_name or output_path.parent.name
+        self._calls: list[dict[str, Any]] = []
+        self._by_model: dict[str, OpenRouterUsageSnapshot] = {}
+        self._write()
+
+    def record(self, *, payload: dict[str, Any], configured_model: str) -> None:
+        snapshot = extract_usage_snapshot(payload)
+        model_name = str(payload.get("model") or configured_model or "unknown").strip() or "unknown"
+        self._calls.append(
+            {
+                "index": len(self._calls) + 1,
+                "model": model_name,
+                **snapshot.as_dict(),
+            }
+        )
+        current = self._by_model.get(model_name)
+        if current is None:
+            self._by_model[model_name] = snapshot
+        else:
+            self._by_model[model_name] = OpenRouterUsageSnapshot(
+                input_tokens=current.input_tokens + snapshot.input_tokens,
+                output_tokens=current.output_tokens + snapshot.output_tokens,
+                cached_tokens=current.cached_tokens + snapshot.cached_tokens,
+                reasoning_tokens=current.reasoning_tokens + snapshot.reasoning_tokens,
+                cache_write_tokens=current.cache_write_tokens + snapshot.cache_write_tokens,
+                total_tokens=current.total_tokens + snapshot.total_tokens,
+            )
+        self._write()
+
+    def _totals(self) -> OpenRouterUsageSnapshot:
+        totals = OpenRouterUsageSnapshot(
+            input_tokens=0,
+            output_tokens=0,
+            cached_tokens=0,
+            reasoning_tokens=0,
+            cache_write_tokens=0,
+            total_tokens=0,
+        )
+        for snapshot in self._by_model.values():
+            totals = OpenRouterUsageSnapshot(
+                input_tokens=totals.input_tokens + snapshot.input_tokens,
+                output_tokens=totals.output_tokens + snapshot.output_tokens,
+                cached_tokens=totals.cached_tokens + snapshot.cached_tokens,
+                reasoning_tokens=totals.reasoning_tokens + snapshot.reasoning_tokens,
+                cache_write_tokens=totals.cache_write_tokens + snapshot.cache_write_tokens,
+                total_tokens=totals.total_tokens + snapshot.total_tokens,
+            )
+        return totals
+
+    def _write(self) -> None:
+        payload = {
+            "task": self.task_name,
+            "request_count": len(self._calls),
+            "models": sorted(self._by_model),
+            "totals": self._totals().as_dict(),
+            "usage_by_model": {
+                model_name: snapshot.as_dict()
+                for model_name, snapshot in sorted(self._by_model.items())
+            },
+            "calls": list(self._calls),
+        }
+        self.output_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+
 class OpenRouterClient:
     """Thin client for OpenRouter chat completions."""
 
+    _trackers: dict[str, _UsageTracker] = {}
+
     def __init__(self, config: OpenRouterConfig) -> None:
         self._config = config
+        self._tracker = self._build_tracker()
+
+    def _build_tracker(self) -> _UsageTracker | None:
+        if self._config.usage_output_path is None:
+            return None
+        key = str(self._config.usage_output_path.resolve())
+        tracker = self._trackers.get(key)
+        if tracker is None:
+            tracker = _UsageTracker(
+                output_path=self._config.usage_output_path.resolve(),
+                task_name=self._config.usage_task_name,
+            )
+            self._trackers[key] = tracker
+        return tracker
 
     def create_raw_completion(
         self,
@@ -135,7 +312,26 @@ class OpenRouterClient:
             raise OpenRouterError("OpenRouter returned a non-object response.")
         if parsed.get("error"):
             raise OpenRouterError(str(parsed["error"]))
+        if self._tracker is not None:
+            self._tracker.record(payload=parsed, configured_model=self._config.model)
         return parsed
+
+    def create_raw_completion_legacy(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | None = None,
+        extra_payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Backward-compatible alias for older task scripts."""
+
+        return self.create_raw_completion(
+            messages,
+            tools=tools,
+            tool_choice=tool_choice,
+            extra_payload=extra_payload,
+        )
 
     def create_completion(
         self,
@@ -153,6 +349,30 @@ class OpenRouterClient:
                 extra_payload=extra_payload,
             )
         )
+
+
+def strip_code_fences(text: str) -> str:
+    """Remove a single surrounding fenced code block when present."""
+
+    stripped = text.strip()
+    if stripped.startswith("```") and stripped.endswith("```"):
+        lines = stripped.splitlines()
+        if len(lines) >= 3:
+            return "\n".join(lines[1:-1]).strip()
+    return stripped
+
+
+def parse_json_object_content(content: str) -> dict[str, Any]:
+    """Parse a model text response as a JSON object."""
+
+    normalized = strip_code_fences(content)
+    try:
+        parsed = json.loads(normalized)
+    except json.JSONDecodeError as exc:
+        raise OpenRouterError("OpenRouter did not return valid JSON.") from exc
+    if not isinstance(parsed, dict):
+        raise OpenRouterError("OpenRouter returned a non-object JSON payload.")
+    return parsed
 
 
 def extract_completion_result(payload: dict[str, Any]) -> ChatCompletionResult:

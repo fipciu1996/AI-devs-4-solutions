@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import unittest
 
+from devs_utilities.openrouter import OpenRouterError
 from filesystem.solve_filesystem import (
     NotesBundle,
     build_batch_actions,
     build_marketplace_data,
+    validate_model_analysis,
 )
 
 
@@ -140,6 +142,34 @@ class SolveFilesystemTests(unittest.TestCase):
             },
             actions,
         )
+
+    def test_validate_model_analysis_accepts_normalized_payload(self) -> None:
+        city_managers, goods_sources, reason = validate_model_analysis(
+            {
+                "city_managers": {
+                    "domatowo": "Natan Rams",
+                    "opalino": "Iga Kapecka",
+                },
+                "goods_sources": {
+                    "chleb": ["domatowo", "celbowo"],
+                    "woda": ["brudzewo"],
+                },
+                "reason": "Cross-checked the natural-language notes.",
+            }
+        )
+
+        self.assertEqual(city_managers["domatowo"], "Natan Rams")
+        self.assertEqual(goods_sources["chleb"], ["celbowo", "domatowo"])
+        self.assertIn("Cross-checked", reason)
+
+    def test_validate_model_analysis_rejects_unknown_city_slug(self) -> None:
+        with self.assertRaises(OpenRouterError):
+            validate_model_analysis(
+                {
+                    "city_managers": {"unknown": "Ghost Manager"},
+                    "goods_sources": {"chleb": ["domatowo"]},
+                }
+            )
 
 
 if __name__ == "__main__":
