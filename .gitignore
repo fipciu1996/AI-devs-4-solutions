@@ -11,3 +11,11 @@ __pycache__/
 *.pyc
 **/*.json
 /courses/
+/phonecall/probe_case_1/
+/phonecall/probe_case_2/
+/phonecall/probe_case_3/
+/phonecall/probe_case_4/
+/phonecall/probe_monitoring_barbakan/
+/phonecall/probe_monitoring_reason/
+/phonecall/probe_natural/
+/phonecall/runs/
