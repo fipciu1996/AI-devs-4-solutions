@@ -11,10 +11,13 @@ for candidate in (str(REPO_ROOT), str(SENDIT_DIR)):
         sys.path.insert(0, candidate)
 
 from devs_utilities.openrouter import ChatCompletionResult
-from build_declaration_draft import build_draft_with_tool_calling, resolve_system_prompt_path
+from build_declaration_draft import DEFAULT_SITE_NAME, build_draft_with_tool_calling, resolve_system_prompt_path
 
 
 class ResolveSystemPromptPathTests(unittest.TestCase):
+    def test_default_site_name_uses_specific_solver_name(self) -> None:
+        self.assertEqual(DEFAULT_SITE_NAME, "AI Devs 4 - sendit-draft")
+
     def test_falls_back_to_sendit_directory_for_legacy_bare_filename(self) -> None:
         resolved = resolve_system_prompt_path(Path("openrouter_system_prompt.txt"), REPO_ROOT)
 

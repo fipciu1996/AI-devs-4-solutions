@@ -49,11 +49,13 @@ logger = shared_logger.bind(component="sensors")
 
 
 TASK_NAME = "evaluation"
+OPENROUTER_TASK_NAME = "sensors"
 DATA_URL = build_ag3nts_public_data_url("sensors.zip")
 DEFAULT_MODEL = get_llm_model("SENSORS_MODEL")
 DEFAULT_BATCH_SIZE = get_int_env("SENSORS_BATCH_SIZE", 10) or 10
 DOWNLOAD_TIMEOUT_SECONDS = get_int_env("SENSORS_DOWNLOAD_TIMEOUT_SECONDS", 60) or 60
 VERIFY_TIMEOUT_SECONDS = get_int_env("AG3NTS_TIMEOUT_SECONDS", 30) or 30
+DEFAULT_SITE_NAME = build_task_site_name(__file__, task_name=OPENROUTER_TASK_NAME)
 
 OUTPUT_DIR = Path(__file__).resolve().parent
 ZIP_PATH = OUTPUT_DIR / "sensors.zip"
@@ -562,6 +564,7 @@ def build_openrouter_client(model_override: str | None) -> OpenRouterClient:
         model=model,
         task_name=TASK_NAME,
         timeout_seconds=timeout_seconds,
+        site_name=DEFAULT_SITE_NAME,
     )
 
 

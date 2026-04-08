@@ -41,9 +41,15 @@ def get_llm_base_url() -> str:
 
 
 def get_llm_model(*names: str, default: str = "") -> str:
-    """Read the shared or task-specific LLM model name from the repo root .env."""
+    """Read the repository-wide default LLM model, then optional task-specific fallbacks."""
 
-    return _get_first_env(*names, "OPENROUTER_MODEL", "LLM_MODEL") or default
+    return _get_first_env("OPENROUTER_MODEL", "LLM_MODEL", *names) or default
+
+
+def get_ngrok_auth_token() -> str:
+    """Read the repository-wide ngrok auth token, with a legacy alias fallback."""
+
+    return _get_first_env("NGROK_AUTH_TOKEN", "NGROK_AUTHTOKEN")
 
 
 def get_package_service_key() -> str:
@@ -67,6 +73,7 @@ __all__ = [
     "get_llm_api_key",
     "get_llm_base_url",
     "get_llm_model",
+    "get_ngrok_auth_token",
     "get_package_service_key",
     "get_package_service_url",
     "load_repo_env",

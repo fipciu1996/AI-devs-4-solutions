@@ -6,6 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import devs_utilities.openrouter as openrouter_module
+from devs_utilities.http import HttpRequestError
 from devs_utilities.openrouter import (
     OpenRouterError,
     OpenRouterClient,
@@ -171,7 +172,7 @@ class OpenRouterParsingTests(unittest.TestCase):
         self.assertEqual(usage.total_tokens, 196)
 
     def test_build_task_site_name_uses_explicit_task_name(self) -> None:
-        site_name = build_task_site_name("C:/repo/people/find-agent.py", task_name="findhim")
+        site_name = build_task_site_name("C:/repo/findhim/solve_findhim.py", task_name="findhim")
 
         self.assertEqual(site_name, "AI Devs 4 - findhim")
 
@@ -280,6 +281,106 @@ class OpenRouterParsingTests(unittest.TestCase):
 
         self.assertEqual(result.content, "working reply")
         self.assertEqual(mock_create_raw_completion.call_count, 2)
+
+    def test_create_raw_completion_retries_after_429(self) -> None:
+        client = OpenRouterClient(
+            OpenRouterConfig(
+                api_key="token",
+                base_url="https://openrouter.example/api/v1/chat/completions",
+                model="openrouter/free",
+                retry_attempts=3,
+                retry_base_delay_seconds=2.0,
+                retry_max_delay_seconds=10.0,
+            )
+        )
+        response_payload = {
+            "choices": [{"message": {"content": "working reply"}}],
+        }
+
+        with patch(
+            "devs_utilities.openrouter.post_json",
+            side_effect=[
+                HttpRequestError(
+                    url="https://openrouter.example/api/v1/chat/completions",
+                    message="HTTP 429",
+                    status_code=429,
+                ),
+                response_payload,
+            ],
+        ) as mock_post_json, patch("devs_utilities.openrouter.time.sleep") as mock_sleep:
+            parsed = client.create_raw_completion([{"role": "user", "content": "hello"}])
+
+        self.assertEqual(parsed, response_payload)
+        self.assertEqual(mock_post_json.call_count, 2)
+        mock_sleep.assert_called_once_with(2.0)
+
+    def test_create_raw_completion_uses_rate_limit_reset_from_error_payload(self) -> None:
+        client = OpenRouterClient(
+            OpenRouterConfig(
+                api_key="token",
+                base_url="https://openrouter.example/api/v1/chat/completions",
+                model="openrouter/free",
+                retry_attempts=2,
+                retry_base_delay_seconds=2.0,
+                retry_max_delay_seconds=90.0,
+            )
+        )
+        reset_timestamp = 1_700_000_030
+        error = HttpRequestError(
+            url="https://openrouter.example/api/v1/chat/completions",
+            message="HTTP 429",
+            status_code=429,
+            body=json.dumps(
+                {
+                    "error": {
+                        "metadata": {
+                            "headers": {
+                                "X-RateLimit-Reset": str(reset_timestamp),
+                            }
+                        }
+                    }
+                }
+            ),
+        )
+        response_payload = {
+            "choices": [{"message": {"content": "working reply"}}],
+        }
+
+        with patch(
+            "devs_utilities.openrouter.post_json",
+            side_effect=[error, response_payload],
+        ), patch("devs_utilities.openrouter.time.sleep") as mock_sleep, patch(
+            "devs_utilities.openrouter.time.time",
+            return_value=1_700_000_000,
+        ):
+            client.create_raw_completion([{"role": "user", "content": "hello"}])
+
+        mock_sleep.assert_called_once_with(30.0)
+
+    def test_create_raw_completion_does_not_retry_non_retryable_http_error(self) -> None:
+        client = OpenRouterClient(
+            OpenRouterConfig(
+                api_key="token",
+                base_url="https://openrouter.example/api/v1/chat/completions",
+                model="openrouter/free",
+                retry_attempts=4,
+            )
+        )
+        error = HttpRequestError(
+            url="https://openrouter.example/api/v1/chat/completions",
+            message="HTTP 400",
+            status_code=400,
+        )
+
+        with patch(
+            "devs_utilities.openrouter.post_json",
+            side_effect=error,
+        ) as mock_post_json, patch("devs_utilities.openrouter.time.sleep") as mock_sleep:
+            with self.assertRaises(OpenRouterError):
+                client.create_raw_completion([{"role": "user", "content": "hello"}])
+
+        self.assertEqual(mock_post_json.call_count, 1)
+        mock_sleep.assert_not_called()
 
 
 if __name__ == "__main__":

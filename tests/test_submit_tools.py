@@ -39,14 +39,21 @@ class SubmitToolsTests(unittest.TestCase):
         tool = payload["tools"][0]
         self.assertEqual(tool["URL"], "https://public.example/api/custom-tool")
 
-    def test_build_ngrok_forward_kwargs_omits_empty_values(self) -> None:
+    def test_build_ngrok_forward_kwargs_omits_optional_empty_values_but_keeps_app_metadata(self) -> None:
         kwargs = build_ngrok_forward_kwargs(
             18081,
             authtoken=None,
             domain=None,
         )
 
-        self.assertEqual(kwargs, {"addr": 18081})
+        self.assertEqual(
+            kwargs,
+            {
+                "addr": 18081,
+                "metadata": "AI Devs 4 - negotiations",
+                "session_metadata": "AI Devs 4 - negotiations",
+            },
+        )
 
     def test_extract_listener_url_supports_method_and_attribute(self) -> None:
         self.assertEqual(

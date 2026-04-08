@@ -44,6 +44,7 @@ logger = shared_logger.bind(component="people.filter")
 
 OPENROUTER_API_URL = get_llm_base_url()
 TASK_NAME = "people"
+OPENROUTER_TASK_NAME = "people-filter"
 REFERENCE_DATE = date.fromisoformat(get_env("PEOPLE_REFERENCE_DATE", "2026-03-10"))
 DEFAULT_OPENROUTER_MODEL = get_llm_model("PEOPLE_MODEL")
 DEFAULT_BATCH_SIZE = get_int_env("PEOPLE_BATCH_SIZE", 25) or 25
@@ -169,7 +170,7 @@ def load_config(path: Path, args: argparse.Namespace) -> AppConfig:
     ).strip()
     openrouter_model = DEFAULT_OPENROUTER_MODEL.strip()
     site_url = str(payload.get("site_url") or get_optional_env("OPENROUTER_SITE_URL") or "").strip() or None
-    site_name = build_task_site_name(__file__, task_name=TASK_NAME)
+    site_name = build_task_site_name(__file__, task_name=OPENROUTER_TASK_NAME)
     batch_size = int(payload.get("batch_size") or DEFAULT_BATCH_SIZE)
 
     if args.model:

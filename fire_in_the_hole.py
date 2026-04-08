@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Callable
 
 from devs_utilities.logging import configure_logging, logger as shared_logger
-from devs_utilities.repo_env import get_optional_env, load_repo_env
+from devs_utilities.repo_env import get_ngrok_auth_token, get_optional_env, load_repo_env
 
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -94,7 +94,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-workers",
         type=int,
-        default=20,
+        default=4,
         help="Maximum number of tasks to run in parallel. Default: 4.",
     )
     parser.add_argument(
@@ -138,7 +138,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--negotiations-use-ngrok",
         action="store_true",
-        help="Expose the local negotiations tool with the ngrok Python SDK.",
+        help="Expose the local negotiations tool with the ngrok Python SDK. Auto-enabled when NGROK_AUTH_TOKEN is set.",
     )
     parser.add_argument(
         "--negotiations-ngrok-domain",
@@ -235,13 +235,13 @@ def build_people_task() -> TaskSpec:
             ),
             StepSpec(
                 label="findhim",
-                command=python_command("people/find-agent.py", *verify_args),
+                command=python_command("findhim/solve_findhim.py", *verify_args),
             ),
         ]
 
     return TaskSpec(
         name="people",
-        description="Run the people candidate filter and then the findhim lookup.",
+        description="Run the people candidate filter from people/ and then the findhim lookup from findhim/.",
         build_steps=build_steps,
         mode_label="pipeline",
     )
@@ -326,7 +326,7 @@ def build_negotiations_task() -> TaskSpec:
             return True, None
         return (
             False,
-            "missing --negotiations-public-base-url or Ngrok config",
+            "missing --negotiations-public-base-url or NGROK_AUTH_TOKEN / Ngrok config",
         )
 
     def build_steps(args: argparse.Namespace) -> list[StepSpec]:
@@ -438,6 +438,11 @@ def build_task_registry() -> dict[str, TaskSpec]:
             "okoeditor/solve_okoeditor.py",
         ),
         build_people_task(),
+        build_single_script_task(
+            "phonecall",
+            "Run the phonecall solver.",
+            "phonecall/solve_phonecall.py",
+        ),
         build_single_script_task(
             "radiomonitoring",
             "Run the radiomonitoring solver.",
@@ -900,15 +905,22 @@ def summarize_results(tasks: list[TaskSpec], results_by_name: dict[str, TaskResu
     return 1 if failure_count else 0
 
 
-def main() -> int:
-    configure_logging(name="fire_in_the_hole")
-    args = parse_args()
+def apply_negotiations_defaults(args: argparse.Namespace) -> argparse.Namespace:
+    """Fill negotiations launcher defaults from the repository environment."""
+
     if not args.negotiations_public_base_url:
         args.negotiations_public_base_url = get_optional_env("NEGOTIATIONS_PUBLIC_BASE_URL")
     if not args.negotiations_ngrok_domain:
         args.negotiations_ngrok_domain = get_optional_env("NGROK_DOMAIN")
     if not args.negotiations_use_ngrok:
-        args.negotiations_use_ngrok = bool(get_optional_env("NGROK_AUTHTOKEN"))
+        args.negotiations_use_ngrok = bool(get_ngrok_auth_token())
+    return args
+
+
+def main() -> int:
+    configure_logging(name="fire_in_the_hole")
+    args = parse_args()
+    apply_negotiations_defaults(args)
 
     registry = build_task_registry()
     try:

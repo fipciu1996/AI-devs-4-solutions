@@ -49,25 +49,25 @@ from devs_utilities.repo_env import (
 
 
 REPO_ROOT = bootstrap_repo(__file__)
-logger = shared_logger.bind(component="people.find")
+logger = shared_logger.bind(component="findhim")
 
 
 OPENROUTER_API_URL = get_llm_base_url()
 TASK_NAME = "findhim"
-DEFAULT_OPENROUTER_MODEL = get_llm_model("PEOPLE_MODEL")
+DEFAULT_OPENROUTER_MODEL = get_llm_model("FINDHIM_MODEL", "PEOPLE_MODEL")
 API_TIMEOUT_SECONDS = get_int_env("PEOPLE_TIMEOUT_SECONDS", 120) or 120
 OPENROUTER_TIMEOUT_SECONDS = get_int_env("OPENROUTER_TIMEOUT_SECONDS", 120) or 120
 DEFAULT_PLANTS_PATH = "findhim_locations.json"
-DEFAULT_SUSPECTS_PATH = "people_result.json"
+DEFAULT_SUSPECTS_PATH = "../people/people_result.json"
 DEFAULT_OUTPUT_PATH = "findhim_result.json"
 MODEL_MAX_STEPS = 4
 GEOCODE_LEGACY_SYSTEM_PROMPT = load_prompt_text(
     __file__,
-    "find_agent_geocode_legacy_system_prompt.txt",
+    "geocode_legacy_system_prompt.txt",
 )
 GEOCODE_SYSTEM_PROMPT = load_prompt_text(
     __file__,
-    "find_agent_geocode_system_prompt.txt",
+    "geocode_system_prompt.txt",
 )
 
 
@@ -117,12 +117,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--config",
-        default="people_config.json",
+        default="findhim_config.json",
         help="Ścieżka do pliku JSON z kluczami i ustawieniami OpenRouter/HUB.",
     )
     parser.add_argument(
         "--csv",
-        default="people.csv",
+        default="../people/people.csv",
         help="Ścieżka do people.csv z pełnymi danymi źródłowymi.",
     )
     parser.add_argument(
@@ -344,7 +344,7 @@ def execute_find_agent_tool_call(
     handlers: dict[str, Any],
 ) -> dict[str, Any]:
     if tool_call.name not in handlers:
-        raise OpenRouterError(f"Unknown people.find tool call: {tool_call.name!r}")
+        raise OpenRouterError(f"Unknown findhim tool call: {tool_call.name!r}")
     result = handlers[tool_call.name](tool_call.arguments)
     return {
         "role": "tool",
@@ -616,18 +616,31 @@ def build_verify_payload(match: CandidateMatch, config: AppConfig) -> dict[str, 
     }
 
 
+def resolve_findhim_config_path(findhim_dir: Path, config_arg: str) -> Path:
+    """Resolve the config path, falling back to the legacy people/ location when needed."""
+
+    candidate = resolve_path(config_arg, findhim_dir)
+    if candidate.exists():
+        return candidate
+    if Path(config_arg) == Path("findhim_config.json"):
+        legacy_candidate = REPO_ROOT / "people" / "people_config.json"
+        if legacy_candidate.exists():
+            return legacy_candidate
+    return candidate
+
+
 def main() -> None:
-    configure_logging(name="people.find")
+    configure_logging(name="findhim")
     if not OPENROUTER_API_URL:
         raise ValueError("Missing LLM_BASE_URL in the local repository config.")
     args = parse_args()
-    people_dir = REPO_ROOT / "people"
-    config = load_config(resolve_path(args.config, people_dir), args)
-    birth_years = load_birth_years(resolve_path(args.csv, people_dir))
-    suspects = load_suspects(resolve_path(args.suspects, people_dir), birth_years)
+    findhim_dir = REPO_ROOT / "findhim"
+    config = load_config(resolve_findhim_config_path(findhim_dir, args.config), args)
+    birth_years = load_birth_years(resolve_path(args.csv, findhim_dir))
+    suspects = load_suspects(resolve_path(args.suspects, findhim_dir), birth_years)
     raw_plants = fetch_power_plants(
         config,
-        resolve_path(args.plants, people_dir),
+        resolve_path(args.plants, findhim_dir),
         args.refresh_plants,
     )
     openrouter_client = build_task_openrouter_client(
@@ -644,7 +657,7 @@ def main() -> None:
     best_match = find_best_match(suspects, plants, config)
     payload = build_verify_payload(best_match, config)
 
-    write_json(resolve_path(args.output, people_dir), payload)
+    write_json(resolve_path(args.output, findhim_dir), payload)
     preview = {
         "bestMatch": {
             "name": best_match.suspect.name,

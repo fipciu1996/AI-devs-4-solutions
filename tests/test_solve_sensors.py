@@ -1,6 +1,7 @@
 import unittest
 
 from sensors.solve_sensors import (
+    DEFAULT_SITE_NAME,
     SensorRecord,
     analyze_measurements,
     classify_note_polarity,
@@ -29,6 +30,9 @@ def build_record(**overrides):
 
 
 class SolveSensorsTests(unittest.TestCase):
+    def test_default_site_name_uses_solver_name_not_course_task_name(self) -> None:
+        self.assertEqual(DEFAULT_SITE_NAME, "AI Devs 4 - sensors")
+
     def test_analyze_measurements_detects_out_of_range_and_inactive_noise(self) -> None:
         record = build_record(
             sensor_type="temperature/voltage",

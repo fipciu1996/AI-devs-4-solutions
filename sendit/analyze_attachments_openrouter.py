@@ -43,11 +43,12 @@ logger = shared_logger.bind(component="sendit.analyze")
 
 OPENROUTER_URL = get_llm_base_url()
 TASK_NAME = "sendit"
+OPENROUTER_TASK_NAME = "sendit-analyze"
 DEFAULT_MODEL = get_llm_model("SENDIT_MODEL")
 DEFAULT_MAX_TEXT_CHARS = get_int_env("SENDIT_ANALYZE_MAX_TEXT_CHARS", 24_000) or 24_000
 OPENROUTER_TIMEOUT_SECONDS = get_int_env("OPENROUTER_TIMEOUT_SECONDS", 120) or 120
 MODEL_MAX_STEPS = 3
-DEFAULT_SITE_NAME = build_task_site_name(__file__, task_name=TASK_NAME)
+DEFAULT_SITE_NAME = build_task_site_name(__file__, task_name=OPENROUTER_TASK_NAME)
 TEXT_EXTENSIONS = {".md", ".txt", ".csv", ".json", ".yaml", ".yml"}
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
 ANALYZE_SYSTEM_PROMPT = load_prompt_text(__file__, "analyze_system_prompt.txt")

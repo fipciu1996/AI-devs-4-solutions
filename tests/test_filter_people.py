@@ -49,6 +49,7 @@ class PeopleFilterTests(unittest.TestCase):
             config = load_config(config_path, args)
 
         self.assertEqual(config.openrouter_model, "env-model")
+        self.assertEqual(config.site_name, "AI Devs 4 - people-filter")
 
     def test_parse_classification_result_accepts_alternate_items_key(self) -> None:
         parsed = parse_classification_result(

@@ -4,11 +4,14 @@ import sys
 import unittest
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from fire_in_the_hole import (
     TaskFlags,
     TaskResult,
+    apply_negotiations_defaults,
+    build_task_registry,
     collect_success_flags,
     empty_token_totals,
     extract_flags_from_log_text,
@@ -21,6 +24,22 @@ from fire_in_the_hole import (
 
 
 class FireInTheHoleFlagTests(unittest.TestCase):
+    def test_build_task_registry_includes_phonecall(self) -> None:
+        registry = build_task_registry()
+
+        self.assertIn("phonecall", registry)
+        self.assertEqual(registry["phonecall"].description, "Run the phonecall solver.")
+
+    def test_people_pipeline_uses_separate_findhim_directory(self) -> None:
+        registry = build_task_registry()
+
+        steps = registry["people"].build_steps(SimpleNamespace(verify=True))
+
+        self.assertEqual(Path(steps[0].command[-2]).as_posix(), "people/filter_people.py")
+        self.assertEqual(steps[0].command[-1], "--verify")
+        self.assertEqual(Path(steps[1].command[-2]).as_posix(), "findhim/solve_findhim.py")
+        self.assertEqual(steps[1].command[-1], "--verify")
+
     def test_extract_flags_from_log_text_reads_main_and_secret_flags(self) -> None:
         flags = extract_flags_from_log_text(
             "categorize",
@@ -127,6 +146,22 @@ class FireInTheHoleFlagTests(unittest.TestCase):
 
         self.assertTrue(default_args.verify)
         self.assertFalse(disabled_args.verify)
+
+    def test_apply_negotiations_defaults_enables_ngrok_from_repo_env(self) -> None:
+        with patch.object(sys, "argv", ["fire_in_the_hole.py"]):
+            args = parse_args()
+        with patch.dict(
+            "os.environ",
+            {
+                "NGROK_AUTH_TOKEN": "token-from-env",
+                "NGROK_DOMAIN": "negotiations.example.ngrok.app",
+            },
+            clear=True,
+        ):
+            apply_negotiations_defaults(args)
+
+        self.assertTrue(args.negotiations_use_ngrok)
+        self.assertEqual(args.negotiations_ngrok_domain, "negotiations.example.ngrok.app")
 
     def test_write_task_cost_report_creates_zero_totals_when_usage_file_is_missing(self) -> None:
         cost_path = Path(__file__).with_name("_fire_in_the_hole_domatowo_cost.json")

@@ -29,7 +29,7 @@ from devs_utilities.ag3nts import AG3NTS_VERIFY_URL, submit_task_answer
 from devs_utilities.bootstrap import bootstrap_repo
 from devs_utilities.http import HttpRequestError, get_json
 from negotiations_api.config import load_settings
-from devs_utilities.repo_env import get_course_api_key, get_optional_env
+from devs_utilities.repo_env import get_course_api_key, get_ngrok_auth_token, get_optional_env
 
 
 bootstrap_repo(__file__)
@@ -39,6 +39,7 @@ DEFAULT_LOCAL_HOST = "127.0.0.1"
 DEFAULT_SERVER_STARTUP_TIMEOUT_SECONDS = 20.0
 DEFAULT_CHECK_INTERVAL_SECONDS = 5.0
 DEFAULT_CHECK_ATTEMPTS = 12
+NGROK_APP_NAME = "AI Devs 4 - negotiations"
 PENDING_CHECK_MARKERS = (
     "pending",
     "processing",
@@ -93,9 +94,11 @@ def parse_args() -> argparse.Namespace:
         help="Expose the local negotiations API through the ngrok Python SDK.",
     )
     parser.add_argument(
+        "--ngrok-auth-token",
         "--ngrok-authtoken",
-        default=get_optional_env("NGROK_AUTHTOKEN"),
-        help="ngrok authtoken. Defaults to NGROK_AUTHTOKEN.",
+        dest="ngrok_auth_token",
+        default=get_ngrok_auth_token(),
+        help="ngrok auth token. Defaults to NGROK_AUTH_TOKEN, with NGROK_AUTHTOKEN as a legacy fallback.",
     )
     parser.add_argument(
         "--ngrok-domain",
@@ -226,7 +229,11 @@ def build_ngrok_forward_kwargs(
 ) -> dict[str, object]:
     """Build keyword arguments for ngrok.forward()."""
 
-    kwargs: dict[str, object] = {"addr": port}
+    kwargs: dict[str, object] = {
+        "addr": port,
+        "metadata": NGROK_APP_NAME,
+        "session_metadata": NGROK_APP_NAME,
+    }
     if authtoken:
         kwargs["authtoken"] = authtoken
     if domain:
@@ -422,7 +429,7 @@ def main() -> int:
                 )
             with ngrok_tunnel(
                 port=args.api_port,
-                authtoken=args.ngrok_authtoken,
+                authtoken=args.ngrok_auth_token,
                 domain=args.ngrok_domain,
             ) as public_base_url:
                 print(f"Ngrok public base URL: {public_base_url}")

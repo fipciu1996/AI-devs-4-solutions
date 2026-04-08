@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .env import get_optional_env
+from .env import get_int_env, get_optional_env
 from .http import HttpRequestError, JsonResponseError, post_json
 
 
@@ -28,6 +28,12 @@ class OpenRouterConfig:
     site_name: str | None = None
     usage_output_path: Path | None = None
     usage_task_name: str | None = None
+    retry_attempts: int = 5
+    retry_base_delay_seconds: float = 5.0
+    retry_max_delay_seconds: float = 90.0
+
+
+RETRYABLE_STATUS_CODES = frozenset({408, 425, 429, 500, 502, 503, 504})
 
 
 def build_task_site_name(source_path: str | Path, *, task_name: str | None = None) -> str:
@@ -62,6 +68,16 @@ def get_default_openrouter_site_url() -> str | None:
     return get_optional_env("OPENROUTER_SITE_URL") or get_optional_env("OPENROUTER_APP_URL")
 
 
+def _get_float_env(name: str, default: float) -> float:
+    raw_value = get_optional_env(name)
+    if not raw_value:
+        return default
+    try:
+        return float(raw_value)
+    except ValueError:
+        return default
+
+
 def build_task_openrouter_client(
     source_path: str | Path,
     *,
@@ -90,6 +106,15 @@ def build_task_openrouter_client(
             site_name=site_name if site_name is not None else build_task_site_name(source_path, task_name=task_name),
             usage_output_path=build_task_usage_output_path(source_path, task_name=task_name),
             usage_task_name=usage_task_name,
+            retry_attempts=max(1, get_int_env("OPENROUTER_RETRY_ATTEMPTS", 5) or 5),
+            retry_base_delay_seconds=max(
+                1.0,
+                _get_float_env("OPENROUTER_RETRY_BASE_DELAY_SECONDS", 5.0),
+            ),
+            retry_max_delay_seconds=max(
+                1.0,
+                _get_float_env("OPENROUTER_RETRY_MAX_DELAY_SECONDS", 90.0),
+            ),
         )
     )
 
@@ -317,6 +342,82 @@ class OpenRouterClient:
             self._trackers[key] = tracker
         return tracker
 
+    def _is_retryable_http_error(self, error: HttpRequestError) -> bool:
+        if error.status_code is None:
+            return True
+        return error.status_code in RETRYABLE_STATUS_CODES
+
+    def _extract_retry_delay(self, error: HttpRequestError, *, attempt: int) -> float:
+        retry_after = self._extract_retry_after_header(error.headers)
+        if retry_after is not None:
+            return retry_after
+
+        payload = error.body_as_json()
+        if isinstance(payload, dict):
+            delay = self._extract_retry_delay_from_payload(payload)
+            if delay is not None:
+                return delay
+
+        computed = self._config.retry_base_delay_seconds * (2 ** attempt)
+        return min(self._config.retry_max_delay_seconds, computed)
+
+    @staticmethod
+    def _extract_retry_after_header(headers: Any) -> float | None:
+        if not headers:
+            return None
+        if isinstance(headers, dict):
+            retry_after = headers.get("Retry-After")
+            if retry_after is None:
+                retry_after = headers.get("retry-after")
+            if retry_after is None:
+                return None
+            try:
+                return max(1.0, float(retry_after))
+            except (TypeError, ValueError):
+                return None
+        return None
+
+    @staticmethod
+    def _extract_retry_delay_from_payload(payload: dict[str, Any]) -> float | None:
+        retry_after = payload.get("retry_after")
+        if isinstance(retry_after, (int, float)) and retry_after > 0:
+            return float(retry_after)
+
+        error_payload = payload.get("error")
+        if not isinstance(error_payload, dict):
+            return None
+
+        metadata = error_payload.get("metadata")
+        if not isinstance(metadata, dict):
+            return None
+
+        metadata_headers = metadata.get("headers")
+        if not isinstance(metadata_headers, dict):
+            return None
+
+        retry_after_header = metadata_headers.get("Retry-After") or metadata_headers.get("retry-after")
+        if isinstance(retry_after_header, (int, float)) and retry_after_header > 0:
+            return float(retry_after_header)
+        if isinstance(retry_after_header, str):
+            try:
+                return max(1.0, float(retry_after_header))
+            except ValueError:
+                pass
+
+        reset_value = metadata_headers.get("X-RateLimit-Reset") or metadata_headers.get("x-ratelimit-reset")
+        if reset_value is None:
+            return None
+        try:
+            reset_timestamp = float(reset_value)
+        except (TypeError, ValueError):
+            return None
+        if reset_timestamp > 1_000_000_000_000:
+            reset_timestamp /= 1000.0
+        delay = reset_timestamp - time.time()
+        if delay <= 0:
+            return None
+        return max(1.0, delay)
+
     def create_raw_completion(
         self,
         messages: list[dict[str, Any]],
@@ -343,7 +444,8 @@ class OpenRouterClient:
         if self._config.site_name:
             headers["X-Title"] = self._config.site_name
 
-        for attempt in range(3):
+        attempts = max(1, self._config.retry_attempts)
+        for attempt in range(attempts):
             try:
                 parsed = post_json(
                     self._config.base_url,
@@ -353,8 +455,8 @@ class OpenRouterClient:
                 )
                 break
             except HttpRequestError as exc:
-                if exc.status_code == 429 and attempt < 2:
-                    time.sleep(5 * (attempt + 1))
+                if self._is_retryable_http_error(exc) and attempt < attempts - 1:
+                    time.sleep(self._extract_retry_delay(exc, attempt=attempt))
                     continue
                 raise OpenRouterError(str(exc)) from exc
             except JsonResponseError as exc:

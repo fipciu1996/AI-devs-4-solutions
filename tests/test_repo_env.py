@@ -24,7 +24,7 @@ class RepoEnvAliasTests(unittest.TestCase):
         with patch.dict(os.environ, {"OPENROUTER_MODEL": "shared-model"}, clear=True):
             self.assertEqual(repo_env.get_llm_model(), "shared-model")
 
-    def test_get_llm_model_prefers_task_specific_alias(self) -> None:
+    def test_get_llm_model_prefers_repository_default_over_task_specific_alias(self) -> None:
         with patch.dict(
             os.environ,
             {
@@ -33,7 +33,32 @@ class RepoEnvAliasTests(unittest.TestCase):
             },
             clear=True,
         ):
+            self.assertEqual(repo_env.get_llm_model("FIRMWARE_MODEL"), "shared-model")
+
+    def test_get_llm_model_uses_task_specific_alias_when_global_default_is_missing(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "FIRMWARE_MODEL": "firmware-model",
+            },
+            clear=True,
+        ):
             self.assertEqual(repo_env.get_llm_model("FIRMWARE_MODEL"), "firmware-model")
+
+    def test_get_ngrok_auth_token_prefers_new_env_name(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "NGROK_AUTH_TOKEN": "new-token",
+                "NGROK_AUTHTOKEN": "legacy-token",
+            },
+            clear=True,
+        ):
+            self.assertEqual(repo_env.get_ngrok_auth_token(), "new-token")
+
+    def test_get_ngrok_auth_token_falls_back_to_legacy_env_name(self) -> None:
+        with patch.dict(os.environ, {"NGROK_AUTHTOKEN": "legacy-token"}, clear=True):
+            self.assertEqual(repo_env.get_ngrok_auth_token(), "legacy-token")
 
     def test_legacy_names_still_win_when_present(self) -> None:
         with patch.dict(

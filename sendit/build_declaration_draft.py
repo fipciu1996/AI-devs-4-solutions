@@ -39,7 +39,8 @@ logger = shared_logger.bind(component="sendit.draft")
 OPENROUTER_URL = get_llm_base_url()
 DEFAULT_MODEL = get_llm_model("SENDIT_MODEL")
 DEFAULT_TASK_NAME = get_env("SENDIT_TASK_NAME", "sendit") or "sendit"
-DEFAULT_SITE_NAME = build_task_site_name(__file__, task_name=DEFAULT_TASK_NAME)
+DEFAULT_OPENROUTER_TASK_NAME = "sendit-draft"
+DEFAULT_SITE_NAME = build_task_site_name(__file__, task_name=DEFAULT_OPENROUTER_TASK_NAME)
 DEFAULT_SYSTEM_PROMPT_FILE = get_env(
     "SENDIT_SYSTEM_PROMPT_FILE",
     "sendit/openrouter_system_prompt.txt",
@@ -444,7 +445,7 @@ def main() -> int:
         task_name=args.task,
         timeout_seconds=OPENROUTER_TIMEOUT_SECONDS,
         site_url=args.site_url,
-        site_name=args.site_name or build_task_site_name(__file__, task_name=args.task),
+        site_name=args.site_name or DEFAULT_SITE_NAME,
     )
 
     analysis_bundle = load_bundle(analysis_dir, "*.md")
