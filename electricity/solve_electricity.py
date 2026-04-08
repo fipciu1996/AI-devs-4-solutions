@@ -28,7 +28,13 @@ from devs_utilities.openrouter import (
     OpenRouterError,
     parse_json_object_content,
 )
-from repo_env import get_course_api_key, get_env, get_int_env, get_optional_env
+from devs_utilities.repo_env import (
+    get_course_api_key,
+    get_env,
+    get_int_env,
+    get_llm_model,
+    get_optional_env,
+)
 
 
 REPO_ROOT = bootstrap_repo(__file__)
@@ -37,11 +43,7 @@ logger = shared_logger.bind(component="electricity")
 
 TASK_NAME = "electricity"
 REQUEST_TIMEOUT_SECONDS = get_int_env("AG3NTS_TIMEOUT_SECONDS", 30) or 30
-DEFAULT_MODEL = (
-    get_optional_env("OPENROUTER_MODEL")
-    or get_optional_env("LLM_MODEL")
-    or "openai/gpt-4.1-mini"
-)
+DEFAULT_MODEL = get_llm_model("ELECTRICITY_MODEL")
 DEFAULT_OPENROUTER_TIMEOUT_SECONDS = get_int_env("OPENROUTER_TIMEOUT_SECONDS", 60) or 60
 OUTPUT_DIR = Path(__file__).resolve().parent
 CURRENT_BOARD_PATH = OUTPUT_DIR / "current.png"
@@ -207,6 +209,13 @@ def load_board_image_bytes(api_key: str) -> bytes:
         raise
 
 
+def prime_remote_board_state(api_key: str) -> None:
+    """Ensure the hub has the live map loaded for this session."""
+
+    board_bytes = http_get(build_board_url(api_key))
+    CURRENT_BOARD_PATH.write_bytes(board_bytes)
+
+
 def build_image_content(label: str, image_bytes: bytes) -> list[dict[str, Any]]:
     encoded = base64.b64encode(image_bytes).decode("ascii")
     return [
@@ -255,6 +264,16 @@ def choose_rotation_sequence(
     return rotations, "openrouter", reason
 
 
+def execute_rotation_sequence(api_key: str, rotation_sequence: list[str]) -> str | None:
+    for index, position in enumerate(rotation_sequence, start=1):
+        response = rotate_once(api_key, position)
+        logger.info("[{}/{}] rotate {} -> {}", index, len(rotation_sequence), position, response)
+        flag = extract_flag(response)
+        if flag:
+            return flag
+    return None
+
+
 def main() -> int:
     configure_logging(name="electricity")
     args = parse_args()
@@ -281,10 +300,28 @@ def main() -> int:
     if args.dry_run:
         return 0
 
-    for index, position in enumerate(rotation_sequence, start=1):
-        response = rotate_once(api_key, position)
-        logger.info("[{}/{}] rotate {} -> {}", index, len(rotation_sequence), position, response)
-        flag = extract_flag(response)
+    try:
+        prime_remote_board_state(api_key)
+    except HttpRequestError as exc:
+        logger.error("Failed to fetch the live board before rotating: {}", exc)
+        return 1
+
+    flag = execute_rotation_sequence(api_key, rotation_sequence)
+    if flag:
+        logger.success("Flag: {}", flag)
+        return 0
+
+    if rotation_source != "deterministic" and rotation_sequence != ROTATION_SEQUENCE:
+        logger.warning(
+            "Flag not returned for the model plan. Resetting the board and trying the deterministic fallback."
+        )
+        try:
+            reset_board(api_key)
+            prime_remote_board_state(api_key)
+        except HttpRequestError as exc:
+            logger.error("Failed to prepare the fallback board state: {}", exc)
+            return 1
+        flag = execute_rotation_sequence(api_key, ROTATION_SEQUENCE)
         if flag:
             logger.success("Flag: {}", flag)
             return 0

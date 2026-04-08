@@ -13,10 +13,11 @@ if str(REPO_ROOT_HINT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT_HINT))
 
 from devs_utilities.bootstrap import bootstrap_repo
-from repo_env import (
+from devs_utilities.repo_env import (
     get_env,
     get_llm_api_key,
     get_llm_base_url,
+    get_llm_model,
     get_package_service_key,
     get_package_service_url,
     load_repo_env,
@@ -138,9 +139,9 @@ def load_settings() -> Settings:
     if not openrouter_api_key:
         raise RuntimeError("Missing LLM_API_KEY.")
 
-    openrouter_model = get_env("OPENROUTER_MODEL", "openai/gpt-4.1-mini")
+    openrouter_model = get_llm_model()
     if not openrouter_model:
-        raise RuntimeError("OPENROUTER_MODEL must not be empty.")
+        raise RuntimeError("OPENROUTER_MODEL must not be empty in the repository .env.")
 
     openrouter_base_url = get_llm_base_url()
     if not openrouter_base_url:

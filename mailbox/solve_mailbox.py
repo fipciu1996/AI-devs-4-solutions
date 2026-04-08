@@ -30,12 +30,13 @@ from devs_utilities.openrouter import (
     OpenRouterError,
     ToolCall,
 )
-from repo_env import (
+from devs_utilities.repo_env import (
     get_course_api_key,
     get_env,
     get_int_env,
     get_llm_api_key,
     get_llm_base_url,
+    get_llm_model,
     get_optional_env,
 )
 
@@ -46,7 +47,7 @@ logger = shared_logger.bind(component="mailbox")
 
 TASK_NAME = "mailbox"
 DEFAULT_ZMAIL_URL = AG3NTS_ZMAIL_URL
-DEFAULT_MODEL = get_env("OPENROUTER_MODEL", "openai/gpt-4.1-mini") or "openai/gpt-4.1-mini"
+DEFAULT_MODEL = get_llm_model("MAILBOX_MODEL")
 DEFAULT_API_TIMEOUT_SECONDS = (
     get_int_env(
         "MAILBOX_TIMEOUT_SECONDS",
@@ -138,9 +139,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model",
         default=None,
-        help=(
-            f"OpenRouter model. Defaults to OPENROUTER_MODEL or {DEFAULT_MODEL}."
-        ),
+        help="OpenRouter model. Defaults to the model configured in the repository .env.",
     )
     parser.add_argument(
         "--max-steps",
@@ -243,7 +242,7 @@ class ZmailClient:
         return self._call({"action": "getThread", "threadID": thread_id})
 
     def get_messages(self, *, ids: int | str | list[int | str]) -> Any:
-        return self._call({"action": "getMessages", "ids": ids})
+        return self._call({"action": "getMessages", "ids": normalize_message_ids(ids)})
 
     def reset(self) -> Any:
         return self._call({"action": "reset"})
@@ -256,7 +255,17 @@ class ZmailClient:
                 full_payload,
                 timeout_seconds=self._config.api_timeout_seconds,
             )
-        except (HttpRequestError, JsonResponseError) as exc:
+        except HttpRequestError as exc:
+            result = exc.to_response_dict()
+            if isinstance(result, dict):
+                result.setdefault("ok", False)
+                result.setdefault(
+                    "agent_note",
+                    "Some mailbox ids may be stale. Refresh the thread or inbox and retry with current messageID values.",
+                )
+                return result
+            raise MailboxError(str(exc)) from exc
+        except JsonResponseError as exc:
             raise MailboxError(str(exc)) from exc
         if isinstance(result, dict):
             result.setdefault(
@@ -264,6 +273,28 @@ class ZmailClient:
                 "Prefer messageID as the stable fetch identifier. The mailbox is live.",
             )
         return result
+
+
+def normalize_message_ids(ids: int | str | list[int | str]) -> int | str | list[int | str]:
+    """Coerce model-produced message identifiers into valid mailbox API payloads."""
+
+    if isinstance(ids, list):
+        return [normalize_message_ids(item) for item in ids]
+    if isinstance(ids, int):
+        return ids
+    raw_value = str(ids).strip()
+    if not raw_value:
+        return raw_value
+    if raw_value.startswith("[") and raw_value.endswith("]"):
+        try:
+            parsed = json.loads(raw_value)
+        except json.JSONDecodeError:
+            return raw_value
+        if isinstance(parsed, list):
+            return [normalize_message_ids(item) for item in parsed]
+    if raw_value.isdigit():
+        return int(raw_value)
+    return raw_value
 
 
 class VerifyClient:
@@ -518,6 +549,11 @@ def build_tool_handlers(
             per_page=int(args.get("per_page", DEFAULT_TOOL_PAGE_SIZE)),
         ),
         "search_messages": lambda args: zmail_client.search(
+            query=str(args["query"]),
+            page=int(args.get("page", 1)),
+            per_page=int(args.get("per_page", DEFAULT_TOOL_PAGE_SIZE)),
+        ),
+        "search": lambda args: zmail_client.search(
             query=str(args["query"]),
             page=int(args.get("page", 1)),
             per_page=int(args.get("per_page", DEFAULT_TOOL_PAGE_SIZE)),

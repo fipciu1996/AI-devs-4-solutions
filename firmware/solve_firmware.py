@@ -32,12 +32,13 @@ from devs_utilities.openrouter import (
     OpenRouterError,
     ToolCall,
 )
-from repo_env import (
+from devs_utilities.repo_env import (
     get_course_api_key,
     get_env,
     get_int_env,
     get_llm_api_key,
     get_llm_base_url,
+    get_llm_model,
     get_optional_env,
 )
 
@@ -48,7 +49,7 @@ logger = shared_logger.bind(component="firmware")
 
 TASK_NAME = "firmware"
 DEFAULT_SHELL_URL = AG3NTS_SHELL_URL
-DEFAULT_MODEL = get_env("OPENROUTER_MODEL", "nvidia/nemotron-3-super-120b-a12b:free")
+DEFAULT_MODEL = get_llm_model("FIRMWARE_MODEL")
 DEFAULT_API_TIMEOUT_SECONDS = (
     get_int_env(
         "FIRMWARE_TIMEOUT_SECONDS",
@@ -164,7 +165,8 @@ def parse_args() -> argparse.Namespace:
         "--model",
         default=None,
         help=(
-            f"OpenRouter model override. Defaults to OPENROUTER_MODEL or {DEFAULT_MODEL}."
+            "OpenRouter model override. Defaults to the model configured in the "
+            "repository .env."
         ),
     )
     parser.add_argument(
@@ -226,7 +228,7 @@ def build_config(args: argparse.Namespace) -> AppConfig:
     if not openrouter_url:
         missing.append("LLM_BASE_URL")
     if not model:
-        missing.append("OPENROUTER_MODEL")
+        missing.append("FIRMWARE_MODEL or OPENROUTER_MODEL")
     if args.max_steps < 1:
         raise SystemExit("--max-steps must be a positive integer.")
 

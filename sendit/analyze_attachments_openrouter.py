@@ -26,7 +26,14 @@ from devs_utilities.openrouter import (
     ToolCall,
     extract_completion_result,
 )
-from repo_env import get_env, get_int_env, get_llm_api_key, get_llm_base_url, get_optional_env
+from devs_utilities.repo_env import (
+    get_env,
+    get_int_env,
+    get_llm_api_key,
+    get_llm_base_url,
+    get_llm_model,
+    get_optional_env,
+)
 
 
 REPO_ROOT = bootstrap_repo(__file__)
@@ -35,7 +42,7 @@ logger = shared_logger.bind(component="sendit.analyze")
 
 OPENROUTER_URL = get_llm_base_url()
 TASK_NAME = "sendit"
-DEFAULT_MODEL = get_env("OPENROUTER_MODEL", "openai/gpt-4.1-mini") or "openai/gpt-4.1-mini"
+DEFAULT_MODEL = get_llm_model("SENDIT_MODEL")
 DEFAULT_MAX_TEXT_CHARS = get_int_env("SENDIT_ANALYZE_MAX_TEXT_CHARS", 24_000) or 24_000
 OPENROUTER_TIMEOUT_SECONDS = get_int_env("OPENROUTER_TIMEOUT_SECONDS", 120) or 120
 MODEL_MAX_STEPS = 3
@@ -235,8 +242,13 @@ def execute_sendit_analyze_tool_call(
     handlers: dict[str, object],
 ) -> dict[str, object]:
     if tool_call.name not in handlers:
-        raise OpenRouterError(f"Unknown sendit analyze tool call: {tool_call.name!r}")
-    result = handlers[tool_call.name](tool_call.arguments)
+        result = {
+            "ok": False,
+            "error": f"Unknown sendit analyze tool call: {tool_call.name!r}",
+            "available_tools": sorted(handlers),
+        }
+    else:
+        result = handlers[tool_call.name](tool_call.arguments)
     return {
         "role": "tool",
         "tool_call_id": tool_call.id,

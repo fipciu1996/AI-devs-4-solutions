@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from devs_utilities.logging import configure_logging, logger as shared_logger
-from repo_env import load_repo_env
+from devs_utilities.repo_env import load_repo_env
 
 
 REPO_ROOT = Path(__file__).resolve().parent

@@ -28,7 +28,7 @@ from devs_utilities.openrouter import (
     OpenRouterError,
     parse_json_object_content,
 )
-from repo_env import get_env, get_int_env, get_optional_env
+from devs_utilities.repo_env import get_env, get_int_env, get_llm_model, get_optional_env
 
 
 REPO_ROOT = bootstrap_repo(__file__)
@@ -44,11 +44,7 @@ LAST_HELP_RESPONSE_PATH = OUTPUT_DIR / "last_help_response.json"
 MODEL_ANALYSIS_PATH = OUTPUT_DIR / "last_model_analysis.json"
 
 REQUEST_TIMEOUT_SECONDS = get_int_env("AG3NTS_TIMEOUT_SECONDS", 30) or 30
-DEFAULT_MODEL = (
-    get_optional_env("OPENROUTER_MODEL")
-    or get_optional_env("LLM_MODEL")
-    or "openai/gpt-4.1-mini"
-)
+DEFAULT_MODEL = get_llm_model("FILESYSTEM_MODEL")
 DEFAULT_OPENROUTER_TIMEOUT_SECONDS = get_int_env("OPENROUTER_TIMEOUT_SECONDS", 60) or 60
 NOTES_ZIP_URL = build_ag3nts_public_data_url("natan_notes.zip")
 NAME_PATTERN = re.compile(r"^[a-z0-9_]+$")

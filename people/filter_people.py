@@ -24,13 +24,15 @@ from devs_utilities.openrouter import (
     OpenRouterClient,
     OpenRouterError,
     ToolCall,
+    strip_code_fences,
 )
-from repo_env import (
+from devs_utilities.repo_env import (
     get_course_api_key,
     get_env,
     get_int_env,
     get_llm_api_key,
     get_llm_base_url,
+    get_llm_model,
     get_optional_env,
 )
 
@@ -42,7 +44,7 @@ logger = shared_logger.bind(component="people.filter")
 OPENROUTER_API_URL = get_llm_base_url()
 TASK_NAME = "people"
 REFERENCE_DATE = date.fromisoformat(get_env("PEOPLE_REFERENCE_DATE", "2026-03-10"))
-DEFAULT_OPENROUTER_MODEL = get_env("OPENROUTER_MODEL", "openai/gpt-4.1-mini") or "openai/gpt-4.1-mini"
+DEFAULT_OPENROUTER_MODEL = get_llm_model("PEOPLE_MODEL")
 DEFAULT_BATCH_SIZE = get_int_env("PEOPLE_BATCH_SIZE", 25) or 25
 API_TIMEOUT_SECONDS = get_int_env("PEOPLE_TIMEOUT_SECONDS", 120) or 120
 OPENROUTER_TIMEOUT_SECONDS = get_int_env("OPENROUTER_TIMEOUT_SECONDS", 120) or 120
@@ -135,7 +137,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--model",
-        help="Nadpisuje openrouter_model z configu.",
+        help="Nadpisuje model z repozytoryjnego .env.",
     )
     parser.add_argument(
         "--verify",
@@ -163,7 +165,7 @@ def load_config(path: Path, args: argparse.Namespace) -> AppConfig:
         or get_llm_api_key()
         or ""
     ).strip()
-    openrouter_model = str(payload.get("openrouter_model") or DEFAULT_OPENROUTER_MODEL).strip()
+    openrouter_model = DEFAULT_OPENROUTER_MODEL.strip()
     site_url = str(payload.get("site_url") or get_optional_env("OPENROUTER_SITE_URL") or "").strip() or None
     site_name = build_task_site_name(__file__, task_name=TASK_NAME)
     batch_size = int(payload.get("batch_size") or DEFAULT_BATCH_SIZE)
@@ -172,6 +174,8 @@ def load_config(path: Path, args: argparse.Namespace) -> AppConfig:
         openrouter_model = args.model
     if args.batch_size:
         batch_size = args.batch_size
+    if not openrouter_model:
+        raise ValueError("Brakuje PEOPLE_MODEL lub OPENROUTER_MODEL w repozytoryjnym .env.")
 
     return AppConfig(
         course_api_key=hub_api_key,
@@ -327,10 +331,29 @@ PEOPLE_FILTER_TOOLS: list[dict[str, Any]] = [
 ]
 
 
+def _extract_classification_items(parsed: Any) -> list[dict[str, Any]]:
+    if isinstance(parsed, list):
+        return [item for item in parsed if isinstance(item, dict)]
+    if isinstance(parsed, dict):
+        for key in ("results", "items", "classifications", "answers"):
+            value = parsed.get(key)
+            if isinstance(value, list):
+                return [item for item in value if isinstance(item, dict)]
+        if "row_id" in parsed and "tags" in parsed:
+            return [parsed]
+    raise OpenRouterError("Model classification payload is missing a results list.")
+
+
 def parse_classification_result(raw_content: str) -> dict[int, list[str]]:
-    parsed = json.loads(raw_content)
+    normalized = strip_code_fences(raw_content).strip()
+    try:
+        parsed = json.loads(normalized)
+    except json.JSONDecodeError as exc:
+        raise OpenRouterError("Model classification payload is not valid JSON.") from exc
+
+    items = _extract_classification_items(parsed)
     tags_by_row_id: dict[int, list[str]] = {}
-    for item in parsed["results"]:
+    for item in items:
         row_id = int(item["row_id"])
         tags = [str(tag) for tag in item["tags"]]
         tags_by_row_id[row_id] = tags
@@ -430,7 +453,21 @@ def classify_jobs(
         raw_text = str(completion.content or "").strip()
         if not raw_text:
             raise RuntimeError("Brak treści w odpowiedzi modelu.")
-        return parse_classification_result(raw_text)
+        messages.append(assistant_message)
+        try:
+            return parse_classification_result(raw_text)
+        except (OpenRouterError, KeyError, TypeError, ValueError) as exc:
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "Return only valid JSON with this exact shape: "
+                        '{"results":[{"row_id":123,"tags":["transport"]}]}. '
+                        f"Your previous response was invalid: {exc}"
+                    ),
+                }
+            )
+            continue
     raise OpenRouterError("OpenRouter tool calling did not finish for people.filter.")
 
 

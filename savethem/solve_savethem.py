@@ -26,7 +26,7 @@ from devs_utilities.openrouter import (
     OpenRouterError,
     ToolCall,
 )
-from repo_env import get_env, get_int_env
+from devs_utilities.repo_env import get_env, get_int_env, get_llm_model
 
 
 REPO_ROOT = bootstrap_repo(__file__)
@@ -115,7 +115,7 @@ def build_payload(answer: list[str], *, api_key: str) -> dict[str, Any]:
 def build_openrouter_client() -> OpenRouterClient:
     api_key = get_env("OPENROUTER_API_KEY")
     base_url = get_env("OPENROUTER_BASE_URL")
-    model = get_env("OPENROUTER_MODEL", "openrouter/healer-alpha")
+    model = get_llm_model("SAVETHEM_MODEL")
     if not api_key or not base_url:
         raise RuntimeError("Missing OPENROUTER_API_KEY or OPENROUTER_BASE_URL in .env.")
 

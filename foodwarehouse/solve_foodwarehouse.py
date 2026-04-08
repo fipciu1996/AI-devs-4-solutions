@@ -22,7 +22,7 @@ from devs_utilities.bootstrap import bootstrap_repo
 from devs_utilities.files import write_json
 from devs_utilities.http import HttpRequestError, get_json
 from devs_utilities.logging import configure_logging, logger as shared_logger
-from repo_env import get_env, get_int_env
+from devs_utilities.repo_env import get_env, get_int_env
 
 
 REPO_ROOT = bootstrap_repo(__file__)

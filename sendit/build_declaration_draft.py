@@ -21,7 +21,14 @@ from devs_utilities.openrouter import (
     OpenRouterError,
     ToolCall,
 )
-from repo_env import get_env, get_int_env, get_llm_api_key, get_llm_base_url, get_optional_env
+from devs_utilities.repo_env import (
+    get_env,
+    get_int_env,
+    get_llm_api_key,
+    get_llm_base_url,
+    get_llm_model,
+    get_optional_env,
+)
 
 
 REPO_ROOT = bootstrap_repo(__file__)
@@ -29,12 +36,16 @@ logger = shared_logger.bind(component="sendit.draft")
 
 
 OPENROUTER_URL = get_llm_base_url()
-DEFAULT_MODEL = get_env("OPENROUTER_MODEL", "openai/gpt-4.1-mini") or "openai/gpt-4.1-mini"
+DEFAULT_MODEL = get_llm_model("SENDIT_MODEL")
 DEFAULT_TASK_NAME = get_env("SENDIT_TASK_NAME", "sendit") or "sendit"
 DEFAULT_SITE_NAME = build_task_site_name(__file__, task_name=DEFAULT_TASK_NAME)
-DEFAULT_SYSTEM_PROMPT_FILE = get_env("SENDIT_SYSTEM_PROMPT_FILE", "openrouter_system_prompt.txt")
+DEFAULT_SYSTEM_PROMPT_FILE = get_env(
+    "SENDIT_SYSTEM_PROMPT_FILE",
+    "sendit/openrouter_system_prompt.txt",
+)
 OPENROUTER_TIMEOUT_SECONDS = get_int_env("OPENROUTER_TIMEOUT_SECONDS", 120) or 120
 MODEL_MAX_STEPS = 4
+SENDIT_DIR = Path(__file__).resolve().parent
 
 
 def parse_args() -> argparse.Namespace:
@@ -111,6 +122,13 @@ def load_system_prompt(path: Path) -> str:
     if not prompt:
         raise ValueError(f"Plik system prompt jest pusty: {path}")
     return prompt
+
+
+def resolve_system_prompt_path(path: Path, base_dir: Path) -> Path:
+    resolved = resolve_path(path, base_dir)
+    if resolved.exists() or path.is_absolute():
+        return resolved
+    return resolve_path(path, SENDIT_DIR)
 
 
 def load_bundle(directory: Path, pattern: str) -> str:
@@ -325,7 +343,20 @@ def build_draft_with_tool_calling(
             continue
         if not completion.content:
             raise ValueError("Nie udalo sie odczytac tresci odpowiedzi modelu.")
-        return parse_model_json(completion.content)
+        messages.append(assistant_message)
+        try:
+            return parse_model_json(completion.content)
+        except (ValueError, json.JSONDecodeError) as exc:
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "Return only valid JSON matching the required schema. "
+                        f"Your previous response was invalid: {exc}"
+                    ),
+                }
+            )
+            continue
     raise OpenRouterError("OpenRouter tool calling did not finish for sendit draft.")
 
 
@@ -383,7 +414,7 @@ def main() -> int:
     attachments_dir = resolve_path(args.attachments_dir, base_dir)
     shipment_file = resolve_path(args.shipment_file, base_dir)
     output_dir = resolve_path(args.output_dir, base_dir)
-    system_prompt_file = resolve_path(args.system_prompt_file, base_dir)
+    system_prompt_file = resolve_system_prompt_path(args.system_prompt_file, base_dir)
     project_root = REPO_ROOT
 
     if not analysis_dir.exists():

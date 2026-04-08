@@ -26,12 +26,13 @@ from devs_utilities.openrouter import (
     OpenRouterError,
     ToolCall,
 )
-from repo_env import (
+from devs_utilities.repo_env import (
     get_course_api_key,
     get_env,
     get_int_env,
     get_llm_api_key,
     get_llm_base_url,
+    get_llm_model,
     get_optional_env,
 )
 
@@ -41,7 +42,7 @@ logger = shared_logger.bind(component="railway")
 
 
 OPENROUTER_API_URL = get_llm_base_url()
-DEFAULT_MODEL = get_env("OPENROUTER_MODEL", "openrouter/healer-alpha") or "openrouter/healer-alpha"
+DEFAULT_MODEL = get_llm_model("RAILWAY_MODEL")
 DEFAULT_MAX_STEPS = get_int_env("RAILWAY_MAX_STEPS", 8) or 8
 DEFAULT_RAILWAY_RETRY_ATTEMPTS = get_int_env("RAILWAY_RETRY_ATTEMPTS", 3) or 3
 DEFAULT_503_RETRY_DELAY_SECONDS = get_int_env("RAILWAY_RETRY_DELAY_503_SECONDS", 30) or 30
@@ -107,7 +108,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model",
         default=None,
-        help=f"Model OpenRouter. Domyslnie: {DEFAULT_MODEL}",
+        help="Model OpenRouter. Domyslnie: model skonfigurowany w repozytoryjnym .env.",
     )
     parser.add_argument(
         "--site-url",
@@ -181,6 +182,25 @@ def require_status(value: str) -> str:
     if candidate not in STATUS_VALUES:
         raise RailwayError('Niepoprawny status. Dozwolone wartosci: "RTOPEN", "RTCLOSE".')
     return candidate
+
+
+def extract_route_argument(arguments: dict[str, Any]) -> str:
+    for key in ("route", "line", "track", "target", "name", "id"):
+        value = arguments.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    for value in arguments.values():
+        if isinstance(value, str) and ROUTE_PATTERN.fullmatch(value.strip()):
+            return value
+    raise RailwayError("Brak parametru trasy w wywolaniu narzedzia.")
+
+
+def extract_status_argument(arguments: dict[str, Any]) -> str:
+    for key in ("value", "status", "state"):
+        value = arguments.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    raise RailwayError("Brak parametru statusu w wywolaniu narzedzia.")
 
 
 class RailwayApiClient:
@@ -387,14 +407,14 @@ TOOLS: list[dict[str, Any]] = [
 def build_tool_handlers(client: RailwayApiClient) -> dict[str, Any]:
     return {
         "help": lambda _: client.call(action="help"),
-        "reconfigure": lambda args: client.call(action="reconfigure", route=str(args["route"])),
-        "getstatus": lambda args: client.call(action="getstatus", route=str(args["route"])),
+        "reconfigure": lambda args: client.call(action="reconfigure", route=extract_route_argument(args)),
+        "getstatus": lambda args: client.call(action="getstatus", route=extract_route_argument(args)),
         "setstatus": lambda args: client.call(
             action="setstatus",
-            route=str(args["route"]),
-            value=str(args["value"]),
+            route=extract_route_argument(args),
+            value=extract_status_argument(args),
         ),
-        "save": lambda args: client.call(action="save", route=str(args["route"])),
+        "save": lambda args: client.call(action="save", route=extract_route_argument(args)),
     }
 
 

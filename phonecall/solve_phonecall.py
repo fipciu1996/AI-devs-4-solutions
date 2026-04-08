@@ -24,7 +24,7 @@ from devs_utilities.bootstrap import bootstrap_repo
 from devs_utilities.files import write_json
 from devs_utilities.logging import configure_logging, logger as shared_logger
 from devs_utilities.openrouter import OpenRouterClient, OpenRouterError, build_task_openrouter_client
-from repo_env import get_env, get_int_env, get_optional_env
+from devs_utilities.repo_env import get_env, get_int_env, get_llm_model, get_optional_env
 
 
 REPO_ROOT = bootstrap_repo(__file__)
@@ -33,8 +33,8 @@ logger = shared_logger.bind(component="phonecall")
 TASK_NAME = "phonecall"
 VERIFY_TIMEOUT_SECONDS = get_int_env("AG3NTS_TIMEOUT_SECONDS", 60) or 60
 OPENROUTER_TIMEOUT_SECONDS = get_int_env("OPENROUTER_TIMEOUT_SECONDS", 180) or 180
-STT_MODEL = "openai/gpt-audio-mini"
-TTS_MODEL = "openai/gpt-audio"
+STT_MODEL = get_llm_model("PHONECALL_STT_MODEL")
+TTS_MODEL = get_llm_model("PHONECALL_TTS_MODEL")
 DEFAULT_TTS_VOICE = "ash"
 OUTPUT_DIR = Path(__file__).resolve().parent
 RUNS_DIR = OUTPUT_DIR / "runs"

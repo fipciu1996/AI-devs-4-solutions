@@ -32,12 +32,13 @@ from devs_utilities.openrouter import (
     OpenRouterError,
     ToolCall,
 )
-from repo_env import (
+from devs_utilities.repo_env import (
     get_course_api_key,
     get_env,
     get_int_env,
     get_llm_api_key,
     get_llm_base_url,
+    get_llm_model,
     get_optional_env,
 )
 
@@ -48,7 +49,7 @@ logger = shared_logger.bind(component="sensors")
 
 TASK_NAME = "evaluation"
 DATA_URL = build_ag3nts_public_data_url("sensors.zip")
-DEFAULT_MODEL = get_env("OPENROUTER_MODEL", "xiaomi/mimo-v2-omni") or "xiaomi/mimo-v2-omni"
+DEFAULT_MODEL = get_llm_model("SENSORS_MODEL")
 DEFAULT_BATCH_SIZE = get_int_env("SENSORS_BATCH_SIZE", 10) or 10
 DOWNLOAD_TIMEOUT_SECONDS = get_int_env("SENSORS_DOWNLOAD_TIMEOUT_SECONDS", 60) or 60
 VERIFY_TIMEOUT_SECONDS = get_int_env("AG3NTS_TIMEOUT_SECONDS", 30) or 30
@@ -373,7 +374,8 @@ def parse_args() -> argparse.Namespace:
         "--model",
         default=None,
         help=(
-            f"OpenRouter model override. Defaults to OPENROUTER_MODEL or {DEFAULT_MODEL}."
+            "OpenRouter model override. Defaults to the model configured in the "
+            "repository .env."
         ),
     )
     parser.add_argument(
@@ -553,7 +555,7 @@ def chunked(items: list[T], size: int) -> list[list[T]]:
 def build_openrouter_client(model_override: str | None) -> OpenRouterClient:
     api_key = get_llm_api_key()
     base_url = get_llm_base_url()
-    model = model_override or get_optional_env("OPENROUTER_MODEL") or DEFAULT_MODEL
+    model = model_override or DEFAULT_MODEL
     resolved_model = LEGACY_MODEL_ALIASES.get(model, model)
     if resolved_model != model:
         logger.warning(

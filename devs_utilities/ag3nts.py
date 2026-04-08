@@ -11,7 +11,7 @@ from .http import RAW_TEXT, post_json
 
 
 load_repo_env(Path(__file__))
-AG3NTS_BASE_URL = get_env("AG3NTS_BASE_URL")
+AG3NTS_BASE_URL = get_env("AG3NTS_BASE_URL").rstrip("/")
 if not AG3NTS_BASE_URL:
     raise RuntimeError("Missing AG3NTS_BASE_URL in the repository .env file.")
 
@@ -22,7 +22,7 @@ AG3NTS_TASK_DATA_BASE_URL = f"{AG3NTS_BASE_URL}/data"
 AG3NTS_PUBLIC_DATA_BASE_URL = f"{AG3NTS_BASE_URL}/dane"
 AG3NTS_SHELL_URL = f"{AG3NTS_BASE_URL}/api/shell"
 AG3NTS_ZMAIL_URL = f"{AG3NTS_BASE_URL}/api/zmail"
-AG3NTS_RAILWAY_URL = f"{AG3NTS_BASE_URL}/"
+AG3NTS_RAILWAY_URL = AG3NTS_VERIFY_URL
 AG3NTS_PACKAGES_URL = f"{AG3NTS_BASE_URL}/packages"
 
 

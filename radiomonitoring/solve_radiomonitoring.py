@@ -30,7 +30,7 @@ from devs_utilities.openrouter import (
     OpenRouterClient,
     OpenRouterError,
 )
-from repo_env import get_env, get_int_env, get_optional_env
+from devs_utilities.repo_env import get_env, get_int_env, get_llm_model, get_optional_env
 
 
 REPO_ROOT = bootstrap_repo(__file__)
@@ -39,12 +39,8 @@ logger = shared_logger.bind(component="radiomonitoring")
 TASK_NAME = "radiomonitoring"
 VERIFY_TIMEOUT_SECONDS = get_int_env("AG3NTS_TIMEOUT_SECONDS", 30) or 30
 OPENROUTER_TIMEOUT_SECONDS = get_int_env("OPENROUTER_TIMEOUT_SECONDS", 180) or 180
-DEFAULT_VISION_MODEL = (
-    get_optional_env("OPENROUTER_MODEL")
-    or get_optional_env("LLM_MODEL")
-    or "openai/gpt-4.1-nano"
-)
-AUDIO_MODEL = "openai/gpt-audio"
+DEFAULT_VISION_MODEL = get_llm_model("RADIOMONITORING_VISION_MODEL")
+AUDIO_MODEL = get_llm_model("RADIOMONITORING_AUDIO_MODEL")
 
 OUTPUT_DIR = Path(__file__).resolve().parent
 CAPTURES_DIR = OUTPUT_DIR / "captures"

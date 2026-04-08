@@ -34,13 +34,15 @@ from devs_utilities.openrouter import (
     OpenRouterClient,
     OpenRouterError,
     ToolCall,
+    extract_completion_result,
 )
-from repo_env import (
+from devs_utilities.repo_env import (
     get_course_api_key,
     get_env,
     get_int_env,
     get_llm_api_key,
     get_llm_base_url,
+    get_llm_model,
     get_optional_env,
 )
 
@@ -51,7 +53,7 @@ logger = shared_logger.bind(component="people.find")
 
 OPENROUTER_API_URL = get_llm_base_url()
 TASK_NAME = "findhim"
-DEFAULT_OPENROUTER_MODEL = get_env("OPENROUTER_MODEL", "openai/gpt-4.1-mini") or "openai/gpt-4.1-mini"
+DEFAULT_OPENROUTER_MODEL = get_llm_model("PEOPLE_MODEL")
 API_TIMEOUT_SECONDS = get_int_env("PEOPLE_TIMEOUT_SECONDS", 120) or 120
 OPENROUTER_TIMEOUT_SECONDS = get_int_env("OPENROUTER_TIMEOUT_SECONDS", 120) or 120
 DEFAULT_PLANTS_PATH = "findhim_locations.json"
@@ -131,7 +133,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--model",
-        help="Nadpisuje openrouter_model z configu.",
+        help="Nadpisuje model z repozytoryjnego .env.",
     )
     parser.add_argument(
         "--verify",
@@ -164,7 +166,7 @@ def load_config(path: Path, args: argparse.Namespace) -> AppConfig:
         or get_llm_api_key()
         or ""
     ).strip()
-    openrouter_model = str(payload.get("openrouter_model") or DEFAULT_OPENROUTER_MODEL).strip()
+    openrouter_model = DEFAULT_OPENROUTER_MODEL.strip()
     site_url = (
         str(payload.get("site_url") or get_optional_env("OPENROUTER_SITE_URL") or "").strip()
         or None
@@ -178,6 +180,8 @@ def load_config(path: Path, args: argparse.Namespace) -> AppConfig:
         raise ValueError("Brakuje COURSE_API_KEY lub course_api_key w configu.")
     if not openrouter_api_key:
         raise ValueError("Brakuje LLM_API_KEY lub llm_api_key w configu.")
+    if not openrouter_model:
+        raise ValueError("Brakuje PEOPLE_MODEL lub OPENROUTER_MODEL w repozytoryjnym .env.")
 
     return AppConfig(
         course_api_key=hub_api_key,
@@ -475,6 +479,20 @@ def geocode_power_plants(
     return plants
 
 
+def safe_geocode_power_plants(
+    raw_plants: dict[str, Any],
+    config: AppConfig,
+    openrouter_client: OpenRouterClient,
+) -> list[PowerPlant]:
+    """Use tool calling first, then fall back to the legacy JSON-schema path."""
+
+    try:
+        return geocode_power_plants(raw_plants, config, openrouter_client)
+    except (OpenRouterError, RuntimeError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+        logger.warning("Tool-calling geocoding failed, using legacy fallback: {}", exc)
+        return geocode_power_plants_legacy(raw_plants, config, openrouter_client)
+
+
 def normalize_location_entry(entry: Any) -> Coordinate | None:
     if isinstance(entry, dict):
         lat = entry.get("latitude", entry.get("lat"))
@@ -620,7 +638,7 @@ def main() -> None:
         site_url=config.site_url,
         site_name=config.site_name,
     )
-    plants = geocode_power_plants(raw_plants, config, openrouter_client)
+    plants = safe_geocode_power_plants(raw_plants, config, openrouter_client)
     best_match = find_best_match(suspects, plants, config)
     payload = build_verify_payload(best_match, config)
 
@@ -642,7 +660,7 @@ def main() -> None:
     if args.verify and not args.dry_run:
         response = submit_task_answer(
             AG3NTS_VERIFY_URL,
-            api_key=config.hub_api_key,
+            api_key=config.course_api_key,
             task=TASK_NAME,
             answer=payload["answer"],
             timeout_seconds=API_TIMEOUT_SECONDS,

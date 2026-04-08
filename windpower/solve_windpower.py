@@ -20,7 +20,7 @@ from devs_utilities.files import write_json
 from devs_utilities.flags import extract_flag
 from devs_utilities.http import HttpRequestError
 from devs_utilities.logging import configure_logging, logger as shared_logger
-from repo_env import get_env, get_int_env
+from devs_utilities.repo_env import get_env, get_int_env
 
 
 REPO_ROOT = bootstrap_repo(__file__)

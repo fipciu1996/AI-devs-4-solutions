@@ -28,7 +28,13 @@ from devs_utilities.openrouter import (
     OpenRouterError,
     parse_json_object_content,
 )
-from repo_env import get_course_api_key, get_env, get_int_env, get_optional_env
+from devs_utilities.repo_env import (
+    get_course_api_key,
+    get_env,
+    get_int_env,
+    get_llm_model,
+    get_optional_env,
+)
 
 
 REPO_ROOT = bootstrap_repo(__file__)
@@ -41,11 +47,7 @@ PROMPT_PLAN_PATH = OUTPUT_DIR / "last_prompt_plan.json"
 DEFAULT_SEND_ORDER = get_env("CATEGORIZE_SEND_ORDER", "J-D-I-B-A-C-G-E-H-F")
 DEFAULT_ORDER_MODE = get_env("CATEGORIZE_ORDER_MODE", "csv_position") or "csv_position"
 REQUEST_TIMEOUT_SECONDS = get_int_env("AG3NTS_TIMEOUT_SECONDS", 30) or 30
-DEFAULT_MODEL = (
-    get_optional_env("OPENROUTER_MODEL")
-    or get_optional_env("LLM_MODEL")
-    or "openai/gpt-4.1-mini"
-)
+DEFAULT_MODEL = get_llm_model("CATEGORIZE_MODEL")
 DEFAULT_OPENROUTER_TIMEOUT_SECONDS = get_int_env("OPENROUTER_TIMEOUT_SECONDS", 60) or 60
 DEFAULT_PROMPT_PREFIX = (
     "Reply DNG or NEU. Reactor/fuel/cassette/core/rod => NEU. DNG only for weapon, "
@@ -86,6 +88,12 @@ def build_data_url(api_key: str) -> str:
 
 def parse_flag(argv: list[str], flag_name: str) -> bool:
     return flag_name in argv
+
+
+def should_use_model_prompt_optimizer(argv: list[str]) -> bool:
+    """Enable the prompt optimizer only when explicitly requested."""
+
+    return parse_flag(argv, "--use-model") or parse_optional_value(argv, "--model") is not None
 
 
 def parse_optional_value(argv: list[str], flag_name: str) -> str | None:
@@ -293,7 +301,7 @@ def estimate_tokens(text: str) -> int:
 
 
 def build_optional_openrouter_client(argv: list[str]) -> OpenRouterClient | None:
-    if parse_flag(argv, "--skip-model"):
+    if parse_flag(argv, "--skip-model") or not should_use_model_prompt_optimizer(argv):
         return None
 
     api_key = (

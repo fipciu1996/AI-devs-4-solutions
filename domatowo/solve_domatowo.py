@@ -30,7 +30,7 @@ from devs_utilities.openrouter import (
     ToolCall,
     build_task_openrouter_client,
 )
-from repo_env import get_env, get_int_env, get_optional_env
+from devs_utilities.repo_env import get_env, get_int_env, get_llm_model, get_optional_env
 
 
 REPO_ROOT = bootstrap_repo(__file__)
@@ -44,11 +44,7 @@ INTERCEPTED_SIGNAL = (
     "z najwyzszych blokow. Nie mam jedzenia. Pomocy."
 )
 VERIFY_TIMEOUT_SECONDS = get_int_env("AG3NTS_TIMEOUT_SECONDS", 30) or 30
-DEFAULT_MODEL = (
-    get_optional_env("OPENROUTER_MODEL")
-    or get_optional_env("LLM_MODEL")
-    or "nvidia/nemotron-3-super-120b-a12b:free"
-)
+DEFAULT_MODEL = get_llm_model("DOMATOWO_MODEL")
 OUTPUT_DIR = Path(__file__).resolve().parent
 MAP_PATH = OUTPUT_DIR / "last_map.json"
 PLAN_PATH = OUTPUT_DIR / "last_plan.json"

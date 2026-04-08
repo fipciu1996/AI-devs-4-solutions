@@ -29,7 +29,7 @@ from devs_utilities.ag3nts import AG3NTS_VERIFY_URL, submit_task_answer
 from devs_utilities.bootstrap import bootstrap_repo
 from devs_utilities.http import HttpRequestError, get_json
 from negotiations_api.config import load_settings
-from repo_env import get_course_api_key, get_optional_env
+from devs_utilities.repo_env import get_course_api_key, get_optional_env
 
 
 bootstrap_repo(__file__)

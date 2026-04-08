@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import ast
 import json
+import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -294,19 +297,24 @@ class OpenRouterClient:
         if self._config.site_name:
             headers["X-Title"] = self._config.site_name
 
-        try:
-            parsed = post_json(
-                self._config.base_url,
-                payload,
-                headers=headers,
-                timeout_seconds=self._config.timeout_seconds,
-            )
-        except HttpRequestError as exc:
-            raise OpenRouterError(str(exc)) from exc
-        except JsonResponseError as exc:
-            raise OpenRouterError(
-                f"OpenRouter returned invalid JSON for {exc.url}."
-            ) from exc
+        for attempt in range(3):
+            try:
+                parsed = post_json(
+                    self._config.base_url,
+                    payload,
+                    headers=headers,
+                    timeout_seconds=self._config.timeout_seconds,
+                )
+                break
+            except HttpRequestError as exc:
+                if exc.status_code == 429 and attempt < 2:
+                    time.sleep(5 * (attempt + 1))
+                    continue
+                raise OpenRouterError(str(exc)) from exc
+            except JsonResponseError as exc:
+                raise OpenRouterError(
+                    f"OpenRouter returned invalid JSON for {exc.url}."
+                ) from exc
 
         if not isinstance(parsed, dict):
             raise OpenRouterError("OpenRouter returned a non-object response.")
@@ -341,14 +349,24 @@ class OpenRouterClient:
         tool_choice: str | None = None,
         extra_payload: dict[str, Any] | None = None,
     ) -> ChatCompletionResult:
-        return extract_completion_result(
-            self.create_raw_completion(
-                messages,
-                tools=tools,
-                tool_choice=tool_choice,
-                extra_payload=extra_payload,
-            )
-        )
+        last_error: OpenRouterError | None = None
+        for attempt in range(3):
+            try:
+                return extract_completion_result(
+                    self.create_raw_completion(
+                        messages,
+                        tools=tools,
+                        tool_choice=tool_choice,
+                        extra_payload=extra_payload,
+                    )
+                )
+            except OpenRouterError as exc:
+                if "empty response" not in str(exc).lower() or attempt == 2:
+                    raise
+                last_error = exc
+        if last_error is not None:
+            raise last_error
+        raise OpenRouterError("OpenRouter completion failed unexpectedly.")
 
 
 def strip_code_fences(text: str) -> str:
@@ -424,6 +442,101 @@ def extract_text_content(content: Any) -> str | None:
     raise OpenRouterError("OpenRouter response content has unsupported format.")
 
 
+def _load_json_with_common_repairs(arguments_raw: str) -> Any:
+    """Parse JSON with a few conservative repairs for common model mistakes."""
+
+    normalized = strip_code_fences(arguments_raw).strip()
+    normalized = normalized.removeprefix("TOOLCALL>").removesuffix("ALL>").strip()
+    candidates: list[str] = []
+
+    def add_candidate(candidate: str) -> None:
+        stripped = candidate.strip()
+        if stripped and stripped not in candidates:
+            candidates.append(stripped)
+
+    def balance_unclosed_structures(candidate: str) -> str:
+        closers: list[str] = []
+        in_string = False
+        escape = False
+        for char in candidate:
+            if escape:
+                escape = False
+                continue
+            if char == "\\" and in_string:
+                escape = True
+                continue
+            if char == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if char == "{":
+                closers.append("}")
+            elif char == "[":
+                closers.append("]")
+            elif char in "}]" and closers and char == closers[-1]:
+                closers.pop()
+        suffix = ""
+        if in_string:
+            suffix += '"'
+        if closers:
+            suffix += "".join(reversed(closers))
+        return candidate + suffix
+
+    def quote_bare_object_keys(candidate: str) -> str:
+        return re.sub(r'([{\[,]\s*)([A-Za-z_][A-Za-z0-9_-]*)\s*:', r'\1"\2":', candidate)
+
+    def replace_bare_key_equals(candidate: str) -> str:
+        return re.sub(r'([{\[,]\s*)([A-Za-z_][A-Za-z0-9_-]*)\s*=', r'\1"\2":', candidate)
+
+    add_candidate(normalized)
+
+    if ":" in normalized and not normalized.startswith(("{", "[")):
+        add_candidate("{" + normalized + "}")
+    if "=" in normalized and not normalized.startswith(("{", "[")):
+        add_candidate("{" + normalized + "}")
+
+    without_trailing_commas = re.sub(r",\s*([}\]])", r"\1", normalized)
+    if without_trailing_commas != normalized:
+        add_candidate(without_trailing_commas)
+
+    for candidate in list(candidates):
+        add_candidate(quote_bare_object_keys(candidate))
+        add_candidate(replace_bare_key_equals(candidate))
+        add_candidate(re.sub(r",\s*([}\]])", r"\1", quote_bare_object_keys(candidate)))
+        add_candidate(re.sub(r",\s*([}\]])", r"\1", replace_bare_key_equals(candidate)))
+        add_candidate(balance_unclosed_structures(candidate))
+
+    for candidate in candidates:
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+    for candidate in candidates:
+        try:
+            return ast.literal_eval(candidate)
+        except (SyntaxError, ValueError):
+            continue
+    raise json.JSONDecodeError("invalid JSON", normalized, 0)
+
+
+def _normalize_tool_call_arguments(name: str, arguments: Any) -> dict[str, Any]:
+    """Coerce slightly-off tool-call payloads into the expected object shape."""
+
+    if isinstance(arguments, dict):
+        return arguments
+    if isinstance(arguments, list):
+        if name == "batch_get_records":
+            return {"requests": arguments}
+        if name == "batch_update_records":
+            return {"updates": arguments}
+        if name == "get_messages":
+            return {"ids": arguments}
+    raise OpenRouterError(
+        f"OpenRouter tool call arguments for {name} must decode to an object."
+    )
+
+
 def extract_tool_calls(raw_tool_calls: Any) -> list[ToolCall]:
     """Parse OpenRouter tool calls into strongly typed objects."""
 
@@ -446,18 +559,19 @@ def extract_tool_calls(raw_tool_calls: Any) -> list[ToolCall]:
             raise OpenRouterError("OpenRouter tool call is missing an id.")
         if not isinstance(name, str) or not name:
             raise OpenRouterError("OpenRouter tool call is missing a function name.")
+        name = re.sub(r"<\|.*$", "", name.strip())
+        name = re.sub(r"[^A-Za-z0-9_:-].*$", "", name)
+        if not name:
+            raise OpenRouterError("OpenRouter tool call function name is invalid.")
         if not isinstance(arguments_raw, str):
             raise OpenRouterError("OpenRouter tool call arguments must be a string.")
         try:
-            arguments = json.loads(arguments_raw)
+            arguments = _load_json_with_common_repairs(arguments_raw)
         except json.JSONDecodeError as exc:
             raise OpenRouterError(
                 f"OpenRouter tool call arguments for {name} are not valid JSON."
             ) from exc
-        if not isinstance(arguments, dict):
-            raise OpenRouterError(
-                f"OpenRouter tool call arguments for {name} must decode to an object."
-            )
+        arguments = _normalize_tool_call_arguments(name, arguments)
         tool_calls.append(ToolCall(id=tool_id, name=name, arguments=arguments))
 
     return tool_calls

@@ -27,12 +27,13 @@ from devs_utilities.openrouter import (
     OpenRouterError,
     ToolCall,
 )
-from repo_env import (
+from devs_utilities.repo_env import (
     get_course_api_key,
     get_env,
     get_int_env,
     get_llm_api_key,
     get_llm_base_url,
+    get_llm_model,
     get_optional_env,
 )
 
@@ -47,7 +48,7 @@ BOARD_ROWS = 5
 GOAL_COLUMN = 7
 DEFAULT_MAX_STEPS = get_int_env("REACTOR_MAX_STEPS", 64) or 64
 VERIFY_TIMEOUT_SECONDS = get_int_env("AG3NTS_TIMEOUT_SECONDS", 30) or 30
-DEFAULT_MODEL = get_env("OPENROUTER_MODEL", "openai/gpt-4.1-mini") or "openai/gpt-4.1-mini"
+DEFAULT_MODEL = get_llm_model("REACTOR_MODEL")
 DEFAULT_OPENROUTER_TIMEOUT_SECONDS = (
     get_int_env("OPENROUTER_TIMEOUT_SECONDS", 60) or 60
 )
@@ -238,8 +239,8 @@ def parse_args() -> argparse.Namespace:
         "--model",
         default=None,
         help=(
-            "OpenRouter model override. Defaults to OPENROUTER_MODEL or "
-            f"{DEFAULT_MODEL}."
+            "OpenRouter model override. Defaults to the model configured in the "
+            "repository .env."
         ),
     )
     return parser.parse_args()
@@ -272,7 +273,7 @@ def send_command(api_key: str, command: ApiCommand) -> dict[str, Any]:
 def build_openrouter_client(model_override: str | None) -> OpenRouterClient:
     api_key = get_llm_api_key()
     base_url = get_llm_base_url()
-    model = (model_override or get_optional_env("OPENROUTER_MODEL") or DEFAULT_MODEL).strip()
+    model = (model_override or DEFAULT_MODEL).strip()
     timeout_raw = get_optional_env("OPENROUTER_TIMEOUT_SECONDS") or str(
         DEFAULT_OPENROUTER_TIMEOUT_SECONDS
     )

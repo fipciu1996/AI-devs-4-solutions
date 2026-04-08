@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 import subprocess
 import sys
 import time
@@ -12,7 +13,7 @@ from pathlib import Path
 from typing import Callable
 
 from devs_utilities.logging import configure_logging, logger as shared_logger
-from repo_env import get_optional_env, load_repo_env
+from devs_utilities.repo_env import get_optional_env, load_repo_env
 
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -24,6 +25,8 @@ DEFAULT_NEGOTIATIONS_POLL_ATTEMPTS = 12
 logger = shared_logger.bind(component="fire_in_the_hole")
 
 load_repo_env(__file__)
+FLAG_PATTERN = re.compile(r"\{FLG:[^}]+\}")
+SECRET_LABEL_PATTERN = re.compile(r"\b(?:sekret|secret)\b\s*:", re.IGNORECASE)
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,6 +56,13 @@ class TaskResult:
     detail: str | None = None
     failed_step: str | None = None
     exit_code: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class TaskFlags:
+    task_name: str
+    main_flag: str | None = None
+    secret_flag: str | None = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -426,6 +436,11 @@ def build_task_registry() -> dict[str, TaskSpec]:
             "savethem/solve_savethem.py",
             supports_verify=True,
         ),
+        build_single_script_task(
+            "shellaccess",
+            "Run the shellaccess solver.",
+            "shellaccess/solve_shellaccess.py",
+        ),
         build_sendit_task(),
         build_single_script_task(
             "sensors",
@@ -564,15 +579,87 @@ def run_task(task: TaskSpec, args: argparse.Namespace) -> TaskResult:
     )
 
 
+def extract_flags_from_log_text(task_name: str, log_text: str) -> TaskFlags | None:
+    main_flag: str | None = None
+    secret_flag: str | None = None
+
+    for line in log_text.splitlines():
+        if not FLAG_PATTERN.search(line):
+            continue
+
+        secret_match = SECRET_LABEL_PATTERN.search(line)
+        if secret_match:
+            before_secret = line[: secret_match.start()]
+            after_secret = line[secret_match.end() :]
+            before_flags = FLAG_PATTERN.findall(before_secret)
+            after_flags = FLAG_PATTERN.findall(after_secret)
+            if before_flags and main_flag is None:
+                main_flag = before_flags[-1]
+            if after_flags and secret_flag is None:
+                secret_flag = after_flags[0]
+            continue
+
+        flags = FLAG_PATTERN.findall(line)
+        if flags and main_flag is None:
+            main_flag = flags[0]
+
+    if main_flag is None and secret_flag is None:
+        return None
+    return TaskFlags(task_name=task_name, main_flag=main_flag, secret_flag=secret_flag)
+
+
+def extract_task_flags(result: TaskResult) -> TaskFlags | None:
+    if result.log_path is None or not result.log_path.exists():
+        return None
+    return extract_flags_from_log_text(
+        result.name,
+        result.log_path.read_text(encoding="utf-8", errors="replace"),
+    )
+
+
+def render_flags_table(flags: list[TaskFlags]) -> str:
+    headers = ("Task name", "Main flag", "Secret flag")
+    rows = [
+        (
+            item.task_name,
+            item.main_flag or "-",
+            item.secret_flag or "-",
+        )
+        for item in flags
+    ]
+    widths = [
+        max(len(headers[index]), *(len(row[index]) for row in rows))
+        for index in range(len(headers))
+    ]
+
+    def format_row(columns: tuple[str, str, str]) -> str:
+        return " | ".join(
+            value.ljust(widths[index])
+            for index, value in enumerate(columns)
+        )
+
+    separator = "-+-".join("-" * width for width in widths)
+    lines = [
+        format_row(headers),
+        separator,
+        *(format_row(row) for row in rows),
+    ]
+    return "\n".join(lines)
+
+
 def summarize_results(tasks: list[TaskSpec], results_by_name: dict[str, TaskResult]) -> int:
     failure_count = 0
     skipped_count = 0
     success_count = 0
+    collected_flags: list[TaskFlags] = []
 
     logger.info("")
     logger.info("Summary:")
     for task in tasks:
         result = results_by_name[task.name]
+        task_flags = extract_task_flags(result)
+        if task_flags is not None:
+            collected_flags.append(task_flags)
         if result.status == "success":
             success_count += 1
             logger.success(
@@ -601,6 +688,10 @@ def summarize_results(tasks: list[TaskSpec], results_by_name: dict[str, TaskResu
         skipped_count,
         failure_count,
     )
+    if collected_flags:
+        logger.info("")
+        logger.info("Collected flags:")
+        logger.info("\n{}", render_flags_table(collected_flags))
     return 1 if failure_count else 0
 
 

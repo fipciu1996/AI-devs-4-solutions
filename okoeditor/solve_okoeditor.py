@@ -31,7 +31,7 @@ from devs_utilities.openrouter import (
     OpenRouterError,
     ToolCall,
 )
-from repo_env import get_env, get_int_env, get_optional_env
+from devs_utilities.repo_env import get_env, get_int_env, get_llm_model, get_optional_env
 
 
 REPO_ROOT = bootstrap_repo(__file__)
@@ -39,7 +39,7 @@ logger = shared_logger.bind(component="okoeditor")
 
 TASK_NAME = "okoeditor"
 OKO_BASE_URL = "https://example.invalid"
-DEFAULT_MODEL = get_env("OPENROUTER_MODEL", "nvidia/nemotron-3-super-120b-a12b:free")
+DEFAULT_MODEL = get_llm_model("OKOEDITOR_MODEL")
 DEFAULT_MAX_STEPS = get_int_env("OKOEDITOR_MAX_STEPS", 12)
 DEFAULT_API_TIMEOUT_SECONDS = get_int_env("AG3NTS_TIMEOUT_SECONDS", 30)
 DEFAULT_OPENROUTER_TIMEOUT_SECONDS = get_int_env("OPENROUTER_TIMEOUT_SECONDS", 60)
@@ -1095,6 +1095,67 @@ def execute_tool_call(
     }
 
 
+def parse_tool_message_content(tool_message: dict[str, Any]) -> dict[str, Any]:
+    """Decode the JSON payload stored in a synthetic tool message."""
+
+    content = tool_message.get("content")
+    if not isinstance(content, str):
+        return {}
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def recover_from_non_tool_response(
+    *,
+    step: int,
+    messages: list[dict[str, Any]],
+    response_text: str,
+    web_client: OkoWebClient,
+    verify_client: OkoVerifyClient,
+    state: AgentState,
+    show_tool_results: bool,
+) -> bool:
+    """Recover when the model answers in plain text instead of using tools."""
+
+    logger.info("Model returned a non-tool response: {}", response_text)
+    evaluation_message = execute_tool_call(
+        ToolCall(id=f"auto_evaluate_state_{step}", name="evaluate_state", arguments={}),
+        web_client=web_client,
+        verify_client=verify_client,
+        state=state,
+        show_tool_results=show_tool_results,
+    )
+    messages.append(evaluation_message)
+    evaluation = parse_tool_message_content(evaluation_message)
+
+    if evaluation.get("ready_for_done") is True:
+        done_message = execute_tool_call(
+            ToolCall(id=f"auto_submit_done_{step}", name="submit_done", arguments={}),
+            web_client=web_client,
+            verify_client=verify_client,
+            state=state,
+            show_tool_results=show_tool_results,
+        )
+        messages.append(done_message)
+        if state.final_flag:
+            return True
+
+    messages.append(
+        {
+            "role": "user",
+            "content": (
+                "Use tools only. Do not summarize progress in plain text. "
+                "If the task is complete, call evaluate_state and then submit_done. "
+                "Otherwise apply the missing edits with update_record or batch_update_records."
+            ),
+        }
+    )
+    return False
+
+
 def run_agent(config: AppConfig) -> tuple[list[dict[str, Any]], AgentState]:
     client = build_task_openrouter_client(
         __file__,
@@ -1142,7 +1203,16 @@ def run_agent(config: AppConfig) -> tuple[list[dict[str, Any]], AgentState]:
             continue
 
         if completion.content:
-            logger.info("Model returned a non-tool response: {}", completion.content)
+            if recover_from_non_tool_response(
+                step=step,
+                messages=messages,
+                response_text=completion.content,
+                web_client=web_client,
+                verify_client=verify_client,
+                state=state,
+                show_tool_results=config.show_tool_results,
+            ):
+                return messages, state
 
     raise OkoEditorError("OpenRouter tool calling did not finish within the step limit.")
 
