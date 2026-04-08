@@ -28,6 +28,7 @@ from devs_utilities.openrouter import (
     build_task_site_name,
     parse_json_object_content,
 )
+from devs_utilities.prompts import load_prompt_text
 from devs_utilities.repo_env import (
     get_course_api_key,
     get_env,
@@ -88,38 +89,7 @@ ALLOWED_REMOTE_COMMANDS = {
     "xargs",
 }
 FORBIDDEN_REDIRECTION_RE = re.compile(r"[<>]")
-
-SYSTEM_PROMPT = """You are solving the AG3NTS shellaccess task through tools only.
-
-Goal:
-- inspect the remote Linux environment exposed by the task
-- find the day when Rafal's body was found
-- return the previous day together with the city and GPS coordinates
-- stop only after the hub returns a flag
-
-Hard rules:
-- Start by inspecting /data unless the conversation already contains the result.
-- The remote output limit is 4096 bytes, so never dump whole files.
-- Prefer dedicated tools for searching logs and resolving IDs before falling back to raw shell.
-- Prefer narrow commands with grep, sed -n, head, tail, cut, wc, and jq -r.
-- time_logs.csv is CSV text, while locations.json and gps.json are JSON files.
-- The key correlation is usually: time_logs.csv -> location_id/place id -> locations.json/gps.json.
-- If the hub returns code -860, your command was too broad. Narrow it.
-- If a jq command returns code -850, switch from JSON output to plain text with jq -r.
-- Exploration must stay read-only. Do not attempt destructive or write operations.
-- Use submit_answer when you have a serious candidate.
-
-Useful patterns:
-- ls -la /data
-- head -n 5 /data/time_logs.csv
-- grep -n 'Rafa' /data/time_logs.csv | tail -n 40
-- grep -n -E 'ciało|znaleziono|jaskini' /data/time_logs.csv | tail -n 20
-- sed -n '3670,3725p' /data/time_logs.csv
-- jq -r '.[] | select(.location_id==N) | .name' /data/locations.json
-- jq -r '.[] | select(.entry_id==N) | [.latitude,.longitude] | @tsv' /data/gps.json
-
-Be concise in assistant text. Think with the tools.
-"""
+SYSTEM_PROMPT = load_prompt_text(__file__, "system_prompt.txt")
 
 INITIAL_USER_PROMPT = """Solve the shellaccess task. Explore the remote files,
 correlate the date, city, and coordinates, then submit the final answer."""

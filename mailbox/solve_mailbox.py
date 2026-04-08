@@ -30,6 +30,7 @@ from devs_utilities.openrouter import (
     OpenRouterError,
     ToolCall,
 )
+from devs_utilities.prompts import load_prompt_text
 from devs_utilities.repo_env import (
     get_course_api_key,
     get_env,
@@ -64,43 +65,7 @@ OUTPUT_DIR = Path(__file__).resolve().parent
 LAST_RESPONSE_PATH = OUTPUT_DIR / "last_verify_response.json"
 LAST_ANSWER_PATH = OUTPUT_DIR / "last_answer.json"
 LAST_TRANSCRIPT_PATH = OUTPUT_DIR / "last_transcript.json"
-
-SYSTEM_PROMPT = """You are a mailbox investigation agent working through tools only.
-
-Goal:
-- find the date when security plans to attack the power plant
-- find the current employee-system password from the mailbox
-- find the confirmation code from the security ticket
-- keep searching and submitting answers until the hub returns a flag
-
-Hard rules:
-- Start by calling zmail_help unless its result is already in the conversation.
-- Always read full message bodies with get_messages before trusting a clue.
-- Prefer messageID over rowID when fetching messages. The mailbox is live and rowIDs may shift.
-- When a search hit belongs to an interesting thread, inspect the whole thread with get_thread and then read the newest relevant messages.
-- Newer corrective emails override older contradictory emails.
-- The mailbox is active. If you cannot find something, refresh page 1 of inbox or repeat key searches after a short wait.
-- Use submit_answer whenever you have a serious candidate set. Hub feedback tells you what is still wrong or missing.
-- Stop only after submit_answer returns a flag.
-
-Known facts:
-- Wiktor sent a denunciation email from the proton.me domain.
-- Search supports Gmail-like operators: from:, to:, subject:, OR, AND.
-- The final answer must contain:
-  - date in YYYY-MM-DD
-  - password as found in the mailbox
-  - confirmation_code in format SEC- followed by 28 characters
-
-Good search angles:
-- from:proton.me
-- PWR6132PL
-- SEC-
-- security
-- pracowniczy
-- haslo / password
-
-Be concise in assistant text. Think with the tools.
-"""
+SYSTEM_PROMPT = load_prompt_text(__file__, "system_prompt.txt")
 
 INITIAL_USER_PROMPT = """Solve the mailbox task. Search iteratively, inspect message bodies,
 and keep going until verify returns the final flag. If the mailbox changes while you work,

@@ -26,6 +26,7 @@ from devs_utilities.openrouter import (
     OpenRouterError,
     ToolCall,
 )
+from devs_utilities.prompts import load_prompt_text
 from devs_utilities.repo_env import get_env, get_int_env, get_llm_model
 
 
@@ -53,6 +54,7 @@ MODEL_ROUTE_PATH = OUTPUT_DIR / "model_route.json"
 DEFAULT_PROBE_ANSWER = ["walk"]
 EPSILON = 1e-9
 MODEL_MAX_STEPS = 6
+SYSTEM_PROMPT = load_prompt_text(__file__, "system_prompt.txt")
 
 DIRS: tuple[tuple[int, int, str], ...] = (
     (-1, 0, "up"),
@@ -570,30 +572,8 @@ def choose_route_with_openrouter(
 ) -> list[str]:
     client = build_openrouter_client()
     handlers = build_model_tool_handlers(preview, specs, deterministic_answer)
-    system_prompt = """You are solving a grid route-planning task.
-
-You must work only through tool calling before giving a final answer.
-
-Rules:
-- Use tools to inspect the task context and at least validate the final route.
-- First item of the route must be one of: walk, horse, car, rocket.
-- Vehicle selection is allowed only in the first step.
-- Later you may use dismount to switch to walk.
-- Rocks are impassable.
-- Car and rocket cannot enter water.
-- Tree tiles are passable, but non-walk modes pay extra fuel on trees.
-- Resource limits are strict: fuel and food must stay above zero.
-- Optimize for highest remaining food first, then highest remaining fuel.
-
-Final answer format:
-Return JSON only:
-{
-  "answer": ["vehicle", "..."],
-  "reason": "short explanation"
-}
-"""
     messages: list[dict[str, Any]] = [
-        {"role": "system", "content": system_prompt},
+        {"role": "system", "content": SYSTEM_PROMPT},
         {
             "role": "user",
             "content": "Find the best valid route for the current savethem map.",

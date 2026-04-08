@@ -26,6 +26,7 @@ from devs_utilities.openrouter import (
     ToolCall,
     extract_completion_result,
 )
+from devs_utilities.prompts import load_prompt_text
 from devs_utilities.repo_env import (
     get_env,
     get_int_env,
@@ -49,6 +50,8 @@ MODEL_MAX_STEPS = 3
 DEFAULT_SITE_NAME = build_task_site_name(__file__, task_name=TASK_NAME)
 TEXT_EXTENSIONS = {".md", ".txt", ".csv", ".json", ".yaml", ".yml"}
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
+ANALYZE_SYSTEM_PROMPT = load_prompt_text(__file__, "analyze_system_prompt.txt")
+ANALYZE_TOOL_SYSTEM_PROMPT = load_prompt_text(__file__, "analyze_tool_system_prompt.txt")
 
 
 @dataclass(slots=True)
@@ -151,15 +154,6 @@ def build_messages(
     question: str,
     max_text_chars: int,
 ) -> list[dict[str, object]]:
-    system_prompt = (
-        "Analizujesz pojedynczy plik dokumentacyjny. "
-        "Odpowiadaj po polsku. "
-        "Wyciagaj tylko informacje wynikajace bezposrednio z pliku. "
-        "Jesli czegos nie ma w materiale, napisz to wprost. "
-        "Nie proponuj obchodzenia zabezpieczen, falszowania dokumentow ani "
-        "innych dzialan niezgodnych z prawem lub regulaminem."
-    )
-
     if target.kind == "text":
         content = load_text(target.path, max_text_chars)
         user_content: list[dict[str, object]] = [
@@ -190,7 +184,7 @@ def build_messages(
         ]
 
     return [
-        {"role": "system", "content": system_prompt},
+        {"role": "system", "content": ANALYZE_SYSTEM_PROMPT},
         {"role": "user", "content": user_content},
     ]
 
@@ -267,10 +261,7 @@ def analyze_target_with_tool_calling(
     messages: list[dict[str, object]] = [
         {
             "role": "system",
-            "content": (
-                "Analizujesz pojedynczy plik dokumentacyjny. "
-                "Użyj tool callingu przed finalną odpowiedzią."
-            ),
+            "content": ANALYZE_TOOL_SYSTEM_PROMPT,
         },
         {
             "role": "user",

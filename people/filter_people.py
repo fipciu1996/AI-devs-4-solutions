@@ -26,6 +26,7 @@ from devs_utilities.openrouter import (
     ToolCall,
     strip_code_fences,
 )
+from devs_utilities.prompts import load_prompt_text
 from devs_utilities.repo_env import (
     get_course_api_key,
     get_env,
@@ -76,6 +77,7 @@ CSV_COLUMNS = {
     "job",
 }
 MODEL_MAX_STEPS = 4
+FILTER_SYSTEM_PROMPT = load_prompt_text(__file__, "filter_system_prompt.txt")
 
 
 @dataclass(slots=True)
@@ -426,10 +428,7 @@ def classify_jobs(
     messages: list[dict[str, Any]] = [
         {
             "role": "system",
-            "content": (
-                "Jesteś klasyfikatorem zawodów. "
-                "Użyj tool callingu przed finalną odpowiedzią i zwróć wyłącznie JSON."
-            ),
+            "content": FILTER_SYSTEM_PROMPT,
         },
         {
             "role": "user",

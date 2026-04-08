@@ -25,6 +25,7 @@ from devs_utilities.openrouter import (
     OpenRouterError,
     parse_json_object_content,
 )
+from devs_utilities.prompts import load_prompt_text
 from devs_utilities.repo_env import (
     get_course_api_key,
     get_env,
@@ -46,17 +47,7 @@ LAST_MODEL_PLAN_PATH = OUTPUT_DIR / "last_model_target.json"
 MAP_IMAGE_PATH = OUTPUT_DIR / "drone.png"
 DEFAULT_MODEL = get_llm_model("DRONE_MODEL")
 DEFAULT_OPENROUTER_TIMEOUT_SECONDS = get_int_env("OPENROUTER_TIMEOUT_SECONDS", 60) or 60
-VISION_SYSTEM_PROMPT = """You analyze a 3x4 tactical grid map for a drone mission.
-
-Task:
-- Inspect the map image.
-- Find the sector containing the dam, not the power plant.
-- Return the target sector as 1-based grid coordinates.
-- The grid has 3 columns and 4 rows.
-
-Return JSON only:
-{"sector_x":2,"sector_y":4,"reason":"short explanation"}
-"""
+VISION_SYSTEM_PROMPT = load_prompt_text(__file__, "vision_system_prompt.txt")
 
 # The map analysis plus API feedback narrows the dam to column 2, row 4
 # on a 3x4 grid. The destination object is the Żarnowiec plant code from

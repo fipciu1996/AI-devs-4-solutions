@@ -28,6 +28,7 @@ from devs_utilities.openrouter import (
     OpenRouterError,
     parse_json_object_content,
 )
+from devs_utilities.prompts import load_prompt_text
 from devs_utilities.repo_env import (
     get_course_api_key,
     get_env,
@@ -54,22 +55,7 @@ DEFAULT_PROMPT_PREFIX = (
     "firearm part, ammo, explosive, poison, corrosive, radioactive, biohazard, "
     "drug. Other industrial/electronic parts => NEU."
 )
-MODEL_SYSTEM_PROMPT = """You optimize prompts for a tiny binary safety classifier.
-
-Task:
-- Produce one short reusable prompt prefix for classifying package descriptions.
-- The final prompt will later append:
-  ID:<item_id>
-  <description>
-- Keep the prefix concise so the combined prompt stays under 100 tokens.
-- Mark reactor and fuel-system items as NEU, not DNG.
-- DNG is only for clearly dangerous goods such as weapons, ammo, explosives,
-  poisons, corrosives, radioactive, biohazard, or illicit drugs.
-- Ordinary industrial, electronic, mechanical, and reactor-related parts are NEU.
-
-Return JSON only:
-{"prompt_prefix":"...","reason":"short explanation"}
-"""
+MODEL_SYSTEM_PROMPT = load_prompt_text(__file__, "system_prompt.txt")
 
 
 @dataclass(slots=True)

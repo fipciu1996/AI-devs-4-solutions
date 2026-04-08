@@ -28,6 +28,7 @@ from devs_utilities.openrouter import (
     OpenRouterError,
     parse_json_object_content,
 )
+from devs_utilities.prompts import load_prompt_text
 from devs_utilities.repo_env import (
     get_course_api_key,
     get_env,
@@ -58,18 +59,7 @@ ROTATION_SEQUENCE = [
     ).split(",")
     if token.strip()
 ]
-VISION_SYSTEM_PROMPT = """You solve a 3x3 rotate-only cable puzzle.
-
-Task:
-- Inspect the current board image.
-- Optionally compare it with the solved reference image.
-- Output the shortest plausible sequence of rotations needed to reach the solved state.
-- Each move rotates one tile 90 degrees clockwise.
-- Coordinates use row x column format like 1x2, 3x1.
-
-Return JSON only:
-{"rotations":["1x2","2x3"],"reason":"short explanation"}
-"""
+VISION_SYSTEM_PROMPT = load_prompt_text(__file__, "vision_system_prompt.txt")
 
 
 def get_api_key() -> str:

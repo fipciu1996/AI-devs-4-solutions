@@ -28,6 +28,7 @@ from devs_utilities.openrouter import (
     OpenRouterError,
     parse_json_object_content,
 )
+from devs_utilities.prompts import load_prompt_text
 from devs_utilities.repo_env import get_env, get_int_env, get_llm_model, get_optional_env
 
 
@@ -48,25 +49,7 @@ DEFAULT_MODEL = get_llm_model("FILESYSTEM_MODEL")
 DEFAULT_OPENROUTER_TIMEOUT_SECONDS = get_int_env("OPENROUTER_TIMEOUT_SECONDS", 60) or 60
 NOTES_ZIP_URL = build_ag3nts_public_data_url("natan_notes.zip")
 NAME_PATTERN = re.compile(r"^[a-z0-9_]+$")
-MODEL_SYSTEM_PROMPT = """You extract structured marketplace facts from Polish logistics notes.
-
-Focus only on:
-- city manager full names from the conversations note
-- goods_sources from the transactions note
-
-Normalization rules:
-- city keys must use slugs exactly as provided in the allowed list
-- goods must use canonical singular slugs
-- goods_sources values must be lists of city slugs sorted alphabetically
-- deduplicate everything
-
-Return JSON only:
-{
-  "city_managers":{"domatowo":"Natan Rams"},
-  "goods_sources":{"chleb":["brudzewo","domatowo"]},
-  "reason":"short explanation"
-}
-"""
+MODEL_SYSTEM_PROMPT = load_prompt_text(__file__, "system_prompt.txt")
 
 CITY_DISPLAY_NAMES = {
     "brudzewo": "Brudzewo",

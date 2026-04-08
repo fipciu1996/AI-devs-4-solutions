@@ -32,6 +32,7 @@ from devs_utilities.openrouter import (
     OpenRouterError,
     ToolCall,
 )
+from devs_utilities.prompts import load_prompt_text
 from devs_utilities.repo_env import (
     get_course_api_key,
     get_env,
@@ -70,6 +71,7 @@ LAST_SESSION_PATH = OUTPUT_DIR / "last_session.json"
 LAST_TRANSCRIPT_PATH = OUTPUT_DIR / "last_transcript.json"
 LAST_VERIFY_RESPONSE_PATH = OUTPUT_DIR / "last_verify_response.json"
 TOOL_MANIFEST_PATH = OUTPUT_DIR / "shell_tools.json"
+SYSTEM_PROMPT_TEMPLATE = load_prompt_text(__file__, "system_prompt.txt")
 
 CONFIRMATION_PATTERN = re.compile(r"(ECCS-[a-f0-9]{40})", re.IGNORECASE)
 EXPECTED_COMMAND_PREFIXES = (
@@ -548,30 +550,11 @@ def build_system_prompt(
         if password_hint
         else ""
     )
-    return (
-        "You are a firmware recovery agent working through tools only.\n\n"
-        "Goal:\n"
-        "- recover the password needed by /opt/firmware/cooler/cooler.bin\n"
-        "- fix the configuration so the cooler can start\n"
-        "- run the binary and recover the ECCS confirmation code\n"
-        "- submit that confirmation with the submit_confirmation tool\n\n"
-        "Hard rules:\n"
-        "- Never touch /etc, /root, or /proc.\n"
-        "- Respect /opt/firmware/cooler/.gitignore exactly.\n"
-        "- If a command returns a refusal or ban, do not repeat that command.\n"
-        "- After any reboot, assume previous filesystem edits are gone.\n"
-        "- Prefer absolute paths.\n"
-        "- Useful safe clues often live in shell history, /home/operator, "
-        "and /opt/firmware/cooler/settings.ini.\n"
-        "- If you change settings.ini, only edit specific lines with editline.\n"
-        "- If a lock file blocks startup, fix the root cause first and then remove the lock.\n"
-        f"- {verification_line}\n\n"
-        "Fresh shell help:\n"
-        f"{help_text}\n\n"
-        "Entries ignored by /opt/firmware/cooler/.gitignore:\n"
-        f"{gitignore_text}\n\n"
-        f"{hint_line}"
-        "Be concise. Think with tools."
+    return SYSTEM_PROMPT_TEMPLATE.format(
+        verification_line=verification_line,
+        help_text=help_text,
+        gitignore_text=gitignore_text,
+        hint_line=hint_line,
     )
 
 

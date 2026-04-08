@@ -26,6 +26,7 @@ from devs_utilities.openrouter import (
     OpenRouterError,
     ToolCall,
 )
+from devs_utilities.prompts import load_prompt_text
 from devs_utilities.repo_env import (
     get_course_api_key,
     get_env,
@@ -52,18 +53,7 @@ RAILWAY_TASK_NAME = "railway"
 RETRYABLE_STATUS_CODES = {429, 503}
 ROUTE_PATTERN = re.compile(r"^[a-z]-[0-9]{1,2}$", re.IGNORECASE)
 STATUS_VALUES = {"RTOPEN", "RTCLOSE"}
-
-SYSTEM_PROMPT = """Jestes agentem do zmiany statusu tras kolejowych.
-Masz dostep wylacznie do narzedzi API i zawsze uzywasz ich do sprawdzania oraz zmiany stanu.
-
-Zasady pracy:
-- Gdy uzytkownik prosi o zmiane statusu trasy, najpierw sprawdz aktualny stan.
-- Aby zmienic status, zawsze wykonaj kolejnosc: reconfigure -> setstatus -> save.
-- Nie wywoluj setstatus bez wczesniejszego reconfigure.
-- Jesli status jest juz zgodny z celem uzytkownika, poinformuj o tym zamiast wykonywac zbedne zmiany.
-- Jesli polecenie uzytkownika jest niejednoznaczne, najpierw pobierz dostepne informacje narzedziami i krotko opisz problem.
-- Odpowiadaj po polsku.
-"""
+SYSTEM_PROMPT = load_prompt_text(__file__, "system_prompt.txt")
 
 
 class RailwayError(RuntimeError):

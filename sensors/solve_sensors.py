@@ -32,6 +32,7 @@ from devs_utilities.openrouter import (
     OpenRouterError,
     ToolCall,
 )
+from devs_utilities.prompts import load_prompt_text
 from devs_utilities.repo_env import (
     get_course_api_key,
     get_env,
@@ -202,33 +203,7 @@ POSITIVE_NOTE_MARKERS = (
     "looks completely normal",
 )
 
-MODEL_SYSTEM_PROMPT = """You classify operator notes from power-plant sensor files.
-
-Your task:
-- Read only operator_notes.
-- Decide whether the note claims everything is OK, claims there is a problem,
-  or is too ambiguous to tell.
-- Ignore unusual writing style and focus on meaning.
-- Use tool calling before giving the final answer.
-
-Use:
-- "ok" when the note says the system looks normal, healthy, stable, approved,
-  routine, or no action is needed.
-- "problem" when the note says the result is suspicious, unstable, faulty,
-  concerning, under investigation, escalated, or needs verification.
-- "uncertain" only when the note does not clearly lean either way.
-
-Return JSON only:
-{
-  "results": [
-    {
-      "key": "abc123",
-      "note_claim": "ok|problem|uncertain",
-      "reason": "short explanation"
-    }
-  ]
-}
-"""
+MODEL_SYSTEM_PROMPT = load_prompt_text(__file__, "system_prompt.txt")
 MODEL_MAX_STEPS = 4
 
 LEGACY_MODEL_ALIASES = {

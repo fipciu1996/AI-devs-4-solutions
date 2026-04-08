@@ -36,6 +36,7 @@ from devs_utilities.openrouter import (
     ToolCall,
     extract_completion_result,
 )
+from devs_utilities.prompts import load_prompt_text
 from devs_utilities.repo_env import (
     get_course_api_key,
     get_env,
@@ -60,6 +61,14 @@ DEFAULT_PLANTS_PATH = "findhim_locations.json"
 DEFAULT_SUSPECTS_PATH = "people_result.json"
 DEFAULT_OUTPUT_PATH = "findhim_result.json"
 MODEL_MAX_STEPS = 4
+GEOCODE_LEGACY_SYSTEM_PROMPT = load_prompt_text(
+    __file__,
+    "find_agent_geocode_legacy_system_prompt.txt",
+)
+GEOCODE_SYSTEM_PROMPT = load_prompt_text(
+    __file__,
+    "find_agent_geocode_system_prompt.txt",
+)
 
 
 @dataclass(slots=True)
@@ -361,10 +370,7 @@ def geocode_power_plants_legacy(
         [
             {
                 "role": "system",
-                "content": (
-                    "Zwracasz tylko poprawny JSON zgodny ze schematem. "
-                    "Używaj współrzędnych miast w Polsce."
-                ),
+                "content": GEOCODE_LEGACY_SYSTEM_PROMPT,
             },
             {
                 "role": "user",
@@ -420,11 +426,7 @@ def geocode_power_plants(
     messages: list[dict[str, Any]] = [
         {
             "role": "system",
-            "content": (
-                "Zwracasz tylko poprawny JSON zgodny ze schematem. "
-                "Użyj tool callingu przed finalną odpowiedzią. "
-                "Używaj współrzędnych miast w Polsce."
-            ),
+            "content": GEOCODE_SYSTEM_PROMPT,
         },
         {
             "role": "user",

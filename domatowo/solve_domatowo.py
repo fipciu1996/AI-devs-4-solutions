@@ -30,6 +30,7 @@ from devs_utilities.openrouter import (
     ToolCall,
     build_task_openrouter_client,
 )
+from devs_utilities.prompts import load_prompt_text
 from devs_utilities.repo_env import get_env, get_int_env, get_llm_model, get_optional_env
 
 
@@ -52,6 +53,8 @@ SEARCH_TRACE_PATH = OUTPUT_DIR / "search_trace.json"
 VERIFY_RESPONSE_PATH = OUTPUT_DIR / "last_verify_response.json"
 SIDE_QUEST_PATH = OUTPUT_DIR / "last_side_quest.json"
 RESULT_PATH = OUTPUT_DIR / "last_result.json"
+PLANNER_SYSTEM_PROMPT = load_prompt_text(__file__, "planner_system_prompt.txt")
+LOG_CLASSIFIER_SYSTEM_PROMPT = load_prompt_text(__file__, "log_classifier_system_prompt.txt")
 
 SCOUTS_PER_TRANSPORTER = 1
 PLANNER_MAX_STEPS = 4
@@ -757,13 +760,7 @@ def recommend_plan_with_openrouter(
     messages: list[dict[str, Any]] = [
         {
             "role": "system",
-            "content": (
-                "You are the Domatowo mission planner.\n"
-                "Use tool calling before your final answer.\n"
-                "Return JSON only with cluster_order, field_order and reason.\n"
-                "You must keep every candidate field in the plan.\n"
-                "Use the intercepted signal to prioritize likely B3 hiding spots."
-            ),
+            "content": PLANNER_SYSTEM_PROMPT,
         },
         {"role": "user", "content": "Build the best mission plan for the current Domatowo board."},
     ]
@@ -828,13 +825,7 @@ def classify_log_with_openrouter(client: OpenRouterClient | None, log_entry: Ins
     messages: list[dict[str, Any]] = [
         {
             "role": "system",
-            "content": (
-                "You classify Domatowo inspect logs.\n"
-                "Use tool calling before the final answer.\n"
-                "Return JSON only with keys result and reason.\n"
-                "Allowed result values: found, empty, uncertain.\n"
-                "Use found only when the message clearly confirms a live person on the inspected field."
-            ),
+            "content": LOG_CLASSIFIER_SYSTEM_PROMPT,
         },
         {"role": "user", "content": "Classify the latest inspect log."},
     ]

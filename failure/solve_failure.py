@@ -30,6 +30,7 @@ from devs_utilities.openrouter import (
     OpenRouterError,
     parse_json_object_content,
 )
+from devs_utilities.prompts import load_prompt_text
 from devs_utilities.repo_env import (
     get_course_api_key,
     get_env,
@@ -55,20 +56,7 @@ RAW_LOG_PATH = Path(__file__).with_name("failure.log")
 CONDENSED_LOG_PATH = Path(__file__).with_name("final_logs.txt")
 RESPONSE_PATH = Path(__file__).with_name("submission_response.json")
 MODEL_PLAN_PATH = Path(__file__).with_name("last_model_logs.json")
-MODEL_SYSTEM_PROMPT = """You compress already-selected outage log lines.
-
-Rules:
-- Do not invent, remove, reorder, or merge distinct incidents unless the meaning
-  stays exactly intact.
-- Keep one incident per output line.
-- Preserve the leading timestamp and level block in each line.
-- Keep component names and causal facts.
-- Make wording shorter and more technical.
-- Stay within 1500 tokens total.
-
-Return JSON only:
-{"logs":["[2026-04-01 10:15] [ERROR] ..."],"reason":"short explanation"}
-"""
+MODEL_SYSTEM_PROMPT = load_prompt_text(__file__, "system_prompt.txt")
 
 EXCLUDED_MESSAGES = {
     "Pressure jitter near STMTURB12 is above baseline. Automatic damping remains engaged.",

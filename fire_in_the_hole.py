@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import re
 import subprocess
 import sys
@@ -19,6 +21,7 @@ from devs_utilities.repo_env import get_optional_env, load_repo_env
 REPO_ROOT = Path(__file__).resolve().parent
 PYTHON = sys.executable
 DEFAULT_LOG_DIR = REPO_ROOT / "fire_in_the_hole_logs"
+DEFAULT_COST_DIR = REPO_ROOT / "fire_in_the_hole_costs"
 DEFAULT_RAILWAY_PROMPT = "Aktywuj trase X-01"
 DEFAULT_NEGOTIATIONS_CHECK_DELAY_SECONDS = 5.0
 DEFAULT_NEGOTIATIONS_POLL_ATTEMPTS = 12
@@ -27,6 +30,14 @@ logger = shared_logger.bind(component="fire_in_the_hole")
 load_repo_env(__file__)
 FLAG_PATTERN = re.compile(r"\{FLG:[^}]+\}")
 SECRET_LABEL_PATTERN = re.compile(r"\b(?:sekret|secret)\b\s*:", re.IGNORECASE)
+TOKEN_FIELDS = (
+    "input_tokens",
+    "output_tokens",
+    "cached_tokens",
+    "reasoning_tokens",
+    "cache_write_tokens",
+    "total_tokens",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,6 +63,7 @@ class TaskResult:
     status: str
     duration_seconds: float
     step_count: int
+    cost_path: Path | None = None
     log_path: Path | None = None
     detail: str | None = None
     failed_step: str | None = None
@@ -82,13 +94,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-workers",
         type=int,
-        default=4,
+        default=20,
         help="Maximum number of tasks to run in parallel. Default: 4.",
     )
     parser.add_argument(
         "--verify",
-        action="store_true",
-        help="Add --verify to tasks that support it.",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Add --verify to tasks that support it. Enabled by default.",
     )
     parser.add_argument(
         "--list",
@@ -105,6 +118,12 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=DEFAULT_LOG_DIR,
         help=f"Directory for per-task logs. Default: {DEFAULT_LOG_DIR.name}",
+    )
+    parser.add_argument(
+        "--cost-dir",
+        type=Path,
+        default=DEFAULT_COST_DIR,
+        help=f"Directory for per-task token cost reports. Default: {DEFAULT_COST_DIR.name}",
     )
     parser.add_argument(
         "--railway-prompt",
@@ -152,6 +171,7 @@ def parse_args() -> argparse.Namespace:
     if args.negotiations_check_attempts < 1:
         parser.error("--negotiations-check-attempts must be >= 1.")
     args.log_dir = resolve_path(args.log_dir)
+    args.cost_dir = resolve_path(args.cost_dir)
     return args
 
 
@@ -509,20 +529,171 @@ def show_dry_run(tasks: list[TaskSpec], args: argparse.Namespace) -> int:
     return 0
 
 
+def empty_token_totals() -> dict[str, int]:
+    return {field: 0 for field in TOKEN_FIELDS}
+
+
+def normalize_token_totals(payload: object) -> dict[str, int]:
+    normalized = empty_token_totals()
+    if not isinstance(payload, dict):
+        return normalized
+    for field in TOKEN_FIELDS:
+        value = payload.get(field, 0)
+        if isinstance(value, bool):
+            normalized[field] = 0
+        elif isinstance(value, int):
+            normalized[field] = value
+        elif isinstance(value, float):
+            normalized[field] = int(value)
+        elif isinstance(value, str) and value.strip().isdigit():
+            normalized[field] = int(value.strip())
+    return normalized
+
+
+def add_token_totals(left: dict[str, int], right: dict[str, int]) -> dict[str, int]:
+    return {
+        field: left[field] + right[field]
+        for field in TOKEN_FIELDS
+    }
+
+
+def task_cost_path(cost_dir: Path, task_name: str) -> Path:
+    return cost_dir / f"{task_name}.json"
+
+
+def prepare_cost_dir(cost_dir: Path) -> None:
+    cost_dir.mkdir(parents=True, exist_ok=True)
+    for json_path in cost_dir.glob("*.json"):
+        json_path.unlink()
+
+
+def load_cost_report(path: Path) -> dict[str, object]:
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def write_task_cost_report(result: TaskResult) -> dict[str, object] | None:
+    if result.cost_path is None:
+        return None
+
+    payload = load_cost_report(result.cost_path)
+    payload["task"] = result.name
+    payload["status"] = result.status
+    payload["duration_seconds"] = round(result.duration_seconds, 3)
+    payload["step_count"] = result.step_count
+    payload["request_count"] = int(payload.get("request_count") or 0)
+    raw_models = payload.get("models")
+    if not isinstance(raw_models, list):
+        raw_models = []
+    payload["models"] = sorted(
+        model
+        for model in raw_models
+        if isinstance(model, str) and model.strip()
+    )
+    payload["totals"] = normalize_token_totals(payload.get("totals"))
+    payload["usage_by_model"] = (
+        payload.get("usage_by_model")
+        if isinstance(payload.get("usage_by_model"), dict)
+        else {}
+    )
+    payload["calls"] = (
+        payload.get("calls")
+        if isinstance(payload.get("calls"), list)
+        else []
+    )
+    payload["source"] = "fire_in_the_hole"
+    if result.log_path is not None:
+        payload["log_path"] = str(result.log_path)
+    if result.detail:
+        payload["detail"] = result.detail
+    if result.failed_step:
+        payload["failed_step"] = result.failed_step
+    if result.exit_code is not None:
+        payload["exit_code"] = result.exit_code
+
+    result.cost_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return payload
+
+
+def write_run_cost_summary(
+    tasks: list[TaskSpec],
+    results_by_name: dict[str, TaskResult],
+    *,
+    cost_dir: Path,
+) -> Path:
+    totals = empty_token_totals()
+    success_count = 0
+    skipped_count = 0
+    failed_count = 0
+    task_reports: dict[str, dict[str, object]] = {}
+
+    for task in tasks:
+        result = results_by_name[task.name]
+        report = write_task_cost_report(result) or {}
+        report_totals = normalize_token_totals(report.get("totals"))
+        totals = add_token_totals(totals, report_totals)
+        task_reports[task.name] = {
+            "status": result.status,
+            "duration_seconds": round(result.duration_seconds, 3),
+            "request_count": int(report.get("request_count") or 0),
+            "models": report.get("models", []),
+            "totals": report_totals,
+            "log_path": str(result.log_path) if result.log_path is not None else None,
+            "cost_path": str(result.cost_path) if result.cost_path is not None else None,
+        }
+        if result.status == "success":
+            success_count += 1
+        elif result.status == "skipped":
+            skipped_count += 1
+        else:
+            failed_count += 1
+
+    summary_path = cost_dir / "fire_in_the_hole_total.json"
+    summary_payload = {
+        "run": "fire_in_the_hole",
+        "task_count": len(tasks),
+        "success_count": success_count,
+        "skipped_count": skipped_count,
+        "failed_count": failed_count,
+        "totals": totals,
+        "tasks": task_reports,
+    }
+    summary_path.write_text(
+        json.dumps(summary_payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return summary_path
+
+
 def run_task(task: TaskSpec, args: argparse.Namespace) -> TaskResult:
+    cost_path = task_cost_path(args.cost_dir, task.name)
     enabled, reason = task.is_enabled(args)
     if not enabled:
-        return TaskResult(
+        result = TaskResult(
             name=task.name,
             status="skipped",
             duration_seconds=0.0,
             step_count=0,
+            cost_path=cost_path,
             detail=reason,
         )
+        write_task_cost_report(result)
+        return result
 
     steps = task.build_steps(args)
     log_path = args.log_dir / f"{task.name}.log"
     args.log_dir.mkdir(parents=True, exist_ok=True)
+    args.cost_dir.mkdir(parents=True, exist_ok=True)
+    if cost_path.exists():
+        cost_path.unlink()
     start_time = time.perf_counter()
 
     with log_path.open("w", encoding="utf-8") as handle:
@@ -536,6 +707,9 @@ def run_task(task: TaskSpec, args: argparse.Namespace) -> TaskResult:
     for index, step in enumerate(steps, start=1):
         command_string = subprocess.list2cmdline(list(step.command))
         logger.info("[{} {}/{}] {}", task.name, index, len(steps), command_string)
+        step_env = os.environ.copy()
+        step_env["OPENROUTER_USAGE_OUTPUT_PATH"] = str(cost_path)
+        step_env["OPENROUTER_USAGE_TASK_NAME"] = task.name
         with log_path.open("a", encoding="utf-8") as handle:
             handle.write(f"=== Step {index}/{len(steps)}: {step.label} ===\n")
             handle.write(f"CWD: {step.cwd}\n")
@@ -547,20 +721,24 @@ def run_task(task: TaskSpec, args: argparse.Namespace) -> TaskResult:
                 check=False,
                 stdout=handle,
                 stderr=subprocess.STDOUT,
+                env=step_env,
             )
             handle.write("\n")
 
         if completed.returncode != 0:
-            return TaskResult(
+            result = TaskResult(
                 name=task.name,
                 status="failed",
                 duration_seconds=time.perf_counter() - start_time,
                 step_count=len(steps),
+                cost_path=cost_path,
                 log_path=log_path,
                 detail=f"step `{step.label}` exited with {completed.returncode}",
                 failed_step=step.label,
                 exit_code=completed.returncode,
             )
+            write_task_cost_report(result)
+            return result
 
         if step.delay_after_seconds > 0 and index < len(steps):
             logger.info(
@@ -570,21 +748,26 @@ def run_task(task: TaskSpec, args: argparse.Namespace) -> TaskResult:
             )
             time.sleep(step.delay_after_seconds)
 
-    return TaskResult(
+    result = TaskResult(
         name=task.name,
         status="success",
         duration_seconds=time.perf_counter() - start_time,
         step_count=len(steps),
+        cost_path=cost_path,
         log_path=log_path,
     )
+    write_task_cost_report(result)
+    return result
 
 
 def extract_flags_from_log_text(task_name: str, log_text: str) -> TaskFlags | None:
     main_flag: str | None = None
     secret_flag: str | None = None
+    ordered_flags: list[str] = []
 
     for line in log_text.splitlines():
-        if not FLAG_PATTERN.search(line):
+        flags_in_line = FLAG_PATTERN.findall(line)
+        if not flags_in_line:
             continue
 
         secret_match = SECRET_LABEL_PATTERN.search(line)
@@ -593,15 +776,27 @@ def extract_flags_from_log_text(task_name: str, log_text: str) -> TaskFlags | No
             after_secret = line[secret_match.end() :]
             before_flags = FLAG_PATTERN.findall(before_secret)
             after_flags = FLAG_PATTERN.findall(after_secret)
+            ordered_flags.extend(before_flags)
             if before_flags and main_flag is None:
                 main_flag = before_flags[-1]
             if after_flags and secret_flag is None:
                 secret_flag = after_flags[0]
+            ordered_flags.extend(after_flags)
             continue
 
-        flags = FLAG_PATTERN.findall(line)
-        if flags and main_flag is None:
-            main_flag = flags[0]
+        ordered_flags.extend(flags_in_line)
+        if main_flag is None:
+            main_flag = flags_in_line[0]
+
+    unique_flags: list[str] = []
+    for flag in ordered_flags:
+        if flag not in unique_flags:
+            unique_flags.append(flag)
+
+    if main_flag is None and unique_flags:
+        main_flag = unique_flags[0]
+    if secret_flag is None and len(unique_flags) > 1:
+        secret_flag = unique_flags[1]
 
     if main_flag is None and secret_flag is None:
         return None
@@ -615,6 +810,19 @@ def extract_task_flags(result: TaskResult) -> TaskFlags | None:
         result.name,
         result.log_path.read_text(encoding="utf-8", errors="replace"),
     )
+
+
+def collect_success_flags(
+    tasks: list[TaskSpec],
+    results_by_name: dict[str, TaskResult],
+) -> list[TaskFlags]:
+    collected_flags: list[TaskFlags] = []
+    for task in tasks:
+        result = results_by_name[task.name]
+        if result.status != "success":
+            continue
+        collected_flags.append(extract_task_flags(result) or TaskFlags(task_name=task.name))
+    return collected_flags
 
 
 def render_flags_table(flags: list[TaskFlags]) -> str:
@@ -651,15 +859,12 @@ def summarize_results(tasks: list[TaskSpec], results_by_name: dict[str, TaskResu
     failure_count = 0
     skipped_count = 0
     success_count = 0
-    collected_flags: list[TaskFlags] = []
+    collected_flags = collect_success_flags(tasks, results_by_name)
 
     logger.info("")
     logger.info("Summary:")
     for task in tasks:
         result = results_by_name[task.name]
-        task_flags = extract_task_flags(result)
-        if task_flags is not None:
-            collected_flags.append(task_flags)
         if result.status == "success":
             success_count += 1
             logger.success(
@@ -690,7 +895,7 @@ def summarize_results(tasks: list[TaskSpec], results_by_name: dict[str, TaskResu
     )
     if collected_flags:
         logger.info("")
-        logger.info("Collected flags:")
+        logger.info("Success flags:")
         logger.info("\n{}", render_flags_table(collected_flags))
     return 1 if failure_count else 0
 
@@ -719,11 +924,13 @@ def main() -> int:
 
     max_workers = min(args.max_workers, len(selected_tasks))
     logger.info(
-        "Running {} task(s) with up to {} worker(s). Logs: {}",
+        "Running {} task(s) with up to {} worker(s). Logs: {} Costs: {}",
         len(selected_tasks),
         max_workers,
         args.log_dir,
+        args.cost_dir,
     )
+    prepare_cost_dir(args.cost_dir)
 
     results_by_name: dict[str, TaskResult] = {}
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -752,6 +959,13 @@ def main() -> int:
             else:
                 logger.error("{} failed: {}", result.name, result.detail)
 
+    summary_cost_path = write_run_cost_summary(
+        selected_tasks,
+        results_by_name,
+        cost_dir=args.cost_dir,
+    )
+    logger.info("Token cost reports saved to {}", args.cost_dir)
+    logger.info("Total token usage saved to {}", summary_cost_path)
     return summarize_results(selected_tasks, results_by_name)
 
 

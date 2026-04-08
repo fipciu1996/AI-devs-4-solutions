@@ -27,6 +27,7 @@ from devs_utilities.openrouter import (
     OpenRouterError,
     ToolCall,
 )
+from devs_utilities.prompts import load_prompt_text
 from devs_utilities.repo_env import (
     get_course_api_key,
     get_env,
@@ -61,21 +62,7 @@ ApiCommand = Literal["start", "reset", "left", "wait", "right"]
 Direction = Literal["up", "down"]
 
 ACTION_PRIORITY: tuple[MoveCommand, ...] = ("right", "wait", "left")
-MODEL_SYSTEM_PROMPT = """You are the reasoning module for a reactor-navigation robot.
-
-Goal:
-- move the robot from column 1 to column 7 on the bottom lane
-- never choose a move that can lead to an immediate collision
-- prefer progress toward the goal and avoid unnecessary backtracking
-
-Rules:
-- Blocks move exactly one step after every command.
-- You will receive only safe candidate moves.
-- Use tool calling before the final answer.
-- Choose the best candidate move for this turn.
-- Return valid JSON only, following the provided schema.
-- Keep the reason short and concrete.
-"""
+MODEL_SYSTEM_PROMPT = load_prompt_text(__file__, "system_prompt.txt")
 MODEL_MAX_STEPS = 4
 
 

@@ -21,6 +21,7 @@ from devs_utilities.openrouter import (
     OpenRouterError,
     ToolCall,
 )
+from devs_utilities.prompts import load_prompt_text
 from devs_utilities.repo_env import (
     get_env,
     get_int_env,
@@ -46,6 +47,7 @@ DEFAULT_SYSTEM_PROMPT_FILE = get_env(
 OPENROUTER_TIMEOUT_SECONDS = get_int_env("OPENROUTER_TIMEOUT_SECONDS", 120) or 120
 MODEL_MAX_STEPS = 4
 SENDIT_DIR = Path(__file__).resolve().parent
+DRAFT_TOOL_SYSTEM_PROMPT = load_prompt_text(__file__, "draft_tool_system_prompt.txt")
 
 
 def parse_args() -> argparse.Namespace:
@@ -317,10 +319,7 @@ def build_draft_with_tool_calling(
     messages: list[dict[str, Any]] = [
         {
             "role": "system",
-            "content": (
-                "Budujesz roboczy draft deklaracji. "
-                "Użyj tool callingu przed finalną odpowiedzią i zwróć tylko JSON."
-            ),
+            "content": DRAFT_TOOL_SYSTEM_PROMPT,
         },
         {
             "role": "user",

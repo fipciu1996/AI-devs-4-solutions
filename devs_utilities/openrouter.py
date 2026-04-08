@@ -42,8 +42,15 @@ def build_task_site_name(source_path: str | Path, *, task_name: str | None = Non
 def build_task_usage_output_path(source_path: str | Path, *, task_name: str | None = None) -> Path:
     """Build the standard per-task OpenRouter usage report path."""
 
+    explicit_output_path = get_optional_env("OPENROUTER_USAGE_OUTPUT_PATH")
+    if explicit_output_path:
+        return Path(explicit_output_path).resolve()
+
     task_dir = Path(source_path).resolve().parent
-    normalized_task_name = (task_name or "").strip()
+    normalized_task_name = (
+        get_optional_env("OPENROUTER_USAGE_TASK_NAME")
+        or (task_name or "").strip()
+    )
     if not normalized_task_name or normalized_task_name == task_dir.name:
         return task_dir / "openrouter_usage.json"
     return task_dir / f"openrouter_usage_{normalized_task_name}.json"
@@ -68,6 +75,11 @@ def build_task_openrouter_client(
 ) -> "OpenRouterClient":
     """Create a task-scoped OpenRouter client with standard headers."""
 
+    usage_task_name = (
+        get_optional_env("OPENROUTER_USAGE_TASK_NAME")
+        or (task_name or "").strip()
+        or Path(source_path).resolve().parent.name
+    )
     return OpenRouterClient(
         OpenRouterConfig(
             api_key=api_key,
@@ -77,7 +89,7 @@ def build_task_openrouter_client(
             site_url=site_url if site_url is not None else get_default_openrouter_site_url(),
             site_name=site_name if site_name is not None else build_task_site_name(source_path, task_name=task_name),
             usage_output_path=build_task_usage_output_path(source_path, task_name=task_name),
-            usage_task_name=(task_name or "").strip() or Path(source_path).resolve().parent.name,
+            usage_task_name=usage_task_name,
         )
     )
 
@@ -123,6 +135,17 @@ class OpenRouterUsageSnapshot:
             "cache_write_tokens": self.cache_write_tokens,
             "total_tokens": self.total_tokens,
         }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any]) -> "OpenRouterUsageSnapshot":
+        return cls(
+            input_tokens=_coerce_int(payload.get("input_tokens")),
+            output_tokens=_coerce_int(payload.get("output_tokens")),
+            cached_tokens=_coerce_int(payload.get("cached_tokens")),
+            reasoning_tokens=_coerce_int(payload.get("reasoning_tokens")),
+            cache_write_tokens=_coerce_int(payload.get("cache_write_tokens")),
+            total_tokens=_coerce_int(payload.get("total_tokens")),
+        )
 
 
 def _coerce_int(value: Any) -> int:
@@ -185,7 +208,29 @@ class _UsageTracker:
         self.task_name = task_name or output_path.parent.name
         self._calls: list[dict[str, Any]] = []
         self._by_model: dict[str, OpenRouterUsageSnapshot] = {}
+        self._load_existing()
         self._write()
+
+    def _load_existing(self) -> None:
+        if not self.output_path.exists():
+            return
+        try:
+            payload = json.loads(self.output_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        if not isinstance(payload, dict):
+            return
+
+        raw_calls = payload.get("calls")
+        if isinstance(raw_calls, list):
+            self._calls = [item for item in raw_calls if isinstance(item, dict)]
+
+        raw_usage_by_model = payload.get("usage_by_model")
+        if isinstance(raw_usage_by_model, dict):
+            for model_name, raw_snapshot in raw_usage_by_model.items():
+                if not isinstance(model_name, str) or not isinstance(raw_snapshot, dict):
+                    continue
+                self._by_model[model_name] = OpenRouterUsageSnapshot.from_dict(raw_snapshot)
 
     def record(self, *, payload: dict[str, Any], configured_model: str) -> None:
         snapshot = extract_usage_snapshot(payload)
@@ -232,6 +277,7 @@ class _UsageTracker:
         return totals
 
     def _write(self) -> None:
+        self.output_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "task": self.task_name,
             "request_count": len(self._calls),
