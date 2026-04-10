@@ -5,6 +5,7 @@ from __future__ import annotations
 import unittest
 from unittest.mock import patch
 
+from devs_utilities.ag3nts import build_ag3nts_api_url
 from devs_utilities.http import HttpRequestError
 from savethem.solve_savethem import (
     Position,
@@ -69,7 +70,7 @@ class SaveThemRouteTests(unittest.TestCase):
             attempts["count"] += 1
             if attempts["count"] == 1:
                 raise HttpRequestError(
-                    url="https://example.invalid/api/wehicles",
+                    url=build_ag3nts_api_url("wehicles"),
                     message="HTTP 429",
                     status_code=429,
                     body='{"code":-9999,"message":"Za często"}',

@@ -15,15 +15,32 @@ AG3NTS_BASE_URL = get_env("AG3NTS_BASE_URL").rstrip("/")
 if not AG3NTS_BASE_URL:
     raise RuntimeError("Missing AG3NTS_BASE_URL in the repository .env file.")
 
-AG3NTS_VERIFY_URL = f"{AG3NTS_BASE_URL}/verify"
-AG3NTS_LOCATION_URL = f"{AG3NTS_BASE_URL}/location"
-AG3NTS_ACCESS_LEVEL_URL = f"{AG3NTS_BASE_URL}/accesslevel"
-AG3NTS_TASK_DATA_BASE_URL = f"{AG3NTS_BASE_URL}/data"
-AG3NTS_PUBLIC_DATA_BASE_URL = f"{AG3NTS_BASE_URL}/dane"
-AG3NTS_SHELL_URL = f"{AG3NTS_BASE_URL}/api/shell"
-AG3NTS_ZMAIL_URL = f"{AG3NTS_BASE_URL}/api/zmail"
+
+def build_ag3nts_url(resource_path: str) -> str:
+    """Build an absolute AG3NTS URL under the configured base host."""
+
+    normalized_resource = resource_path.strip().lstrip("/")
+    return f"{AG3NTS_BASE_URL}/{normalized_resource}"
+
+
+def build_ag3nts_api_url(resource_path: str) -> str:
+    """Build an AG3NTS API URL under `/api/...`."""
+
+    normalized_resource = resource_path.strip().lstrip("/")
+    return f"{AG3NTS_API_BASE_URL}/{normalized_resource}"
+
+
+AG3NTS_API_BASE_URL = build_ag3nts_url("api")
+AG3NTS_VERIFY_URL = build_ag3nts_url("verify")
+AG3NTS_LOCATION_URL = build_ag3nts_url("location")
+AG3NTS_ACCESS_LEVEL_URL = build_ag3nts_url("accesslevel")
+AG3NTS_TASK_DATA_BASE_URL = build_ag3nts_url("data")
+AG3NTS_PUBLIC_DATA_BASE_URL = build_ag3nts_url("dane")
+AG3NTS_TIMETRAVEL_PREVIEW_URL = build_ag3nts_url("timetravel_preview")
+AG3NTS_SHELL_URL = build_ag3nts_api_url("shell")
+AG3NTS_ZMAIL_URL = build_ag3nts_api_url("zmail")
 AG3NTS_RAILWAY_URL = AG3NTS_VERIFY_URL
-AG3NTS_PACKAGES_URL = f"{AG3NTS_BASE_URL}/packages"
+AG3NTS_PACKAGES_URL = build_ag3nts_url("packages")
 
 
 def build_ag3nts_task_data_url(api_key: str, resource_name: str) -> str:

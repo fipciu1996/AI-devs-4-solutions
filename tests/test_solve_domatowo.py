@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 
+from devs_utilities.ag3nts import build_ag3nts_public_data_url
 from domatowo.solve_domatowo import (
     MapState,
     build_clusters,
@@ -97,7 +98,10 @@ class DomatowoSolverTests(unittest.TestCase):
         clue = parse_church_clue(self.CHURCH_CLUE_MESSAGE)
         self.assertIn("Jak mia", clue["decoded_message"])
         self.assertEqual("Jak mia\u0142 na imie go\u015b\u0107 od Vigen\u00e8re?", clue["question"])
-        self.assertEqual("https://example.invalid/dane/azazel_secret.mp4", clue["media_url"])
+        self.assertEqual(
+            build_ag3nts_public_data_url("azazel_secret.mp4"),
+            clue["media_url"],
+        )
 
     def test_resolve_side_secret_answer_matches_corrected_hash(self) -> None:
         self.assertEqual("plane", resolve_side_secret_answer(SIDE_SECRET_HASH))

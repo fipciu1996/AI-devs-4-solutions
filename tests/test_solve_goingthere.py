@@ -4,6 +4,7 @@ import json
 import unittest
 from unittest.mock import patch
 
+from devs_utilities.ag3nts import AG3NTS_VERIFY_URL, build_ag3nts_api_url
 from devs_utilities.http import HttpRequestError
 from devs_utilities.openrouter import ChatCompletionResult, ToolCall
 from goingthere.solve_goingthere import (
@@ -122,8 +123,8 @@ class SolveGoingThereTests(unittest.TestCase):
         self.assertIn("If two directions are safe, prefer the move", prompt)
 
     def test_should_apply_hub_spacing_only_for_hub_host(self) -> None:
-        self.assertTrue(should_apply_hub_spacing("https://example.invalid/api/getmessage"))
-        self.assertTrue(should_apply_hub_spacing("https://example.invalid/verify"))
+        self.assertTrue(should_apply_hub_spacing(build_ag3nts_api_url("getmessage")))
+        self.assertTrue(should_apply_hub_spacing(AG3NTS_VERIFY_URL))
         self.assertFalse(
             should_apply_hub_spacing("https://openrouter.ai/api/v1/chat/completions")
         )
@@ -283,7 +284,7 @@ class SolveGoingThereTests(unittest.TestCase):
     def test_ensure_safe_to_move_turns_trap_crash_into_game_loss(self) -> None:
         trap = RadarTrap(frequency=411, detection_code="abc")
         crash_error = HttpRequestError(
-            url="https://example.invalid/api/frequencyScanner",
+            url=build_ag3nts_api_url("frequencyScanner"),
             message="boom",
             status_code=400,
             body=json.dumps(

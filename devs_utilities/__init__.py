@@ -11,6 +11,7 @@ from typing import Any
 
 _EXPORTS: dict[str, tuple[str, str]] = {
     "AG3NTS_ACCESS_LEVEL_URL": ("devs_utilities.ag3nts", "AG3NTS_ACCESS_LEVEL_URL"),
+    "AG3NTS_API_BASE_URL": ("devs_utilities.ag3nts", "AG3NTS_API_BASE_URL"),
     "AG3NTS_BASE_URL": ("devs_utilities.ag3nts", "AG3NTS_BASE_URL"),
     "AG3NTS_LOCATION_URL": ("devs_utilities.ag3nts", "AG3NTS_LOCATION_URL"),
     "AG3NTS_PACKAGES_URL": ("devs_utilities.ag3nts", "AG3NTS_PACKAGES_URL"),
@@ -18,6 +19,10 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     "AG3NTS_RAILWAY_URL": ("devs_utilities.ag3nts", "AG3NTS_RAILWAY_URL"),
     "AG3NTS_SHELL_URL": ("devs_utilities.ag3nts", "AG3NTS_SHELL_URL"),
     "AG3NTS_TASK_DATA_BASE_URL": ("devs_utilities.ag3nts", "AG3NTS_TASK_DATA_BASE_URL"),
+    "AG3NTS_TIMETRAVEL_PREVIEW_URL": (
+        "devs_utilities.ag3nts",
+        "AG3NTS_TIMETRAVEL_PREVIEW_URL",
+    ),
     "AG3NTS_VERIFY_URL": ("devs_utilities.ag3nts", "AG3NTS_VERIFY_URL"),
     "AG3NTS_ZMAIL_URL": ("devs_utilities.ag3nts", "AG3NTS_ZMAIL_URL"),
     "ChatCompletionResult": ("devs_utilities.openrouter", "ChatCompletionResult"),
@@ -30,8 +35,10 @@ _EXPORTS: dict[str, tuple[str, str]] = {
     "build_task_openrouter_client": ("devs_utilities.openrouter", "build_task_openrouter_client"),
     "build_task_site_name": ("devs_utilities.openrouter", "build_task_site_name"),
     "get_default_openrouter_site_url": ("devs_utilities.openrouter", "get_default_openrouter_site_url"),
+    "build_ag3nts_api_url": ("devs_utilities.ag3nts", "build_ag3nts_api_url"),
     "build_ag3nts_public_data_url": ("devs_utilities.ag3nts", "build_ag3nts_public_data_url"),
     "build_ag3nts_task_data_url": ("devs_utilities.ag3nts", "build_ag3nts_task_data_url"),
+    "build_ag3nts_url": ("devs_utilities.ag3nts", "build_ag3nts_url"),
     "build_task_answer_payload": ("devs_utilities.ag3nts", "build_task_answer_payload"),
     "configure_logging": ("devs_utilities.logging", "configure_logging"),
     "extract_completion_result": ("devs_utilities.openrouter", "extract_completion_result"),
