@@ -16,6 +16,7 @@ from shellaccess.solve_shellaccess import (
     build_answer_command,
     execute_tool_call,
     build_tool_handlers,
+    is_retryable_completion_error,
     split_shell_segments,
     validate_remote_command,
 )
@@ -38,6 +39,14 @@ def make_config() -> AppConfig:
 
 
 class ShellAccessHelpersTests(unittest.TestCase):
+    def test_retryable_completion_error_detects_malformed_tool_call(self) -> None:
+        self.assertTrue(
+            is_retryable_completion_error(
+                RuntimeError("OpenRouter tool call arguments for search_time_logs are not valid JSON.")
+            )
+        )
+        self.assertFalse(is_retryable_completion_error(RuntimeError("invalid answer")))
+
     def test_build_answer_command_preserves_unicode_and_format(self) -> None:
         command = build_answer_command(
             {
@@ -140,6 +149,24 @@ class ToolHandlerTests(unittest.TestCase):
 
         self.assertEqual(message["role"], "tool")
         self.assertIn("Invalid shell syntax", message["content"])
+
+    def test_execute_tool_call_returns_error_payload_when_required_argument_is_missing(self) -> None:
+        state = AgentState()
+
+        class FakeVerifyClient:
+            def submit_answer(self, **_kwargs):
+                return {"code": 0, "message": "ok"}
+
+            def execute_command(self, _command: str):
+                return {"code": 0, "message": "ok"}
+
+        handlers = build_tool_handlers(verify_client=FakeVerifyClient(), state=state)
+        tool_call = ToolCall(id="call_2", name="get_location_name", arguments={})
+
+        message = execute_tool_call(tool_call, handlers, show_tool_results=False)
+
+        self.assertEqual(message["role"], "tool")
+        self.assertIn("location_id is required", message["content"])
 
 
 if __name__ == "__main__":

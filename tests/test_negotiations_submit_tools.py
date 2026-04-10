@@ -34,6 +34,20 @@ class NegotiationsSubmitToolsArgTests(unittest.TestCase):
         self.assertEqual(kwargs["authtoken"], "token")
         self.assertEqual(kwargs["domain"], "example.ngrok.app")
 
+    def test_close_listener_ignores_missing_event_loop_runtime_error(self) -> None:
+        class Listener:
+            def close(self) -> None:
+                raise RuntimeError("no running event loop")
+
+        submit_tools.close_listener(Listener())
+
+    def test_close_listener_ignores_other_cleanup_errors(self) -> None:
+        class Listener:
+            def close(self) -> None:
+                raise RuntimeError("listener already closed")
+
+        submit_tools.close_listener(Listener())
+
 
 if __name__ == "__main__":
     unittest.main()

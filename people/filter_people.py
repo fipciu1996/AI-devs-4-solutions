@@ -6,6 +6,7 @@ import argparse
 import csv
 import json
 import sys
+import unicodedata
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -79,6 +80,19 @@ CSV_COLUMNS = {
 }
 MODEL_MAX_STEPS = 4
 FILTER_SYSTEM_PROMPT = load_prompt_text(__file__, "filter_system_prompt.txt")
+TRANSPORT_JOB_KEYWORDS = (
+    "transport",
+    "kierow",
+    "kurier",
+    "logist",
+    "spedy",
+    "dyspozytor",
+    "przewoz",
+    "dostaw",
+    "motornicz",
+    "maszynist",
+    "konduktor",
+)
 
 
 @dataclass(slots=True)
@@ -289,6 +303,22 @@ def build_llm_prompt(batch: list[Person]) -> str:
     )
 
 
+def build_plain_json_prompt(
+    batch: list[Person],
+    *,
+    previous_error: str | None = None,
+) -> str:
+    prompt = (
+        f"{build_llm_prompt(batch)}\n\n"
+        'Zwróć wyłącznie poprawny JSON w formacie '
+        '{"results":[{"row_id":123,"tags":["transport"]}]}. '
+        "Uwzględnij każdy row_id dokładnie raz."
+    )
+    if previous_error:
+        prompt = f"{prompt}\nPoprzednia odpowiedź była niepoprawna: {previous_error}"
+    return prompt
+
+
 PEOPLE_FILTER_TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
@@ -468,7 +498,114 @@ def classify_jobs(
                 }
             )
             continue
-    raise OpenRouterError("OpenRouter tool calling did not finish for people.filter.")
+    logger.warning(
+        "OpenRouter tool calling did not finish for people.filter. Falling back to plain JSON mode."
+    )
+    return classify_jobs_without_tools(batch, openrouter_client)
+
+
+def classify_jobs_without_tools(
+    batch: list[Person],
+    openrouter_client: OpenRouterClient,
+) -> dict[int, list[str]]:
+    messages: list[dict[str, Any]] = [
+        {
+            "role": "system",
+            "content": FILTER_SYSTEM_PROMPT,
+        },
+        {
+            "role": "user",
+            "content": build_plain_json_prompt(batch),
+        },
+    ]
+    last_error: str | None = None
+    for _ in range(2):
+        completion = openrouter_client.create_completion(messages)
+        raw_text = str(completion.content or "").strip()
+        if not raw_text:
+            last_error = "Model classification payload was empty."
+        else:
+            try:
+                return parse_classification_result(raw_text)
+            except (OpenRouterError, KeyError, TypeError, ValueError) as exc:
+                last_error = str(exc)
+        messages.append({"role": "assistant", "content": raw_text})
+        messages.append(
+            {
+                "role": "user",
+                "content": build_plain_json_prompt(batch, previous_error=last_error),
+            }
+        )
+    raise OpenRouterError(
+        "OpenRouter plain JSON fallback did not produce a valid people.filter response."
+    )
+
+
+def infer_tags_from_job_title(job: str) -> list[str]:
+    normalized = unicodedata.normalize("NFKD", job).casefold()
+    normalized = "".join(char for char in normalized if not unicodedata.combining(char))
+    if any(keyword in normalized for keyword in TRANSPORT_JOB_KEYWORDS):
+        return ["transport"]
+    return []
+
+
+def classify_batch_with_retries(
+    batch: list[Person],
+    config: AppConfig,
+    openrouter_client: OpenRouterClient,
+) -> dict[int, list[str]]:
+    try:
+        tags_by_row_id = classify_jobs(batch, config, openrouter_client)
+    except OpenRouterError as exc:
+        if len(batch) == 1:
+            person = batch[0]
+            inferred_tags = infer_tags_from_job_title(person.job)
+            logger.warning(
+                "Model nie sklasyfikował row_id {} po fallbackach. Używam lokalnego fallbacku na podstawie zawodu: {} -> {} ({})",
+                person.row_id,
+                person.job,
+                inferred_tags,
+                exc,
+            )
+            return {person.row_id: inferred_tags}
+
+        logger.warning(
+            "Model nie sklasyfikował partii row_id {}. Dzielę partię na mniejsze po błędzie: {}",
+            ", ".join(str(person.row_id) for person in batch),
+            exc,
+        )
+        tags_by_row_id = {}
+        next_batch_size = max(1, len(batch) // 2)
+        for sub_batch in chunked(batch, next_batch_size):
+            tags_by_row_id.update(classify_batch_with_retries(sub_batch, config, openrouter_client))
+        return tags_by_row_id
+
+    missing_ids = {person.row_id for person in batch} - set(tags_by_row_id)
+    if not missing_ids:
+        return tags_by_row_id
+
+    missing_display = ", ".join(str(item) for item in sorted(missing_ids))
+    if len(batch) == 1:
+        person = batch[0]
+        inferred_tags = infer_tags_from_job_title(person.job)
+        logger.warning(
+            "Model pominął row_id {}. Używam lokalnego fallbacku na podstawie zawodu: {} -> {}",
+            person.row_id,
+            person.job,
+            inferred_tags,
+        )
+        tags_by_row_id[person.row_id] = inferred_tags
+        return tags_by_row_id
+
+    logger.warning(
+        "Model nie zwrócił tagów dla row_id: {}. Ponawiam brakujące rekordy w mniejszych partiach.",
+        missing_display,
+    )
+    missing_people = [person for person in batch if person.row_id in missing_ids]
+    next_batch_size = max(1, len(missing_people) // 2)
+    for sub_batch in chunked(missing_people, next_batch_size):
+        tags_by_row_id.update(classify_batch_with_retries(sub_batch, config, openrouter_client))
+    return tags_by_row_id
 
 
 def classify_all(
@@ -478,7 +615,7 @@ def classify_all(
 ) -> dict[int, list[str]]:
     tags_by_row_id: dict[int, list[str]] = {}
     for batch in chunked(candidates, config.batch_size):
-        tags_by_row_id.update(classify_jobs(batch, config, openrouter_client))
+        tags_by_row_id.update(classify_batch_with_retries(batch, config, openrouter_client))
     missing_ids = {person.row_id for person in candidates} - set(tags_by_row_id)
     if missing_ids:
         missing_display = ", ".join(str(item) for item in sorted(missing_ids))
@@ -492,6 +629,7 @@ def build_answer(candidates: list[Person], tags_by_row_id: dict[int, list[str]])
         tags = tags_by_row_id[person.row_id]
         if "transport" not in tags:
             continue
+        answer_tags = ["transport"]
         answer.append(
             {
                 "name": person.name,
@@ -499,7 +637,7 @@ def build_answer(candidates: list[Person], tags_by_row_id: dict[int, list[str]])
                 "gender": person.gender,
                 "born": person.birth_year,
                 "city": person.birth_place,
-                "tags": tags,
+                "tags": answer_tags,
             }
         )
     return answer

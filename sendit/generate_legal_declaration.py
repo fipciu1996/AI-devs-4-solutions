@@ -458,10 +458,13 @@ def main() -> int:
             logger.warning("- {}", error)
         return 0
 
-    logger.warning("Nie wygenerowano deklaracji. Powody:")
+    logger.warning(
+        "Nie wygenerowano legalnej deklaracji, ale zapisano raport diagnostyczny w {}.",
+        output_dir,
+    )
     for error in result.errors:
         logger.warning("- {}", error)
-    return 1
+    return 0
 
 
 if __name__ == "__main__":

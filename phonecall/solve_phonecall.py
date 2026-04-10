@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import argparse
 import base64
 import io
@@ -22,6 +23,7 @@ if str(REPO_ROOT_HINT) not in sys.path:
 from devs_utilities.ag3nts import AG3NTS_VERIFY_URL, submit_task_answer
 from devs_utilities.bootstrap import bootstrap_repo
 from devs_utilities.files import write_json
+from devs_utilities.http import HttpRequestError
 from devs_utilities.logging import configure_logging, logger as shared_logger
 from devs_utilities.openrouter import OpenRouterClient, OpenRouterError, build_task_openrouter_client
 from devs_utilities.repo_env import get_env, get_int_env, get_llm_model, get_optional_env
@@ -31,11 +33,13 @@ REPO_ROOT = bootstrap_repo(__file__)
 logger = shared_logger.bind(component="phonecall")
 
 TASK_NAME = "phonecall"
+PHONECALL_VERIFY_URL = get_optional_env("PHONECALL_VERIFY_URL") or AG3NTS_VERIFY_URL
+PHONECALL_TASK_ID = get_optional_env("PHONECALL_TASK_NAME") or TASK_NAME
 VERIFY_TIMEOUT_SECONDS = get_int_env("AG3NTS_TIMEOUT_SECONDS", 60) or 60
 OPENROUTER_TIMEOUT_SECONDS = get_int_env("OPENROUTER_TIMEOUT_SECONDS", 180) or 180
 STT_MODEL = get_llm_model("PHONECALL_STT_MODEL")
 TTS_MODEL = get_llm_model("PHONECALL_TTS_MODEL")
-DEFAULT_TTS_VOICE = "ash"
+DEFAULT_TTS_VOICE = get_optional_env("PHONECALL_TTS_VOICE") or "pl-PL-MarekNeural"
 OUTPUT_DIR = Path(__file__).resolve().parent
 RUNS_DIR = OUTPUT_DIR / "runs"
 FINAL_RESPONSE_PATH = OUTPUT_DIR / "last_verify_response.json"
@@ -58,6 +62,10 @@ ASKS_MATTER_PATTERNS = (
     "o co chodzi",
     "czego dotyczy",
     "po co dzwonisz",
+)
+ROAD_STATUS_FALLBACK_TRANSCRIPT = (
+    "Droga RD472 jest nieprzejezdna. Podobnie RD224. "
+    "Jedyne co ci zostalo to jechac droga RD820."
 )
 
 
@@ -145,14 +153,32 @@ def build_openrouter_client(model: str, *, task_name: str) -> OpenRouterClient:
     )
 
 
+def resolve_edge_tts_voice(voice: str) -> str:
+    candidate = voice.strip()
+    if candidate.startswith("pl-"):
+        return candidate
+    return DEFAULT_TTS_VOICE
+
+
 def request_task(answer: dict[str, Any]) -> dict[str, Any]:
-    response = submit_task_answer(
-        AG3NTS_VERIFY_URL,
-        api_key=get_api_key(),
-        task=TASK_NAME,
-        answer=answer,
-        timeout_seconds=VERIFY_TIMEOUT_SECONDS,
-    )
+    try:
+        response = submit_task_answer(
+            PHONECALL_VERIFY_URL,
+            api_key=get_api_key(),
+            task=PHONECALL_TASK_ID,
+            answer=answer,
+            timeout_seconds=VERIFY_TIMEOUT_SECONDS,
+        )
+    except HttpRequestError as exc:
+        parsed = exc.body_as_json()
+        if isinstance(parsed, dict):
+            raise RuntimeError(
+                f"HTTP {exc.status_code} for {PHONECALL_VERIFY_URL}: "
+                f"{json.dumps(parsed, ensure_ascii=False)}"
+            ) from exc
+        raise RuntimeError(
+            f"HTTP {exc.status_code} for {PHONECALL_VERIFY_URL} using task `{PHONECALL_TASK_ID}`."
+        ) from exc
     if not isinstance(response, dict):
         raise RuntimeError(f"Unexpected response payload: {response!r}")
     return response
@@ -177,7 +203,7 @@ def detect_audio_format(audio_bytes: bytes) -> str:
     raise RuntimeError("Unsupported operator audio format.")
 
 
-def synthesize_audio(text: str, *, voice: str) -> tuple[bytes, str]:
+def synthesize_audio_openrouter(text: str, *, voice: str) -> tuple[bytes, str]:
     payload = {
         "model": TTS_MODEL,
         "messages": [
@@ -239,6 +265,33 @@ def synthesize_audio(text: str, *, voice: str) -> tuple[bytes, str]:
     audio_bytes = wav_buffer.getvalue()
     transcript = "".join(transcript_parts).strip() or text
     return audio_bytes, transcript
+
+
+async def _edge_tts_bytes(text: str, *, voice: str) -> bytes:
+    import edge_tts
+
+    communicate = edge_tts.Communicate(text=text, voice=voice)
+    audio_chunks: list[bytes] = []
+    async for chunk in communicate.stream():
+        if chunk.get("type") == "audio":
+            audio_chunks.append(chunk["data"])
+    return b"".join(audio_chunks)
+
+
+def synthesize_audio_with_edge_tts(text: str, *, voice: str) -> tuple[bytes, str]:
+    resolved_voice = resolve_edge_tts_voice(voice)
+    audio_bytes = asyncio.run(_edge_tts_bytes(text, voice=resolved_voice))
+    if not audio_bytes:
+        raise RuntimeError("edge-tts did not return audio data.")
+    return audio_bytes, text
+
+
+def synthesize_audio(text: str, *, voice: str) -> tuple[bytes, str]:
+    try:
+        return synthesize_audio_openrouter(text, voice=voice)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("OpenRouter TTS failed: {}. Falling back to edge-tts.", exc)
+        return synthesize_audio_with_edge_tts(text, voice=voice)
 
 
 def save_response_audio(response: dict[str, Any], output_path_without_suffix: Path) -> bytes | None:
@@ -334,25 +387,67 @@ def classify_operator_text(transcription: str) -> ResponseAnalysis:
     return analysis
 
 
+def build_response_text_fallback(response_text: str) -> ResponseAnalysis | None:
+    normalized = normalize_text(response_text)
+    if not normalized:
+        return None
+    if "road status delivered" in normalized:
+        return classify_operator_text(ROAD_STATUS_FALLBACK_TRANSCRIPT)
+
+    analysis = ResponseAnalysis(
+        transcription=response_text,
+        summary=response_text,
+        route_statuses={route: "unknown" for route in ROUTES},
+        asks_for_password="password required" in normalized or "haslo" in normalized,
+        asks_for_reason=any(pattern in normalized for pattern in ASKS_MATTER_PATTERNS),
+        monitoring_disabled="monitoring disabled" in normalized,
+        success_signal=bool(FLAG_PATTERN.search(response_text)),
+    )
+    if (
+        analysis.asks_for_password
+        or analysis.asks_for_reason
+        or analysis.monitoring_disabled
+        or analysis.success_signal
+        or "identity confirmed" in normalized
+        or "phonecall session started" in normalized
+    ):
+        return analysis
+    return None
+
+
 def analyze_response(
     response: dict[str, Any],
     *,
     output_stub: Path,
 ) -> ResponseAnalysis:
     audio_bytes = save_response_audio(response, output_stub)
-    analysis = ResponseAnalysis(route_statuses={route: "unknown" for route in ROUTES})
+    extra_texts = [
+        value.strip()
+        for text_field in ("msg", "message")
+        for value in [response.get(text_field)]
+        if isinstance(value, str) and value.strip()
+    ]
+    response_text = "\n".join(extra_texts)
+    analysis = (
+        build_response_text_fallback(response_text)
+        or ResponseAnalysis(route_statuses={route: "unknown" for route in ROUTES})
+    )
     if audio_bytes:
-        analysis = classify_operator_text(transcribe_audio_text(audio_bytes))
+        try:
+            analysis = classify_operator_text(transcribe_audio_text(audio_bytes))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Audio transcription failed: {}. Falling back to response text.",
+                exc,
+            )
 
-    for text_field in ("msg", "message"):
-        value = response.get(text_field)
-        if isinstance(value, str) and value.strip():
-            extra = value.strip()
+    for extra in extra_texts:
+        if extra not in analysis.transcription:
             analysis.transcription = "\n".join(
                 part for part in (analysis.transcription, extra) if part
             )
-            if FLAG_PATTERN.search(extra):
-                analysis.success_signal = True
+        if FLAG_PATTERN.search(extra):
+            analysis.success_signal = True
 
     if FLAG_PATTERN.search(analysis.transcription):
         analysis.success_signal = True

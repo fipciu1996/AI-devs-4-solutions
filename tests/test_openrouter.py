@@ -131,6 +131,39 @@ class OpenRouterParsingTests(unittest.TestCase):
 
         self.assertEqual(result[0].arguments, {"page": "incydenty", "id": "abc"})
 
+    def test_extract_tool_calls_parses_loose_scalar_assignments(self) -> None:
+        result = extract_tool_calls(
+            [
+                {
+                    "id": "call_1",
+                    "function": {
+                        "name": "submit_answer",
+                        "arguments": (
+                            "date=2024-11-12, city=Grudziądz, "
+                            "longitude=18.968774, latitude=53.432303"
+                        ),
+                    },
+                }
+            ]
+        )
+
+        self.assertEqual(
+            result[0].arguments,
+            {
+                "date": "2024-11-12",
+                "city": "Grudziądz",
+                "longitude": 18.968774,
+                "latitude": 53.432303,
+            },
+        )
+
+    def test_parse_json_object_content_extracts_embedded_object(self) -> None:
+        payload = openrouter_module.parse_json_object_content(
+            'Use this payload:\n{"date":"2024-11-12","city":"Grudziądz"}'
+        )
+
+        self.assertEqual(payload["city"], "Grudziądz")
+
     def test_extract_tool_calls_sanitizes_tool_name_noise(self) -> None:
         result = extract_tool_calls(
             [

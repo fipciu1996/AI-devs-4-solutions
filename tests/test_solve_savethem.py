@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
+from devs_utilities.http import HttpRequestError
 from savethem.solve_savethem import (
     Position,
     PreviewState,
     VehicleSpec,
     find_best_route,
+    with_ag3nts_retry,
 )
 
 
@@ -58,6 +61,26 @@ class SaveThemRouteTests(unittest.TestCase):
                 "right",
             ],
         )
+
+    def test_with_ag3nts_retry_retries_transient_http_error(self) -> None:
+        attempts = {"count": 0}
+
+        def flaky_call():
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                raise HttpRequestError(
+                    url="https://example.invalid/api/wehicles",
+                    message="HTTP 429",
+                    status_code=429,
+                    body='{"code":-9999,"message":"Za często"}',
+                )
+            return {"ok": True}
+
+        with patch("savethem.solve_savethem.time.sleep"):
+            result = with_ag3nts_retry("vehicle lookup", flaky_call)
+
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(attempts["count"], 2)
 
 
 if __name__ == "__main__":

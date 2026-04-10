@@ -257,7 +257,13 @@ def close_listener(listener: object) -> None:
 
     close = getattr(listener, "close", None)
     if callable(close):
-        close()
+        try:
+            close()
+        except Exception as exc:  # noqa: BLE001
+            detail = str(exc).casefold()
+            if "no running event loop" in detail:
+                return
+            print(f"Warning: ngrok listener cleanup failed: {exc}", file=sys.stderr)
 
 
 def serialize_response(response: Any) -> str:
@@ -342,12 +348,17 @@ def launched_server(args: argparse.Namespace) -> Iterator[subprocess.Popen[str] 
         )
         yield process
     finally:
-        process.terminate()
         try:
+            process.terminate()
             process.wait(timeout=5)
         except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=5)
+            try:
+                process.kill()
+                process.wait(timeout=5)
+            except Exception as exc:  # noqa: BLE001
+                print(f"Warning: negotiations server kill failed: {exc}", file=sys.stderr)
+        except Exception as exc:  # noqa: BLE001
+            print(f"Warning: negotiations server cleanup failed: {exc}", file=sys.stderr)
 
 
 @contextmanager
@@ -420,6 +431,7 @@ def main() -> int:
         return 0
 
     if args.use_ngrok:
+        exit_code = 0
         with launched_server(args):
             if not args.launch_server:
                 wait_for_server(
@@ -438,14 +450,14 @@ def main() -> int:
                     public_base_url=public_base_url,
                     tool_path=args.api_tool_path,
                 )
-                if not args.wait_for_check:
-                    return 0
-                _, completed = wait_for_check_result(
-                    api_key,
-                    interval_seconds=args.check_interval_seconds,
-                    attempts=args.check_attempts,
-                )
-                return 0 if completed else 1
+                if args.wait_for_check:
+                    _, completed = wait_for_check_result(
+                        api_key,
+                        interval_seconds=args.check_interval_seconds,
+                        attempts=args.check_attempts,
+                    )
+                    exit_code = 0 if completed else 1
+        return exit_code
 
     register_with_public_url(
         api_key,

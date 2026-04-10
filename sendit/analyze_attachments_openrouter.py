@@ -7,6 +7,7 @@ import base64
 import json
 import mimetypes
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -48,6 +49,10 @@ DEFAULT_MODEL = get_llm_model("SENDIT_MODEL")
 DEFAULT_MAX_TEXT_CHARS = get_int_env("SENDIT_ANALYZE_MAX_TEXT_CHARS", 24_000) or 24_000
 OPENROUTER_TIMEOUT_SECONDS = get_int_env("OPENROUTER_TIMEOUT_SECONDS", 120) or 120
 MODEL_MAX_STEPS = 3
+FILE_RETRY_ATTEMPTS = get_int_env("SENDIT_ANALYZE_FILE_RETRY_ATTEMPTS", 3) or 3
+FILE_RETRY_BASE_DELAY_SECONDS = float(
+    get_int_env("SENDIT_ANALYZE_FILE_RETRY_BASE_DELAY_SECONDS", 3) or 3
+)
 DEFAULT_SITE_NAME = build_task_site_name(__file__, task_name=OPENROUTER_TASK_NAME)
 TEXT_EXTENSIONS = {".md", ".txt", ".csv", ".json", ".yaml", ".yml"}
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
@@ -120,6 +125,11 @@ def parse_args() -> argparse.Namespace:
         "--site-name",
         default=DEFAULT_SITE_NAME,
         help="Opcjonalny naglowek X-Title dla OpenRouter.",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Wymusza ponowna analize nawet wtedy, gdy wynikowy plik juz istnieje.",
     )
     return parser.parse_args()
 
@@ -296,6 +306,26 @@ def analyze_target_with_tool_calling(
     raise OpenRouterError("OpenRouter tool calling did not finish for sendit analysis.")
 
 
+def is_retryable_analysis_error(error: Exception) -> bool:
+    """Return True when attachment analysis likely failed due to a transient upstream issue."""
+
+    lowered = str(error).casefold()
+    return any(
+        marker in lowered
+        for marker in (
+            "429",
+            "500",
+            "502",
+            "503",
+            "504",
+            "timed out",
+            "aborted",
+            "temporarily unavailable",
+            "internal server error",
+        )
+    )
+
+
 def main() -> int:
     configure_logging(name="sendit.analyze")
     if not OPENROUTER_URL:
@@ -342,26 +372,44 @@ def main() -> int:
 
     failures = 0
     for target in targets:
+        destination = output_path_for(target, output_dir, args.format)
+        if destination.exists() and destination.stat().st_size > 0 and not args.force:
+            logger.info("SKIP  {} -> {} (wynik juz istnieje)", target.path.name, destination.name)
+            continue
         logger.info("Analizuje: {}", target.path.name)
-        try:
-            response_json = analyze_target_with_tool_calling(
-                openrouter_client,
-                target,
-                args.question,
-                args.max_text_chars,
-            )
-            destination = output_path_for(target, output_dir, args.format)
-            if args.format == "json":
-                write_json_report(destination, response_json)
-            else:
-                content = str(response_json.get("content") or "").strip()
-                if not content:
-                    raise ValueError("Nie udalo sie odczytac tresci odpowiedzi modelu.")
-                write_text_report(destination, content)
-            logger.success("Zapisano wynik do {}", destination)
-        except (RuntimeError, ValueError, OSError) as error:
-            failures += 1
-            logger.error("Nie udalo sie przeanalizowac {}: {}", target.path.name, error)
+        for attempt in range(1, FILE_RETRY_ATTEMPTS + 1):
+            try:
+                response_json = analyze_target_with_tool_calling(
+                    openrouter_client,
+                    target,
+                    args.question,
+                    args.max_text_chars,
+                )
+                if args.format == "json":
+                    write_json_report(destination, response_json)
+                else:
+                    content = str(response_json.get("content") or "").strip()
+                    if not content:
+                        raise ValueError("Nie udalo sie odczytac tresci odpowiedzi modelu.")
+                    write_text_report(destination, content)
+                logger.success("Zapisano wynik do {}", destination)
+                break
+            except (RuntimeError, ValueError, OSError) as error:
+                if attempt < FILE_RETRY_ATTEMPTS and is_retryable_analysis_error(error):
+                    delay_seconds = FILE_RETRY_BASE_DELAY_SECONDS * attempt
+                    logger.warning(
+                        "Analiza {} nie powiodla sie na probie {}/{}: {}. Ponawiam za {:.1f}s.",
+                        target.path.name,
+                        attempt,
+                        FILE_RETRY_ATTEMPTS,
+                        error,
+                        delay_seconds,
+                    )
+                    time.sleep(delay_seconds)
+                    continue
+                failures += 1
+                logger.error("Nie udalo sie przeanalizowac {}: {}", target.path.name, error)
+                break
 
     if failures:
         logger.warning("Zakonczono z {} bledami.", failures)

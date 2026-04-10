@@ -54,6 +54,7 @@ DEFAULT_API_TIMEOUT_SECONDS = (
 )
 DEFAULT_OPENROUTER_TIMEOUT_SECONDS = get_int_env("OPENROUTER_TIMEOUT_SECONDS", 120) or 120
 DEFAULT_MAX_STEPS = get_int_env("SHELLACCESS_MAX_STEPS", 18) or 18
+COMPLETION_RETRY_ATTEMPTS = get_int_env("SHELLACCESS_COMPLETION_RETRY_ATTEMPTS", 2) or 2
 
 OUTPUT_DIR = Path(__file__).resolve().parent
 LAST_ANSWER_PATH = OUTPUT_DIR / "last_answer.json"
@@ -563,6 +564,12 @@ def build_tool_handlers(
     verify_client: VerifyClient,
     state: AgentState,
 ) -> dict[str, Callable[[dict[str, Any]], dict[str, Any]]]:
+    def require_argument(arguments: dict[str, Any], key: str) -> Any:
+        value = arguments.get(key)
+        if value is None or (isinstance(value, str) and not value.strip()):
+            raise ShellAccessError(f"{key} is required for this tool call.")
+        return value
+
     def serialize_history() -> list[dict[str, Any]]:
         return [asdict(record) for record in state.command_history]
 
@@ -574,7 +581,7 @@ def build_tool_handlers(
         return result
 
     def execute_remote_command(arguments: dict[str, Any]) -> dict[str, Any]:
-        command = str(arguments["command"])
+        command = str(require_argument(arguments, "command"))
         return run_command(command)
 
     def search_time_logs(arguments: dict[str, Any]) -> dict[str, Any]:
@@ -612,7 +619,7 @@ def build_tool_handlers(
         }
 
     def get_location_name(arguments: dict[str, Any]) -> dict[str, Any]:
-        location_id = int(arguments["location_id"])
+        location_id = int(require_argument(arguments, "location_id"))
         command = f"jq -r '.[] | select(.location_id=={location_id}) | .name' /data/locations.json"
         result = run_command(command)
         output = str(result.get("output", "")).strip()
@@ -626,7 +633,7 @@ def build_tool_handlers(
         }
 
     def get_gps_entry(arguments: dict[str, Any]) -> dict[str, Any]:
-        entry_id = int(arguments["entry_id"])
+        entry_id = int(require_argument(arguments, "entry_id"))
         command = (
             f"jq -r '.[] | select(.entry_id=={entry_id}) | "
             " [.latitude,.longitude,.type,.location_id,.entry_id] | @tsv' /data/gps.json"
@@ -665,10 +672,10 @@ def build_tool_handlers(
 
     def submit_answer(arguments: dict[str, Any]) -> dict[str, Any]:
         answer = build_answer_payload(
-            date=str(arguments["date"]),
-            city=str(arguments["city"]),
-            longitude=float(arguments["longitude"]),
-            latitude=float(arguments["latitude"]),
+            date=str(require_argument(arguments, "date")),
+            city=str(require_argument(arguments, "city")),
+            longitude=float(require_argument(arguments, "longitude")),
+            latitude=float(require_argument(arguments, "latitude")),
         )
         state.last_answer = answer
         write_json(LAST_ANSWER_PATH, answer)
@@ -708,7 +715,7 @@ def execute_tool_call(
 
     try:
         result = handlers[tool_call.name](tool_call.arguments)
-    except (ShellAccessError, ValueError, TypeError) as exc:
+    except (ShellAccessError, ValueError, TypeError, KeyError) as exc:
         result = {
             "error": str(exc),
             "tool_name": tool_call.name,
@@ -767,6 +774,27 @@ def maybe_finish_from_plain_text(
     return True
 
 
+def is_retryable_completion_error(error: Exception) -> bool:
+    """Return True when the model response should be retried in-loop."""
+
+    lowered = str(error).casefold()
+    return any(
+        marker in lowered
+        for marker in (
+            "tool call arguments",
+            "tool_calls field has invalid format",
+            "returned an empty response",
+            "429",
+            "500",
+            "502",
+            "503",
+            "504",
+            "timed out",
+            "internal server error",
+        )
+    )
+
+
 def build_session_payload(
     *,
     config: AppConfig,
@@ -815,7 +843,25 @@ def run_agent(
 
     try:
         for _step in range(config.max_steps):
-            completion = openrouter_client.create_completion(messages, tools=TOOLS)
+            completion = None
+            for attempt in range(1, COMPLETION_RETRY_ATTEMPTS + 1):
+                try:
+                    completion = openrouter_client.create_completion(messages, tools=TOOLS)
+                    break
+                except OpenRouterError as exc:
+                    if attempt >= COMPLETION_RETRY_ATTEMPTS or not is_retryable_completion_error(exc):
+                        raise
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "Your previous tool call was malformed or transiently rejected. "
+                                "Retry the same step and emit only valid tool calls with strict JSON arguments."
+                            ),
+                        }
+                    )
+            if completion is None:
+                raise ShellAccessError("OpenRouter did not produce a completion.")
             assistant_message: dict[str, Any] = {
                 "role": "assistant",
                 "content": completion.content or "",

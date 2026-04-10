@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from dataclasses import dataclass
 from heapq import heappop, heappush
 from pathlib import Path
@@ -46,6 +47,9 @@ OPENROUTER_TIMEOUT_SECONDS = min(
     get_int_env("OPENROUTER_TIMEOUT_SECONDS", 120) or 120,
     20,
 )
+API_RETRY_ATTEMPTS = get_int_env("SAVETHEM_API_RETRY_ATTEMPTS", 4) or 4
+API_RETRY_BASE_DELAY_SECONDS = float(get_int_env("SAVETHEM_API_RETRY_BASE_DELAY_SECONDS", 2) or 2)
+API_RETRY_MAX_DELAY_SECONDS = float(get_int_env("SAVETHEM_API_RETRY_MAX_DELAY_SECONDS", 20) or 20)
 OUTPUT_DIR = Path(__file__).resolve().parent
 PREVIEW_PATH = OUTPUT_DIR / "last_preview_state.json"
 VERIFY_RESPONSE_PATH = OUTPUT_DIR / "last_verify_response.json"
@@ -131,12 +135,55 @@ def build_openrouter_client() -> OpenRouterClient:
     )
 
 
+def is_retryable_ag3nts_error(exc: HttpRequestError) -> bool:
+    """Return True for transient AG3NTS failures worth retrying."""
+
+    if exc.status_code in {408, 425, 429, 500, 502, 503, 504}:
+        return True
+    payload = exc.body_as_json()
+    if isinstance(payload, dict):
+        code = payload.get("code")
+        if code in {-9999, -500}:
+            return True
+    return exc.status_code is None
+
+
+def with_ag3nts_retry(action: str, operation: Any) -> Any:
+    """Retry transient AG3NTS API calls with exponential backoff."""
+
+    delay_seconds = max(0.1, API_RETRY_BASE_DELAY_SECONDS)
+    last_error: HttpRequestError | None = None
+    for attempt in range(1, API_RETRY_ATTEMPTS + 1):
+        try:
+            return operation()
+        except HttpRequestError as exc:
+            last_error = exc
+            if attempt >= API_RETRY_ATTEMPTS or not is_retryable_ag3nts_error(exc):
+                raise
+            logger.warning(
+                "{} transient failure on attempt {}/{}: {}. Retrying in {:.1f}s.",
+                action,
+                attempt,
+                API_RETRY_ATTEMPTS,
+                exc,
+                delay_seconds,
+            )
+            time.sleep(delay_seconds)
+            delay_seconds = min(API_RETRY_MAX_DELAY_SECONDS, delay_seconds * 2)
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError(f"{action} retry loop ended unexpectedly.")
+
+
 def call_tool(url: str, *, api_key: str, query: str) -> Any:
-    return post_json(
-        url,
-        {"apikey": api_key, "query": query},
-        timeout_seconds=VERIFY_TIMEOUT_SECONDS,
-        on_decode_error="raw_text",
+    return with_ag3nts_retry(
+        f"Tool call `{query}`",
+        lambda: post_json(
+            url,
+            {"apikey": api_key, "query": query},
+            timeout_seconds=VERIFY_TIMEOUT_SECONDS,
+            on_decode_error="raw_text",
+        ),
     )
 
 
@@ -190,12 +237,15 @@ def send_probe_answer(api_key: str) -> None:
 
 def fetch_preview_state(api_key: str) -> dict[str, Any]:
     body = urlencode({"key": api_key}).encode("utf-8")
-    raw = request_bytes(
-        PREVIEW_URL,
-        method="POST",
-        data=body,
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-        timeout_seconds=VERIFY_TIMEOUT_SECONDS,
+    raw = with_ag3nts_retry(
+        "Fetch preview state",
+        lambda: request_bytes(
+            PREVIEW_URL,
+            method="POST",
+            data=body,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout_seconds=VERIFY_TIMEOUT_SECONDS,
+        ),
     )
     payload = json.loads(raw.decode("utf-8"))
     if not isinstance(payload, dict):
@@ -607,11 +657,14 @@ def choose_route_with_openrouter(
 
 def submit_answer(answer: list[str], *, api_key: str) -> Any:
     payload = build_payload(answer, api_key=api_key)
-    response = post_json(
-        VERIFY_URL,
-        payload,
-        timeout_seconds=VERIFY_TIMEOUT_SECONDS,
-        on_decode_error="raw_text",
+    response = with_ag3nts_retry(
+        "Submit savethem answer",
+        lambda: post_json(
+            VERIFY_URL,
+            payload,
+            timeout_seconds=VERIFY_TIMEOUT_SECONDS,
+            on_decode_error="raw_text",
+        ),
     )
     write_json(VERIFY_RESPONSE_PATH, response)
     return response

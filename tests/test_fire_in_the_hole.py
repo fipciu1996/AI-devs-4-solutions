@@ -138,6 +138,42 @@ class FireInTheHoleFlagTests(unittest.TestCase):
             ],
         )
 
+    def test_collect_success_flags_includes_failed_pipeline_when_flag_was_logged(self) -> None:
+        tasks = [
+            type("Task", (), {"name": "people"})(),
+            type("Task", (), {"name": "reactor"})(),
+        ]
+        results_by_name = {
+            "people": TaskResult(
+                name="people",
+                status="failed",
+                duration_seconds=1.0,
+                step_count=2,
+                log_path=Path(__file__),
+            ),
+            "reactor": TaskResult(
+                name="reactor",
+                status="success",
+                duration_seconds=1.0,
+                step_count=1,
+                log_path=None,
+            ),
+        }
+
+        with patch(
+            "fire_in_the_hole.extract_task_flags",
+            side_effect=[TaskFlags("people", "{FLG:SURVIVORS}", None), None],
+        ):
+            flags = collect_success_flags(tasks, results_by_name)
+
+        self.assertEqual(
+            flags,
+            [
+                TaskFlags("people", "{FLG:SURVIVORS}", None),
+                TaskFlags("reactor", None, None),
+            ],
+        )
+
     def test_parse_args_enables_verify_by_default_and_supports_no_verify(self) -> None:
         with patch.object(sys, "argv", ["fire_in_the_hole.py"]):
             default_args = parse_args()

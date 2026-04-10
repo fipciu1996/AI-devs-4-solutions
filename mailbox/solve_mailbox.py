@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -61,6 +62,8 @@ DEFAULT_MAX_STEPS = get_int_env("MAILBOX_MAX_STEPS", 24) or 24
 DEFAULT_TOOL_PAGE_SIZE = get_int_env("MAILBOX_TOOL_PAGE_SIZE", 5) or 5
 DEFAULT_WAIT_SECONDS = get_int_env("MAILBOX_WAIT_SECONDS", 5) or 5
 MAX_WAIT_SECONDS = get_int_env("MAILBOX_MAX_WAIT_SECONDS", 30) or 30
+DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+CONFIRMATION_CODE_PATTERN = re.compile(r"^SEC-[A-Za-z0-9]{28,32}$")
 OUTPUT_DIR = Path(__file__).resolve().parent
 LAST_RESPONSE_PATH = OUTPUT_DIR / "last_verify_response.json"
 LAST_ANSWER_PATH = OUTPUT_DIR / "last_answer.json"
@@ -205,6 +208,44 @@ class ZmailClient:
 
     def get_thread(self, *, thread_id: int) -> Any:
         return self._call({"action": "getThread", "threadID": thread_id})
+
+    def get_thread_messages(self, *, thread_id: int) -> Any:
+        thread_result = self.get_thread(thread_id=thread_id)
+        items = thread_result.get("items") if isinstance(thread_result, dict) else None
+        if not isinstance(items, list):
+            return {
+                "ok": False,
+                "thread_id": thread_id,
+                "thread": thread_result,
+                "error": "Thread lookup did not return message metadata.",
+            }
+
+        message_ids = [
+            item.get("messageID")
+            for item in items
+            if isinstance(item, dict) and isinstance(item.get("messageID"), str)
+        ]
+        message_ids = [message_id for message_id in message_ids if message_id]
+        if not message_ids:
+            return {
+                "ok": False,
+                "thread_id": thread_id,
+                "thread": thread_result,
+                "error": "Thread does not expose any current messageID values.",
+            }
+
+        messages_result = self.get_messages(ids=message_ids)
+        return {
+            "ok": bool(messages_result.get("ok", True)),
+            "thread_id": thread_id,
+            "message_ids": message_ids,
+            "thread": thread_result,
+            "messages": messages_result,
+            "agent_note": (
+                "Use this tool when a thread matters. It refreshes the live thread and "
+                "immediately fetches the current messages to avoid stale messageID values."
+            ),
+        }
 
     def get_messages(self, *, ids: int | str | list[int | str]) -> Any:
         return self._call({"action": "getMessages", "ids": normalize_message_ids(ids)})
@@ -399,6 +440,27 @@ TOOLS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "get_thread_messages",
+            "description": (
+                "Refresh a live thread and immediately fetch its current full messages. "
+                "Prefer this over separate get_thread and get_messages when a thread is important."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "thread_id": {
+                        "type": "integer",
+                        "description": "Numeric thread identifier.",
+                    }
+                },
+                "required": ["thread_id"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "submit_answer",
             "description": (
                 "Submit the current candidate answer to the AG3NTS verify endpoint. "
@@ -481,8 +543,23 @@ def build_tool_handlers(
     verify_client: VerifyClient,
     state: AgentState,
 ) -> dict[str, Any]:
+    def require_argument(arguments: dict[str, Any], key: str) -> Any:
+        value = arguments.get(key)
+        if value is None or (isinstance(value, str) and not value.strip()):
+            raise MailboxError(f"{key} is required for this tool call.")
+        return value
+
     def submit_answer(arguments: dict[str, Any]) -> Any:
         answer = normalize_answer(arguments)
+        if answer["date"] and not DATE_PATTERN.fullmatch(answer["date"]):
+            raise MailboxError("date must use the YYYY-MM-DD format.")
+        if (
+            answer["confirmation_code"]
+            and not CONFIRMATION_CODE_PATTERN.fullmatch(answer["confirmation_code"])
+        ):
+            raise MailboxError(
+                "confirmation_code must match SEC- followed by 28 letters or digits."
+            )
         state.last_answer = answer
         write_json(LAST_ANSWER_PATH, answer)
         response = verify_client.submit_answer(answer)
@@ -514,17 +591,22 @@ def build_tool_handlers(
             per_page=int(args.get("per_page", DEFAULT_TOOL_PAGE_SIZE)),
         ),
         "search_messages": lambda args: zmail_client.search(
-            query=str(args["query"]),
+            query=str(require_argument(args, "query")),
             page=int(args.get("page", 1)),
             per_page=int(args.get("per_page", DEFAULT_TOOL_PAGE_SIZE)),
         ),
         "search": lambda args: zmail_client.search(
-            query=str(args["query"]),
+            query=str(require_argument(args, "query")),
             page=int(args.get("page", 1)),
             per_page=int(args.get("per_page", DEFAULT_TOOL_PAGE_SIZE)),
         ),
-        "get_thread": lambda args: zmail_client.get_thread(thread_id=int(args["thread_id"])),
-        "get_messages": lambda args: zmail_client.get_messages(ids=args["ids"]),
+        "get_thread": lambda args: zmail_client.get_thread(
+            thread_id=int(require_argument(args, "thread_id"))
+        ),
+        "get_thread_messages": lambda args: zmail_client.get_thread_messages(
+            thread_id=int(require_argument(args, "thread_id"))
+        ),
+        "get_messages": lambda args: zmail_client.get_messages(ids=require_argument(args, "ids")),
         "submit_answer": submit_answer,
         "wait_for_new_messages": wait_for_new_messages,
         "reset_zmail_counter": lambda _args: zmail_client.reset(),
@@ -540,7 +622,15 @@ def execute_tool_call(
     if tool_call.name not in handlers:
         raise MailboxError(f"Model called an unknown tool: {tool_call.name}")
 
-    result = handlers[tool_call.name](tool_call.arguments)
+    try:
+        result = handlers[tool_call.name](tool_call.arguments)
+    except Exception as exc:  # noqa: BLE001 - agent safety net
+        result = {
+            "ok": False,
+            "error": str(exc),
+            "tool_name": tool_call.name,
+            "arguments": tool_call.arguments,
+        }
     if show_tool_results:
         logger.info(
             "Tool {} args:\n{}\nTool result:\n{}",

@@ -22,6 +22,7 @@ if str(REPO_ROOT_HINT) not in sys.path:
 from devs_utilities.ag3nts import AG3NTS_VERIFY_URL, submit_task_answer
 from devs_utilities.bootstrap import bootstrap_repo
 from devs_utilities.files import write_json
+from devs_utilities.flags import extract_flag
 from devs_utilities.http import HttpRequestError
 from devs_utilities.logging import configure_logging, logger as shared_logger
 from devs_utilities.openrouter import (
@@ -29,6 +30,7 @@ from devs_utilities.openrouter import (
     build_task_site_name,
     OpenRouterClient,
     OpenRouterError,
+    parse_json_content,
     ToolCall,
 )
 from devs_utilities.repo_env import get_env, get_int_env, get_llm_model, get_optional_env
@@ -43,6 +45,10 @@ DEFAULT_MODEL = get_llm_model("OKOEDITOR_MODEL")
 DEFAULT_MAX_STEPS = get_int_env("OKOEDITOR_MAX_STEPS", 12)
 DEFAULT_API_TIMEOUT_SECONDS = get_int_env("AG3NTS_TIMEOUT_SECONDS", 30)
 DEFAULT_OPENROUTER_TIMEOUT_SECONDS = get_int_env("OPENROUTER_TIMEOUT_SECONDS", 60)
+STEP_RETRY_ATTEMPTS = get_int_env("OKOEDITOR_STEP_RETRY_ATTEMPTS", 3) or 3
+STEP_RETRY_BASE_DELAY_SECONDS = float(
+    get_int_env("OKOEDITOR_STEP_RETRY_BASE_DELAY_SECONDS", 4) or 4
+)
 OUTPUT_DIR = Path(__file__).resolve().parent
 LAST_TRANSCRIPT_PATH = OUTPUT_DIR / "last_transcript.json"
 LAST_DONE_RESPONSE_PATH = OUTPUT_DIR / "last_done_response.json"
@@ -65,6 +71,26 @@ SYSTEM_PROMPT = load_system_prompt()
 
 class OkoEditorError(RuntimeError):
     """Raised when the OKO session, parser, or agent returns invalid data."""
+
+
+def is_retryable_openrouter_error(error: Exception) -> bool:
+    """Return True for transient upstream/provider failures."""
+
+    lowered = str(error).casefold()
+    return any(
+        marker in lowered
+        for marker in (
+            "429",
+            "500",
+            "502",
+            "503",
+            "504",
+            "timed out",
+            "internal server error",
+            "temporarily unavailable",
+            "operation was aborted",
+        )
+    )
 
 
 @dataclass(slots=True)
@@ -90,6 +116,7 @@ class AgentState:
     last_update_response: Any = None
     targets: dict[str, Any] | None = None
     decoy_incident_id: str | None = None
+    completed: bool = False
 
 
 def parse_args() -> argparse.Namespace:
@@ -713,6 +740,20 @@ def find_targets(web_client: OkoWebClient) -> dict[str, Any]:
         ),
         None,
     )
+    if not skolwin_task and skolwin_incident:
+        try:
+            candidate_task = web_client.get_record("zadania", skolwin_incident["id"])
+        except OkoEditorError:
+            candidate_task = None
+        if candidate_task and mentions_skolwin(
+            candidate_task.get("title"),
+            candidate_task.get("content"),
+        ):
+            skolwin_task = {
+                "id": candidate_task["id"],
+                "title": candidate_task.get("title", ""),
+                "status": candidate_task.get("status"),
+            }
     coding_note = next(
         (
             entry
@@ -996,6 +1037,17 @@ def execute_tool_call(
     state: AgentState,
     show_tool_results: bool,
 ) -> dict[str, Any]:
+    def tool_result_failed(payload: Any) -> bool:
+        return isinstance(payload, dict) and payload.get("ok") is False
+
+    def has_syncable_update(update: dict[str, Any]) -> bool:
+        record_id = update.get("id")
+        return (
+            update.get("page") in {"incydenty", "zadania"}
+            and isinstance(record_id, str)
+            and bool(re.fullmatch(r"[0-9a-f]{32}", record_id.strip().lower()))
+        )
+
     handlers = {
         "find_targets": lambda _: find_targets(web_client),
         "list_records": lambda args: web_client.list_records(args["page"]),
@@ -1030,9 +1082,13 @@ def execute_tool_call(
         state.targets = result
 
     if tool_call.name == "update_record":
-        sync_result = wait_for_visible_updates(web_client, [tool_call.arguments])
-        if isinstance(result, dict):
-            result["sync"] = sync_result
+        if not tool_result_failed(result) and has_syncable_update(tool_call.arguments):
+            try:
+                sync_result = wait_for_visible_updates(web_client, [tool_call.arguments])
+            except Exception as exc:  # noqa: BLE001
+                sync_result = {"visible": False, "error": str(exc)}
+            if isinstance(result, dict):
+                result["sync"] = sync_result
         state.last_update_response = result
         write_json(LAST_UPDATE_RESPONSE_PATH, result)
         if (
@@ -1042,16 +1098,18 @@ def execute_tool_call(
         ):
             state.decoy_incident_id = tool_call.arguments.get("id")
     if tool_call.name == "batch_update_records":
-        sync_result = wait_for_visible_updates(
-            web_client,
-            [
-                update
-                for update in tool_call.arguments.get("updates", [])
-                if update.get("page") in {"incydenty", "zadania"}
-            ],
-        )
-        if isinstance(result, dict):
-            result["sync"] = sync_result
+        sync_updates = [
+            update
+            for update in tool_call.arguments.get("updates", [])
+            if has_syncable_update(update)
+        ]
+        if not tool_result_failed(result) and sync_updates:
+            try:
+                sync_result = wait_for_visible_updates(web_client, sync_updates)
+            except Exception as exc:  # noqa: BLE001
+                sync_result = {"visible": False, "error": str(exc)}
+            if isinstance(result, dict):
+                result["sync"] = sync_result
         state.last_update_response = result
         write_json(LAST_UPDATE_RESPONSE_PATH, result)
         for update in tool_call.arguments.get("updates", []):
@@ -1064,6 +1122,12 @@ def execute_tool_call(
     if tool_call.name == "submit_done":
         state.final_response = result
         write_json(LAST_DONE_RESPONSE_PATH, result)
+        direct_flag = extract_flag(result)
+        if direct_flag:
+            state.final_flag = direct_flag
+            state.completed = True
+        if isinstance(result, dict) and result.get("code") == 0:
+            state.completed = True
         if isinstance(result, dict):
             error_text = json.dumps(result, ensure_ascii=False).lower()
             if "note's content does not meet the requirements" in error_text or "#osb" in error_text:
@@ -1075,6 +1139,7 @@ def execute_tool_call(
                 value = result.get(key)
                 if isinstance(value, str) and "{" in value and "}" in value:
                     state.final_flag = value
+                    state.completed = True
                     break
 
     if show_tool_results:
@@ -1108,6 +1173,106 @@ def parse_tool_message_content(tool_message: dict[str, Any]) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 
+def evaluate_and_maybe_submit_done(
+    *,
+    step: int,
+    suffix: str,
+    messages: list[dict[str, Any]],
+    web_client: OkoWebClient,
+    verify_client: OkoVerifyClient,
+    state: AgentState,
+    show_tool_results: bool,
+) -> bool:
+    """Evaluate the live state and auto-submit when the task is already complete."""
+
+    evaluation_message = execute_tool_call(
+        ToolCall(id=f"auto_evaluate_state_{step}_{suffix}", name="evaluate_state", arguments={}),
+        web_client=web_client,
+        verify_client=verify_client,
+        state=state,
+        show_tool_results=show_tool_results,
+    )
+    messages.append(evaluation_message)
+    evaluation = parse_tool_message_content(evaluation_message)
+    if evaluation.get("ready_for_done") is not True:
+        return False
+
+    done_message = execute_tool_call(
+        ToolCall(id=f"auto_submit_done_{step}_{suffix}", name="submit_done", arguments={}),
+        web_client=web_client,
+        verify_client=verify_client,
+        state=state,
+        show_tool_results=show_tool_results,
+    )
+    messages.append(done_message)
+    return bool(state.final_flag or state.completed)
+
+
+def submit_done_from_ready_state(
+    *,
+    step: int,
+    suffix: str,
+    messages: list[dict[str, Any]],
+    web_client: OkoWebClient,
+    verify_client: OkoVerifyClient,
+    state: AgentState,
+    show_tool_results: bool,
+) -> bool:
+    """Submit completion after an already-confirmed ready state."""
+
+    done_message = execute_tool_call(
+        ToolCall(id=f"auto_submit_done_{step}_{suffix}", name="submit_done", arguments={}),
+        web_client=web_client,
+        verify_client=verify_client,
+        state=state,
+        show_tool_results=show_tool_results,
+    )
+    messages.append(done_message)
+    return bool(state.final_flag or state.completed)
+
+
+def recover_plaintext_tool_calls(response_text: str, *, step: int) -> list[ToolCall]:
+    """Decode malformed plaintext tool-call dumps emitted by weaker models."""
+
+    normalized = response_text.strip()
+    if '"name"' not in normalized or '"arguments"' not in normalized:
+        return []
+
+    payload_start = normalized.find("[")
+    if payload_start < 0:
+        payload_start = normalized.find("{")
+    if payload_start < 0:
+        return []
+
+    try:
+        parsed = parse_json_content(normalized[payload_start:])
+    except OpenRouterError:
+        return []
+
+    raw_calls: list[dict[str, Any]]
+    if isinstance(parsed, dict):
+        raw_calls = [parsed]
+    elif isinstance(parsed, list):
+        raw_calls = [item for item in parsed if isinstance(item, dict)]
+    else:
+        return []
+
+    recovered: list[ToolCall] = []
+    for index, raw_call in enumerate(raw_calls, start=1):
+        name = raw_call.get("name")
+        arguments = raw_call.get("arguments", {})
+        if not isinstance(name, str) or not isinstance(arguments, dict):
+            continue
+        recovered.append(
+            ToolCall(
+                id=f"recovered_tool_call_{step}_{index}",
+                name=name,
+                arguments=arguments,
+            )
+        )
+    return recovered
+
+
 def recover_from_non_tool_response(
     *,
     step: int,
@@ -1121,27 +1286,67 @@ def recover_from_non_tool_response(
     """Recover when the model answers in plain text instead of using tools."""
 
     logger.info("Model returned a non-tool response: {}", response_text)
-    evaluation_message = execute_tool_call(
-        ToolCall(id=f"auto_evaluate_state_{step}", name="evaluate_state", arguments={}),
+    stripped_response = response_text.strip()
+    recovered_tool_calls = recover_plaintext_tool_calls(stripped_response, step=step)
+    if recovered_tool_calls:
+        for tool_call in recovered_tool_calls:
+            tool_message = execute_tool_call(
+                tool_call,
+                web_client=web_client,
+                verify_client=verify_client,
+                state=state,
+                show_tool_results=show_tool_results,
+            )
+            messages.append(tool_message)
+            if tool_call.name == "evaluate_state":
+                evaluation = parse_tool_message_content(tool_message)
+                if evaluation.get("ready_for_done") is True:
+                    if submit_done_from_ready_state(
+                        step=step,
+                        suffix="recovered_evaluate_state",
+                        messages=messages,
+                        web_client=web_client,
+                        verify_client=verify_client,
+                        state=state,
+                        show_tool_results=show_tool_results,
+                    ):
+                        return True
+            elif tool_call.name in {"update_record", "batch_update_records"}:
+                if evaluate_and_maybe_submit_done(
+                    step=step,
+                    suffix=f"recovered_{tool_call.name}",
+                    messages=messages,
+                    web_client=web_client,
+                    verify_client=verify_client,
+                    state=state,
+                    show_tool_results=show_tool_results,
+                ):
+                    return True
+            elif tool_call.name == "submit_done" and (state.final_flag or state.completed):
+                return True
+        return bool(state.final_flag or state.completed)
+
+    if stripped_response.startswith(("TOOLCALL>", "CALL>", "ALL>", "OLCALL>", ">[")):
+        messages.append(
+            {
+                "role": "user",
+                "content": (
+                    "Your previous message looked like a malformed tool call. "
+                    "Retry immediately using real tool calls with strict JSON arguments."
+                ),
+            }
+        )
+        return False
+    if evaluate_and_maybe_submit_done(
+        step=step,
+        suffix="recovery",
+        messages=messages,
         web_client=web_client,
         verify_client=verify_client,
         state=state,
         show_tool_results=show_tool_results,
-    )
-    messages.append(evaluation_message)
-    evaluation = parse_tool_message_content(evaluation_message)
-
-    if evaluation.get("ready_for_done") is True:
-        done_message = execute_tool_call(
-            ToolCall(id=f"auto_submit_done_{step}", name="submit_done", arguments={}),
-            web_client=web_client,
-            verify_client=verify_client,
-            state=state,
-            show_tool_results=show_tool_results,
-        )
-        messages.append(done_message)
-        if state.final_flag:
-            return True
+    ):
+        return True
 
     messages.append(
         {
@@ -1178,7 +1383,28 @@ def run_agent(config: AppConfig) -> tuple[list[dict[str, Any]], AgentState]:
 
     for step in range(1, config.max_steps + 1):
         logger.info("Starting tool-calling step {}/{}.", step, config.max_steps)
-        completion = client.create_completion(messages, tools=TOOLS)
+        delay_seconds = max(0.1, STEP_RETRY_BASE_DELAY_SECONDS)
+        completion = None
+        for attempt in range(1, STEP_RETRY_ATTEMPTS + 1):
+            try:
+                completion = client.create_completion(messages, tools=TOOLS)
+                break
+            except OpenRouterError as exc:
+                if attempt >= STEP_RETRY_ATTEMPTS or not is_retryable_openrouter_error(exc):
+                    raise
+                logger.warning(
+                    "Transient OpenRouter failure on step {}/{} attempt {}/{}: {}. Retrying in {:.1f}s.",
+                    step,
+                    config.max_steps,
+                    attempt,
+                    STEP_RETRY_ATTEMPTS,
+                    exc,
+                    delay_seconds,
+                )
+                time.sleep(delay_seconds)
+                delay_seconds *= 2
+        if completion is None:
+            raise OkoEditorError("OpenRouter did not produce a completion.")
         assistant_message: dict[str, Any] = {"role": "assistant"}
         if completion.content:
             assistant_message["content"] = completion.content
@@ -1198,7 +1424,31 @@ def run_agent(config: AppConfig) -> tuple[list[dict[str, Any]], AgentState]:
                     show_tool_results=config.show_tool_results,
                 )
                 messages.append(tool_message)
-            if state.final_flag:
+                if tool_call.name == "evaluate_state":
+                    evaluation = parse_tool_message_content(tool_message)
+                    if evaluation.get("ready_for_done") is True:
+                        if submit_done_from_ready_state(
+                            step=step,
+                            suffix="evaluate_state",
+                            messages=messages,
+                            web_client=web_client,
+                            verify_client=verify_client,
+                            state=state,
+                            show_tool_results=config.show_tool_results,
+                        ):
+                            return messages, state
+                elif tool_call.name in {"update_record", "batch_update_records"}:
+                    if evaluate_and_maybe_submit_done(
+                        step=step,
+                        suffix=tool_call.name,
+                        messages=messages,
+                        web_client=web_client,
+                        verify_client=verify_client,
+                        state=state,
+                        show_tool_results=config.show_tool_results,
+                    ):
+                        return messages, state
+            if state.final_flag or state.completed:
                 return messages, state
             continue
 

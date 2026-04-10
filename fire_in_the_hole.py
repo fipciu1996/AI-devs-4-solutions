@@ -824,9 +824,12 @@ def collect_success_flags(
     collected_flags: list[TaskFlags] = []
     for task in tasks:
         result = results_by_name[task.name]
-        if result.status != "success":
+        task_flags = extract_task_flags(result)
+        if result.status == "success":
+            collected_flags.append(task_flags or TaskFlags(task_name=task.name))
             continue
-        collected_flags.append(extract_task_flags(result) or TaskFlags(task_name=task.name))
+        if task_flags is not None:
+            collected_flags.append(task_flags)
     return collected_flags
 
 
@@ -900,7 +903,7 @@ def summarize_results(tasks: list[TaskSpec], results_by_name: dict[str, TaskResu
     )
     if collected_flags:
         logger.info("")
-        logger.info("Success flags:")
+        logger.info("Collected flags:")
         logger.info("\n{}", render_flags_table(collected_flags))
     return 1 if failure_count else 0
 

@@ -13,11 +13,14 @@ for candidate in (str(REPO_ROOT), str(PEOPLE_DIR)):
     if candidate not in sys.path:
         sys.path.insert(0, candidate)
 
-from devs_utilities.openrouter import ChatCompletionResult
+from devs_utilities.openrouter import ChatCompletionResult, ToolCall
 from filter_people import (
     AppConfig,
     Person,
+    build_answer,
+    classify_all,
     classify_jobs,
+    infer_tags_from_job_title,
     load_config,
     parse_classification_result,
 )
@@ -101,6 +104,123 @@ class PeopleFilterTests(unittest.TestCase):
         self.assertEqual(result, {1: ["transport"]})
         self.assertEqual(len(client.calls), 2)
         self.assertIn("Return only valid JSON", str(client.calls[1][-1]["content"]))
+
+    def test_classify_jobs_falls_back_to_plain_json_after_tool_loop_stalls(self) -> None:
+        client = StubOpenRouterClient(
+            [
+                ChatCompletionResult(
+                    content="",
+                    tool_calls=[ToolCall(id="call-1", name="get_job_batch_context", arguments={})],
+                ),
+                ChatCompletionResult(
+                    content="",
+                    tool_calls=[ToolCall(id="call-2", name="get_job_batch_context", arguments={})],
+                ),
+                ChatCompletionResult(
+                    content="",
+                    tool_calls=[ToolCall(id="call-3", name="get_job_batch_context", arguments={})],
+                ),
+                ChatCompletionResult(
+                    content="",
+                    tool_calls=[ToolCall(id="call-4", name="get_job_batch_context", arguments={})],
+                ),
+                ChatCompletionResult(
+                    content='{"results":[{"row_id":1,"tags":["transport"]}]}',
+                    tool_calls=[],
+                ),
+            ]
+        )
+        config = AppConfig(
+            course_api_key="course",
+            llm_api_key="llm",
+            openrouter_model="model",
+            site_url=None,
+            site_name=None,
+            batch_size=10,
+        )
+        batch = [
+            Person(
+                row_id=1,
+                name="Jan",
+                surname="Kowalski",
+                gender="M",
+                birth_date=date(2000, 1, 1),
+                birth_place="Grudziadz",
+                birth_country="Poland",
+                job="Kierowca autobusu",
+            )
+        ]
+
+        result = classify_jobs(batch, config, client)
+
+        self.assertEqual(result, {1: ["transport"]})
+        self.assertEqual(len(client.calls), 5)
+        self.assertIn("Zwróć wyłącznie poprawny JSON", str(client.calls[-1][-1]["content"]))
+
+    def test_build_answer_keeps_only_transport_tag_in_verify_payload(self) -> None:
+        candidates = [
+            Person(
+                row_id=7,
+                name="Cezary",
+                surname="Żurek",
+                gender="M",
+                birth_date=date(1987, 1, 1),
+                birth_place="Grudziądz",
+                birth_country="Poland",
+                job="Koordynator transportu",
+            )
+        ]
+
+        answer = build_answer(candidates, {7: ["transport", "praca z ludźmi"]})
+
+        self.assertEqual(answer[0]["tags"], ["transport"])
+
+    def test_classify_all_retries_missing_rows_in_smaller_batches(self) -> None:
+        config = AppConfig(
+            course_api_key="course",
+            llm_api_key="llm",
+            openrouter_model="model",
+            site_url=None,
+            site_name=None,
+            batch_size=10,
+        )
+        candidates = [
+            Person(
+                row_id=1,
+                name="Jan",
+                surname="Kowalski",
+                gender="M",
+                birth_date=date(2000, 1, 1),
+                birth_place="Grudziądz",
+                birth_country="Poland",
+                job="Kierowca autobusu",
+            ),
+            Person(
+                row_id=2,
+                name="Piotr",
+                surname="Nowak",
+                gender="M",
+                birth_date=date(2000, 1, 1),
+                birth_place="Grudziądz",
+                birth_country="Poland",
+                job="Nauczyciel",
+            ),
+        ]
+
+        with patch(
+            "filter_people.classify_jobs",
+            side_effect=[
+                {1: ["transport"]},
+                {2: ["edukacja"]},
+            ],
+        ):
+            result = classify_all(candidates, config, openrouter_client=object())
+
+        self.assertEqual(result, {1: ["transport"], 2: ["edukacja"]})
+
+    def test_infer_tags_from_job_title_marks_transport_keywords(self) -> None:
+        self.assertEqual(infer_tags_from_job_title("Kierowca autobusu"), ["transport"])
+        self.assertEqual(infer_tags_from_job_title("Nauczyciel historii"), [])
 
 
 if __name__ == "__main__":

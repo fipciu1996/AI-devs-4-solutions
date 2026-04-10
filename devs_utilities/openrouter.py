@@ -528,14 +528,153 @@ def strip_code_fences(text: str) -> str:
     return stripped
 
 
-def parse_json_object_content(content: str) -> dict[str, Any]:
-    """Parse a model text response as a JSON object."""
+def _extract_balanced_json_substring(text: str) -> str | None:
+    """Return the first balanced JSON-like object or array found in text."""
+
+    starts = [
+        (index, opener)
+        for opener in ("{", "[")
+        if (index := text.find(opener)) != -1
+    ]
+    if not starts:
+        return None
+
+    start_index, opener = min(starts, key=lambda item: item[0])
+    closers: list[str] = []
+    in_string = False
+    escape = False
+
+    for index in range(start_index, len(text)):
+        char = text[index]
+        if escape:
+            escape = False
+            continue
+        if char == "\\" and in_string:
+            escape = True
+            continue
+        if char == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if char == "{":
+            closers.append("}")
+        elif char == "[":
+            closers.append("]")
+        elif closers and char == closers[-1]:
+            closers.pop()
+            if not closers:
+                return text[start_index : index + 1]
+    return None
+
+
+def _parse_loose_scalar(value: str) -> Any:
+    stripped = value.strip().rstrip(",")
+    if not stripped:
+        return ""
+
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        pass
+
+    try:
+        return ast.literal_eval(stripped)
+    except (SyntaxError, ValueError):
+        pass
+
+    lowered = stripped.casefold()
+    if lowered == "true":
+        return True
+    if lowered == "false":
+        return False
+    if lowered == "null":
+        return None
+    if re.fullmatch(r"-?\d+", stripped):
+        return int(stripped)
+    if re.fullmatch(r"-?\d+\.\d+", stripped):
+        return float(stripped)
+    return stripped.strip("'\"")
+
+
+def _parse_loose_object_assignments(arguments_raw: str) -> dict[str, Any] | None:
+    """Parse flat key/value assignments such as `foo=1, bar=baz`."""
+
+    candidate = arguments_raw.strip()
+    if candidate.startswith("{") and candidate.endswith("}"):
+        candidate = candidate[1:-1].strip()
+    if not candidate:
+        return None
+
+    parts: list[str] = []
+    current: list[str] = []
+    quote: str | None = None
+    depth = 0
+    escape = False
+    for char in candidate:
+        if escape:
+            current.append(char)
+            escape = False
+            continue
+        if quote is not None:
+            current.append(char)
+            if char == "\\":
+                escape = True
+            elif char == quote:
+                quote = None
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            current.append(char)
+            continue
+        if char in "{[":
+            depth += 1
+            current.append(char)
+            continue
+        if char in "}]":
+            depth = max(0, depth - 1)
+            current.append(char)
+            continue
+        if depth == 0 and char in {",", "\n", ";"}:
+            part = "".join(current).strip()
+            if part:
+                parts.append(part)
+            current = []
+            continue
+        current.append(char)
+
+    tail = "".join(current).strip()
+    if tail:
+        parts.append(tail)
+
+    parsed: dict[str, Any] = {}
+    for part in parts:
+        match = re.match(
+            r'^\s*(?P<key>"[^"]+"|\'[^\']+\'|[A-Za-z_][A-Za-z0-9_-]*)\s*(?P<sep>[:=])\s*(?P<value>.+?)\s*$',
+            part,
+        )
+        if not match:
+            return None
+        key = match.group("key").strip().strip("'\"")
+        parsed[key] = _parse_loose_scalar(match.group("value"))
+
+    return parsed if parsed else None
+
+
+def parse_json_content(content: str) -> Any:
+    """Parse model text as JSON with the same repairs used for tool arguments."""
 
     normalized = strip_code_fences(content)
     try:
-        parsed = json.loads(normalized)
+        return _load_json_with_common_repairs(normalized)
     except json.JSONDecodeError as exc:
         raise OpenRouterError("OpenRouter did not return valid JSON.") from exc
+
+
+def parse_json_object_content(content: str) -> dict[str, Any]:
+    """Parse a model text response as a JSON object."""
+
+    parsed = parse_json_content(content)
     if not isinstance(parsed, dict):
         raise OpenRouterError("OpenRouter returned a non-object JSON payload.")
     return parsed
@@ -594,7 +733,7 @@ def _load_json_with_common_repairs(arguments_raw: str) -> Any:
     """Parse JSON with a few conservative repairs for common model mistakes."""
 
     normalized = strip_code_fences(arguments_raw).strip()
-    normalized = normalized.removeprefix("TOOLCALL>").removesuffix("ALL>").strip()
+    normalized = normalized.removeprefix("TOOLCALL>").removeprefix("CALL>").removesuffix("ALL>").strip()
     candidates: list[str] = []
 
     def add_candidate(candidate: str) -> None:
@@ -639,6 +778,10 @@ def _load_json_with_common_repairs(arguments_raw: str) -> Any:
 
     add_candidate(normalized)
 
+    extracted = _extract_balanced_json_substring(normalized)
+    if extracted is not None and extracted != normalized:
+        add_candidate(extracted)
+
     if ":" in normalized and not normalized.startswith(("{", "[")):
         add_candidate("{" + normalized + "}")
     if "=" in normalized and not normalized.startswith(("{", "[")):
@@ -665,6 +808,9 @@ def _load_json_with_common_repairs(arguments_raw: str) -> Any:
             return ast.literal_eval(candidate)
         except (SyntaxError, ValueError):
             continue
+    loose_object = _parse_loose_object_assignments(normalized)
+    if loose_object is not None:
+        return loose_object
     raise json.JSONDecodeError("invalid JSON", normalized, 0)
 
 
