@@ -30,6 +30,12 @@ logger = shared_logger.bind(component="fire_in_the_hole")
 load_repo_env(__file__)
 FLAG_PATTERN = re.compile(r"\{FLG:[^}]+\}")
 SECRET_LABEL_PATTERN = re.compile(r"\b(?:sekret|secret)\b\s*:", re.IGNORECASE)
+STEP_HEADER_PATTERN = re.compile(r"^=== Step \d+/\d+: (?P<label>.+?) ===$", re.MULTILINE)
+SUMMARY_STEP_ALIASES = {
+    "people": {
+        "findhim": "findhim",
+    },
+}
 TOKEN_FIELDS = (
     "input_tokens",
     "output_tokens",
@@ -427,6 +433,11 @@ def build_task_registry() -> dict[str, TaskSpec]:
             supports_verify=True,
         ),
         build_single_script_task(
+            "goingthere",
+            "Run the goingthere solver.",
+            "goingthere/solve_goingthere.py",
+        ),
+        build_single_script_task(
             "mailbox",
             "Run the mailbox solver.",
             "mailbox/solve_mailbox.py",
@@ -472,6 +483,11 @@ def build_task_registry() -> dict[str, TaskSpec]:
             "Run the sensors solver.",
             "sensors/solve_sensors.py",
             supports_verify=True,
+        ),
+        build_single_script_task(
+            "timetravel",
+            "Run the timetravel solver.",
+            "timetravel/solve_timetravel.py",
         ),
         build_single_script_task(
             "windpower",
@@ -808,13 +824,49 @@ def extract_flags_from_log_text(task_name: str, log_text: str) -> TaskFlags | No
     return TaskFlags(task_name=task_name, main_flag=main_flag, secret_flag=secret_flag)
 
 
-def extract_task_flags(result: TaskResult) -> TaskFlags | None:
+def read_task_log_text(result: TaskResult) -> str | None:
     if result.log_path is None or not result.log_path.exists():
         return None
-    return extract_flags_from_log_text(
-        result.name,
-        result.log_path.read_text(encoding="utf-8", errors="replace"),
-    )
+    return result.log_path.read_text(encoding="utf-8", errors="replace")
+
+
+def extract_step_log_sections(log_text: str) -> dict[str, str]:
+    sections: dict[str, str] = {}
+    matches = list(STEP_HEADER_PATTERN.finditer(log_text))
+    for index, match in enumerate(matches):
+        step_label = match.group("label").strip()
+        step_start = match.end()
+        step_end = matches[index + 1].start() if index + 1 < len(matches) else len(log_text)
+        sections[step_label] = log_text[step_start:step_end]
+    return sections
+
+
+def extract_task_flags(result: TaskResult) -> TaskFlags | None:
+    log_text = read_task_log_text(result)
+    if log_text is None:
+        return None
+    return extract_flags_from_log_text(result.name, log_text)
+
+
+def extract_additional_task_flags(result: TaskResult) -> list[TaskFlags]:
+    step_aliases = SUMMARY_STEP_ALIASES.get(result.name)
+    if not step_aliases:
+        return []
+
+    log_text = read_task_log_text(result)
+    if log_text is None:
+        return []
+
+    step_logs = extract_step_log_sections(log_text)
+    additional_flags: list[TaskFlags] = []
+    for step_label, summary_name in step_aliases.items():
+        step_log_text = step_logs.get(step_label)
+        if step_log_text is None:
+            continue
+        task_flags = extract_flags_from_log_text(summary_name, step_log_text)
+        if task_flags is not None:
+            additional_flags.append(task_flags)
+    return additional_flags
 
 
 def collect_success_flags(
@@ -827,28 +879,19 @@ def collect_success_flags(
         task_flags = extract_task_flags(result)
         if result.status == "success":
             collected_flags.append(task_flags or TaskFlags(task_name=task.name))
-            continue
-        if task_flags is not None:
+        elif task_flags is not None:
             collected_flags.append(task_flags)
+        collected_flags.extend(extract_additional_task_flags(result))
     return collected_flags
 
 
-def render_flags_table(flags: list[TaskFlags]) -> str:
-    headers = ("Task name", "Main flag", "Secret flag")
-    rows = [
-        (
-            item.task_name,
-            item.main_flag or "-",
-            item.secret_flag or "-",
-        )
-        for item in flags
-    ]
+def render_table(headers: tuple[str, ...], rows: list[tuple[str, ...]]) -> str:
     widths = [
         max(len(headers[index]), *(len(row[index]) for row in rows))
         for index in range(len(headers))
     ]
 
-    def format_row(columns: tuple[str, str, str]) -> str:
+    def format_row(columns: tuple[str, ...]) -> str:
         return " | ".join(
             value.ljust(widths[index])
             for index, value in enumerate(columns)
@@ -861,6 +904,58 @@ def render_flags_table(flags: list[TaskFlags]) -> str:
         *(format_row(row) for row in rows),
     ]
     return "\n".join(lines)
+
+
+def render_flags_table(flags: list[TaskFlags]) -> str:
+    headers = ("Task name", "Main flag", "Secret flag")
+    rows = [
+        (
+            item.task_name,
+            item.main_flag or "-",
+            item.secret_flag or "-",
+        )
+        for item in flags
+    ]
+    return render_table(headers, rows)
+
+
+def format_duration_seconds(seconds: float) -> str:
+    return f"{seconds:.1f}s"
+
+
+def extract_models_used(result: TaskResult) -> list[str]:
+    if result.cost_path is None:
+        return []
+    report = load_cost_report(result.cost_path)
+    raw_models = report.get("models")
+    if not isinstance(raw_models, list):
+        return []
+    return sorted(
+        model
+        for model in raw_models
+        if isinstance(model, str) and model.strip()
+    )
+
+
+def did_task_fetch_flag(result: TaskResult) -> bool:
+    return extract_task_flags(result) is not None or bool(extract_additional_task_flags(result))
+
+
+def render_task_run_table(
+    tasks: list[TaskSpec],
+    results_by_name: dict[str, TaskResult],
+) -> str:
+    headers = ("Task name", "Time from starting task", "Models used", "If flag fetched")
+    rows = [
+        (
+            task.name,
+            format_duration_seconds(results_by_name[task.name].duration_seconds),
+            ", ".join(extract_models_used(results_by_name[task.name])) or "-",
+            "yes" if did_task_fetch_flag(results_by_name[task.name]) else "no",
+        )
+        for task in tasks
+    ]
+    return render_table(headers, rows)
 
 
 def summarize_results(tasks: list[TaskSpec], results_by_name: dict[str, TaskResult]) -> int:
@@ -901,6 +996,9 @@ def summarize_results(tasks: list[TaskSpec], results_by_name: dict[str, TaskResu
         skipped_count,
         failure_count,
     )
+    logger.info("")
+    logger.info("Task runs:")
+    logger.info("\n{}", render_task_run_table(tasks, results_by_name))
     if collected_flags:
         logger.info("")
         logger.info("Collected flags:")

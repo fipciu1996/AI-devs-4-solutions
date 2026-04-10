@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import json
 import sys
 import unittest
-import json
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -17,6 +17,7 @@ from fire_in_the_hole import (
     extract_flags_from_log_text,
     parse_args,
     render_flags_table,
+    render_task_run_table,
     task_cost_path,
     write_run_cost_summary,
     write_task_cost_report,
@@ -24,11 +25,15 @@ from fire_in_the_hole import (
 
 
 class FireInTheHoleFlagTests(unittest.TestCase):
-    def test_build_task_registry_includes_phonecall(self) -> None:
+    def test_build_task_registry_includes_recent_single_script_tasks(self) -> None:
         registry = build_task_registry()
 
         self.assertIn("phonecall", registry)
         self.assertEqual(registry["phonecall"].description, "Run the phonecall solver.")
+        self.assertIn("goingthere", registry)
+        self.assertEqual(registry["goingthere"].description, "Run the goingthere solver.")
+        self.assertIn("timetravel", registry)
+        self.assertEqual(registry["timetravel"].description, "Run the timetravel solver.")
 
     def test_people_pipeline_uses_separate_findhim_directory(self) -> None:
         registry = build_task_registry()
@@ -102,6 +107,59 @@ class FireInTheHoleFlagTests(unittest.TestCase):
         self.assertIn("{FLG:JUMPJUMP}", table)
         self.assertIn(" -", table.replace("|", " "))
 
+    def test_render_task_run_table_includes_duration_models_and_flag_status(self) -> None:
+        tasks = [
+            type("Task", (), {"name": "domatowo"})(),
+            type("Task", (), {"name": "reactor"})(),
+        ]
+        domatowo_cost_path = Path(__file__).with_name("_domatowo_run_table_cost.json")
+        reactor_log_path = Path(__file__).with_name("_reactor_run_table.log")
+        for path in (domatowo_cost_path, reactor_log_path):
+            path.unlink(missing_ok=True)
+
+        domatowo_cost_path.write_text(
+            json.dumps({"models": ["model-b", "model-a"]}, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        reactor_log_path.write_text(
+            "SUCCESS | reactor | Flag: {FLG:INSTALLED}\n",
+            encoding="utf-8",
+        )
+        try:
+            results_by_name = {
+                "domatowo": TaskResult(
+                    name="domatowo",
+                    status="success",
+                    duration_seconds=12.34,
+                    step_count=1,
+                    cost_path=domatowo_cost_path,
+                ),
+                "reactor": TaskResult(
+                    name="reactor",
+                    status="success",
+                    duration_seconds=2.0,
+                    step_count=1,
+                    log_path=reactor_log_path,
+                ),
+            }
+
+            table = render_task_run_table(tasks, results_by_name)
+        finally:
+            for path in (domatowo_cost_path, reactor_log_path):
+                path.unlink(missing_ok=True)
+
+        self.assertIn("Task name", table)
+        self.assertIn("Time from starting task", table)
+        self.assertIn("Models used", table)
+        self.assertIn("If flag fetched", table)
+        self.assertIn("domatowo", table)
+        self.assertIn("12.3s", table)
+        self.assertIn("model-a, model-b", table)
+        self.assertIn("reactor", table)
+        self.assertIn("2.0s", table)
+        self.assertIn("yes", table)
+        self.assertIn("no", table)
+
     def test_collect_success_flags_keeps_placeholder_rows_for_success_without_flag(self) -> None:
         tasks = [
             type("Task", (), {"name": "domatowo"})(),
@@ -171,6 +229,57 @@ class FireInTheHoleFlagTests(unittest.TestCase):
             [
                 TaskFlags("people", "{FLG:SURVIVORS}", None),
                 TaskFlags("reactor", None, None),
+            ],
+        )
+
+    def test_collect_success_flags_includes_findhim_as_separate_summary_row(self) -> None:
+        tasks = [type("Task", (), {"name": "people"})()]
+        log_path = Path(__file__).with_name("_people_pipeline.log")
+        log_path.unlink(missing_ok=True)
+        try:
+            log_path.write_text(
+                "\n".join(
+                    [
+                        "Task: people",
+                        "Description: People pipeline",
+                        "Started: 2026-04-10 12:00:00",
+                        "Step count: 2",
+                        "",
+                        "=== Step 1/2: people-filter ===",
+                        "CWD: C:\\repo",
+                        "CMD: python people/filter_people.py --verify",
+                        "",
+                        "INFO | people-filter | {FLG:SURVIVORS}",
+                        "",
+                        "=== Step 2/2: findhim ===",
+                        "CWD: C:\\repo",
+                        "CMD: python findhim/solve_findhim.py --verify",
+                        "",
+                        "INFO | findhim | {FLG:BUSTED}",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            results_by_name = {
+                "people": TaskResult(
+                    name="people",
+                    status="success",
+                    duration_seconds=1.0,
+                    step_count=2,
+                    log_path=log_path,
+                ),
+            }
+
+            flags = collect_success_flags(tasks, results_by_name)
+        finally:
+            log_path.unlink(missing_ok=True)
+
+        self.assertEqual(
+            flags,
+            [
+                TaskFlags("people", "{FLG:SURVIVORS}", "{FLG:BUSTED}"),
+                TaskFlags("findhim", "{FLG:BUSTED}", None),
             ],
         )
 

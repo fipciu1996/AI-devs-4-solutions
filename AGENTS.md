@@ -29,5 +29,12 @@ Tests use `unittest` naming and are discoverable by `unittest` or `pytest` if in
 ## Commit & Pull Request Guidelines
 Recent history uses short imperative subjects such as `Add interactive task menu...` and `Refactor HTTP utilities...`. Follow that pattern: start with a verb, keep the first line specific, and scope the change to one task or utility when possible. PRs should explain which task folder changed, list the command used for verification, mention `.env` or API-key impacts, and include screenshots only for UI or proxy log view changes.
 
+## Public Sharing Guidelines
+Sharing your own code and approach is encouraged, but public repositories must not include course-sensitive material. Do not publish task flags or final answers, even if they were later removed from the working tree, because Git history still preserves them. If a flag or similar secret lands in history, clean the repository history before publishing (for example with `bfg-repo-cleaner`).
+
+Do not publish hub URLs, task API endpoints, or other course infrastructure links. Do not publish lesson content, task statements, or copied course materials. Treat these as private course assets rather than project documentation.
+
+It is fine to share your implementation, architecture, prompts, tool choices, and lessons learned. Prefer explaining your reasoning and techniques over posting ready-made answers. Hints, discussion of tradeoffs, and implementation notes are welcome as long as they do not expose flags, protected endpoints, or course content.
+
 ## Security & Configuration Tips
 Use the repository-root `.env` (`.env`) for local runtime-tunable settings. Keep shared LLM settings in the `LLM_*` section instead of duplicating per-task model or header variables. Never hardcode external course endpoints, external API-key names, or absolute local filesystem paths anywhere outside local `docker-compose` configuration. Documentation should use relative paths only. Leak audits should ignore files covered by `.gitignore`. New scripts should load configurable values through `repo_env.py` or `devs_utilities.env`. Never commit secrets. Generated artifacts such as `sendit/analysis/`, `sensors/dataset/`, `failure/failure.log`, and `*.json` are ignored and should stay out of review unless a change explicitly requires them.
