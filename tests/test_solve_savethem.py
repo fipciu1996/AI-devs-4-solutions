@@ -11,6 +11,7 @@ from savethem.solve_savethem import (
     Position,
     PreviewState,
     VehicleSpec,
+    choose_route_with_openrouter,
     find_best_route,
     with_ag3nts_retry,
 )
@@ -82,6 +83,29 @@ class SaveThemRouteTests(unittest.TestCase):
 
         self.assertEqual(result, {"ok": True})
         self.assertEqual(attempts["count"], 2)
+
+    def test_choose_route_with_openrouter_accepts_list_payload(self) -> None:
+        preview = PreviewState(
+            terrain=((".", "."), (".", "G")),
+            start=Position(row=0, col=0),
+            goal=Position(row=1, col=1),
+        )
+        specs = {
+            "walk": VehicleSpec(name="walk", fuel_per_move=0.0, food_per_move=1.0),
+        }
+
+        class FakeClient:
+            def create_completion(self, _messages, tools=None):  # type: ignore[no-untyped-def]
+                del tools
+                return type("Completion", (), {"content": '["walk", "right", "down"]', "tool_calls": []})()
+
+        with (
+            patch("savethem.solve_savethem.build_openrouter_client", return_value=FakeClient()),
+            patch("savethem.solve_savethem.write_json"),
+        ):
+            answer = choose_route_with_openrouter(preview, specs, ["walk", "down", "right"])
+
+        self.assertEqual(answer, ["walk", "right", "down"])
 
 
 if __name__ == "__main__":

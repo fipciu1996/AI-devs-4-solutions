@@ -9,12 +9,13 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+from devs_utilities.bootstrap import resolve_repo_python
 from devs_utilities.logging import configure_logging, logger as shared_logger
 from devs_utilities.repo_env import load_repo_env
 
 
 REPO_ROOT = Path(__file__).resolve().parent
-PYTHON = sys.executable
+PYTHON = str(resolve_repo_python(__file__))
 IGNORED_DIRS = {
     ".git",
     ".idea",

@@ -25,6 +25,7 @@ from devs_utilities.openrouter import (
     build_task_site_name,
     OpenRouterClient,
     OpenRouterError,
+    parse_json_content,
     ToolCall,
 )
 from devs_utilities.prompts import load_prompt_text
@@ -648,9 +649,13 @@ def choose_route_with_openrouter(
         if not completion.content:
             raise OpenRouterError("OpenRouter returned neither content nor tool calls.")
 
-        payload = json.loads(completion.content)
+        payload = parse_json_content(completion.content)
         write_json(MODEL_ROUTE_PATH, payload)
-        return normalize_answer(payload.get("answer"))
+        if isinstance(payload, list):
+            return normalize_answer(payload)
+        if isinstance(payload, dict):
+            return normalize_answer(payload.get("answer"))
+        raise OpenRouterError("OpenRouter returned an unsupported route payload.")
 
     raise OpenRouterError("OpenRouter tool calling did not finish within the step limit.")
 

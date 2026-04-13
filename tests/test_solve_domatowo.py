@@ -5,9 +5,10 @@ import unittest
 from devs_utilities.ag3nts import build_ag3nts_public_data_url
 from domatowo.solve_domatowo import (
     MapState,
+    SIDE_SECRET_ANSWER,
     build_clusters,
     build_side_quest_plan,
-    classify_log_heuristically,
+    parse_log_assessment_payload,
     parse_church_clue,
     run_with_retries,
     resolve_side_secret_answer,
@@ -84,12 +85,12 @@ class DomatowoSolverTests(unittest.TestCase):
         self.assertEqual("F8", plan.predicted_dismount)
         self.assertEqual("G8", plan.secret_field)
 
-    def test_log_heuristics_detect_positive_and_negative_messages(self) -> None:
-        found = classify_log_heuristically(
-            "Mamy osob\u0119. M\u0119\u017cczyzna mniej wi\u0119cej 30-letni, schowa\u0142 si\u0119 pod przewr\u00f3conym sto\u0142em."
+    def test_parse_log_assessment_payload_reads_agent_result(self) -> None:
+        found = parse_log_assessment_payload(
+            {"result": "found", "reason": "The log explicitly reports a living survivor."}
         )
-        empty = classify_log_heuristically(
-            "Nie odnotowano cz\u0142owieka. Jedynie przewr\u00f3cona szafa i druty."
+        empty = parse_log_assessment_payload(
+            {"result": "empty", "reason": "The log explicitly says no person was found."}
         )
         self.assertEqual("found", found.result)
         self.assertEqual("empty", empty.result)
@@ -104,7 +105,7 @@ class DomatowoSolverTests(unittest.TestCase):
         )
 
     def test_resolve_side_secret_answer_matches_corrected_hash(self) -> None:
-        self.assertEqual("plane", resolve_side_secret_answer(SIDE_SECRET_HASH))
+        self.assertEqual(SIDE_SECRET_ANSWER, resolve_side_secret_answer(SIDE_SECRET_HASH))
 
     def test_run_with_retries_returns_first_successful_attempt(self) -> None:
         attempts: list[int] = []

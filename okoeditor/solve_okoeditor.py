@@ -42,7 +42,7 @@ logger = shared_logger.bind(component="okoeditor")
 TASK_NAME = "okoeditor"
 OKO_BASE_URL = "https://example.invalid"
 DEFAULT_MODEL = get_llm_model("OKOEDITOR_MODEL")
-DEFAULT_MAX_STEPS = get_int_env("OKOEDITOR_MAX_STEPS", 12)
+DEFAULT_MAX_STEPS = get_int_env("OKOEDITOR_MAX_STEPS", 20)
 DEFAULT_API_TIMEOUT_SECONDS = get_int_env("AG3NTS_TIMEOUT_SECONDS", 30)
 DEFAULT_OPENROUTER_TIMEOUT_SECONDS = get_int_env("OPENROUTER_TIMEOUT_SECONDS", 60)
 STEP_RETRY_ATTEMPTS = get_int_env("OKOEDITOR_STEP_RETRY_ATTEMPTS", 3) or 3

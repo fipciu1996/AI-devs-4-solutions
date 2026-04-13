@@ -43,16 +43,16 @@ HUB_HOST = urlsplit(BASE_URL).netloc.lower()
 VERIFY_TIMEOUT_SECONDS = get_int_env("AG3NTS_TIMEOUT_SECONDS", 30) or 30
 API_RETRY_ATTEMPTS = get_int_env("GOINGTHERE_API_RETRY_ATTEMPTS", 8) or 8
 API_RETRY_BASE_DELAY_SECONDS = float(
-    get_int_env("GOINGTHERE_API_RETRY_BASE_DELAY_SECONDS", 1) or 1
+    get_int_env("GOINGTHERE_API_RETRY_BASE_DELAY_SECONDS", 2) or 2
 )
 API_RETRY_MAX_DELAY_SECONDS = float(
-    get_int_env("GOINGTHERE_API_RETRY_MAX_DELAY_SECONDS", 8) or 8
+    get_int_env("GOINGTHERE_API_RETRY_MAX_DELAY_SECONDS", 30) or 30
 )
 MAX_GAMES = get_int_env("GOINGTHERE_MAX_GAMES", 40) or 40
 MAX_DISARM_CYCLES = get_int_env("GOINGTHERE_MAX_DISARM_CYCLES", 10) or 10
 MAX_AGENT_STEPS = get_int_env("GOINGTHERE_TOOL_CALL_MAX_STEPS", 80) or 80
 HUB_REQUEST_SPACING_SECONDS = float(
-    get_optional_env("GOINGTHERE_REQUEST_SPACING_SECONDS") or "2.0"
+    get_optional_env("GOINGTHERE_REQUEST_SPACING_SECONDS") or "4.0"
 )
 OPENROUTER_TIMEOUT_SECONDS = min(
     get_int_env("OPENROUTER_TIMEOUT_SECONDS", 60) or 60,
@@ -229,15 +229,26 @@ def with_api_retry(
         if attempt >= API_RETRY_ATTEMPTS or not should_retry:
             break
 
+        retry_delay_seconds = delay_seconds
+        if (
+            isinstance(last_error, HttpRequestError)
+            and last_error.status_code == 429
+            and apply_spacing
+        ):
+            retry_delay_seconds = min(
+                API_RETRY_MAX_DELAY_SECONDS,
+                max(delay_seconds, HUB_REQUEST_SPACING_SECONDS * 2, 12.0),
+            )
+
         logger.warning(
             "{} failed on attempt {}/{}: {}. Retrying in {:.1f}s.",
             action,
             attempt,
             API_RETRY_ATTEMPTS,
             last_error,
-            delay_seconds,
+            retry_delay_seconds,
         )
-        time.sleep(delay_seconds)
+        time.sleep(retry_delay_seconds)
         delay_seconds = min(API_RETRY_MAX_DELAY_SECONDS, delay_seconds * 2)
 
     if last_error is not None:

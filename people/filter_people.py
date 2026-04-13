@@ -6,7 +6,6 @@ import argparse
 import csv
 import json
 import sys
-import unicodedata
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -22,9 +21,9 @@ from devs_utilities.logging import configure_logging, logger as shared_logger
 from devs_utilities.openrouter import (
     build_task_openrouter_client,
     build_task_site_name,
+    execute_tool_call,
     OpenRouterClient,
     OpenRouterError,
-    ToolCall,
     strip_code_fences,
 )
 from devs_utilities.prompts import load_prompt_text
@@ -80,19 +79,6 @@ CSV_COLUMNS = {
 }
 MODEL_MAX_STEPS = 4
 FILTER_SYSTEM_PROMPT = load_prompt_text(__file__, "filter_system_prompt.txt")
-TRANSPORT_JOB_KEYWORDS = (
-    "transport",
-    "kierow",
-    "kurier",
-    "logist",
-    "spedy",
-    "dyspozytor",
-    "przewoz",
-    "dostaw",
-    "motornicz",
-    "maszynist",
-    "konduktor",
-)
 
 
 @dataclass(slots=True)
@@ -432,22 +418,6 @@ def build_people_filter_handlers(batch: list[Person]) -> dict[str, Any]:
         "validate_tag_results": validate_tag_results,
     }
 
-
-def execute_people_filter_tool_call(
-    tool_call: ToolCall,
-    handlers: dict[str, Any],
-) -> dict[str, Any]:
-    if tool_call.name not in handlers:
-        raise OpenRouterError(f"Unknown people.filter tool call: {tool_call.name!r}")
-    result = handlers[tool_call.name](tool_call.arguments)
-    return {
-        "role": "tool",
-        "tool_call_id": tool_call.id,
-        "name": tool_call.name,
-        "content": json.dumps(result, ensure_ascii=False),
-    }
-
-
 def classify_jobs(
     batch: list[Person],
     config: AppConfig,
@@ -478,7 +448,13 @@ def classify_jobs(
             ]
             messages.append(assistant_message)
             for tool_call in completion.tool_calls:
-                messages.append(execute_people_filter_tool_call(tool_call, handlers))
+                messages.append(
+                    execute_tool_call(
+                        tool_call,
+                        handlers,
+                        error_prefix="Unknown people.filter tool",
+                    )
+                )
             continue
         raw_text = str(completion.content or "").strip()
         if not raw_text:
@@ -540,15 +516,6 @@ def classify_jobs_without_tools(
         "OpenRouter plain JSON fallback did not produce a valid people.filter response."
     )
 
-
-def infer_tags_from_job_title(job: str) -> list[str]:
-    normalized = unicodedata.normalize("NFKD", job).casefold()
-    normalized = "".join(char for char in normalized if not unicodedata.combining(char))
-    if any(keyword in normalized for keyword in TRANSPORT_JOB_KEYWORDS):
-        return ["transport"]
-    return []
-
-
 def classify_batch_with_retries(
     batch: list[Person],
     config: AppConfig,
@@ -559,15 +526,9 @@ def classify_batch_with_retries(
     except OpenRouterError as exc:
         if len(batch) == 1:
             person = batch[0]
-            inferred_tags = infer_tags_from_job_title(person.job)
-            logger.warning(
-                "Model nie sklasyfikował row_id {} po fallbackach. Używam lokalnego fallbacku na podstawie zawodu: {} -> {} ({})",
-                person.row_id,
-                person.job,
-                inferred_tags,
-                exc,
-            )
-            return {person.row_id: inferred_tags}
+            raise OpenRouterError(
+                f"Model nie sklasyfikował row_id {person.row_id} nawet po retry i plain JSON mode."
+            ) from exc
 
         logger.warning(
             "Model nie sklasyfikował partii row_id {}. Dzielę partię na mniejsze po błędzie: {}",
@@ -587,15 +548,9 @@ def classify_batch_with_retries(
     missing_display = ", ".join(str(item) for item in sorted(missing_ids))
     if len(batch) == 1:
         person = batch[0]
-        inferred_tags = infer_tags_from_job_title(person.job)
-        logger.warning(
-            "Model pominął row_id {}. Używam lokalnego fallbacku na podstawie zawodu: {} -> {}",
-            person.row_id,
-            person.job,
-            inferred_tags,
+        raise OpenRouterError(
+            f"Model pominął row_id {person.row_id}; brak lokalnego fallbacku heurystycznego."
         )
-        tags_by_row_id[person.row_id] = inferred_tags
-        return tags_by_row_id
 
     logger.warning(
         "Model nie zwrócił tagów dla row_id: {}. Ponawiam brakujące rekordy w mniejszych partiach.",

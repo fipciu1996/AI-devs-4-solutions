@@ -29,6 +29,7 @@ TASK_NAME = "timetravel-frontend"
 DEFAULT_MODEL = (
     get_optional_env("TIMETRAVEL_FRONTEND_MODEL")
     or get_optional_env("TIMETRAVEL_MODEL")
+    or get_optional_env("TIMETAVEL_MODEL")
     or get_llm_model()
 )
 DEFAULT_OPENROUTER_TIMEOUT_SECONDS = get_int_env("OPENROUTER_TIMEOUT_SECONDS", 120) or 120
@@ -176,7 +177,7 @@ class OpenRouterFrontendAgent:
         if not self.model:
             raise RuntimeError(
                 "Missing OpenRouter model. Set TIMETRAVEL_FRONTEND_MODEL, TIMETRAVEL_MODEL, "
-                "OPENROUTER_MODEL, or LLM_MODEL."
+                "TIMETAVEL_MODEL, OPENROUTER_MODEL, or LLM_MODEL."
             )
         return build_task_openrouter_client(
             __file__,

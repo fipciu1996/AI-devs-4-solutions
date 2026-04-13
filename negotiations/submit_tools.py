@@ -26,13 +26,14 @@ for candidate in (
         sys.path.insert(0, candidate)
 
 from devs_utilities.ag3nts import AG3NTS_VERIFY_URL, submit_task_answer
-from devs_utilities.bootstrap import bootstrap_repo
+from devs_utilities.bootstrap import bootstrap_repo, resolve_repo_python
 from devs_utilities.http import HttpRequestError, get_json
 from negotiations_api.config import load_settings
 from devs_utilities.repo_env import get_course_api_key, get_ngrok_auth_token, get_optional_env
 
 
 bootstrap_repo(__file__)
+PYTHON = str(resolve_repo_python(__file__))
 TASK_NAME = "negotiations"
 DEFAULT_SETTINGS = load_settings()
 DEFAULT_LOCAL_HOST = "127.0.0.1"
@@ -335,7 +336,7 @@ def launched_server(args: argparse.Namespace) -> Iterator[subprocess.Popen[str] 
         return
 
     process = subprocess.Popen(
-        [sys.executable, "-m", "negotiations_api.server"],
+        [PYTHON, "-m", "negotiations_api.server"],
         cwd=NEGOTIATIONS_DIR,
         env=build_server_environment(args),
         text=True,

@@ -45,6 +45,14 @@ class FireInTheHoleFlagTests(unittest.TestCase):
         self.assertEqual(Path(steps[1].command[-2]).as_posix(), "findhim/solve_findhim.py")
         self.assertEqual(steps[1].command[-1], "--verify")
 
+    def test_people_pipeline_is_disabled_when_private_dataset_is_missing(self) -> None:
+        registry = build_task_registry()
+        with patch("fire_in_the_hole.REPO_ROOT", Path("C:/__definitely_missing_people_dataset__")):
+            enabled, reason = registry["people"].is_enabled(SimpleNamespace(verify=True))
+
+        self.assertFalse(enabled)
+        self.assertIn("people.csv", reason or "")
+
     def test_extract_flags_from_log_text_reads_main_and_secret_flags(self) -> None:
         flags = extract_flags_from_log_text(
             "categorize",

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import json
 import re
 import sys
 import unicodedata
@@ -24,11 +23,11 @@ from devs_utilities.files import write_json
 from devs_utilities.http import HttpRequestError
 from devs_utilities.logging import configure_logging, logger as shared_logger
 from devs_utilities.openrouter import (
-    ChatCompletionResult,
     OpenRouterClient,
     OpenRouterError,
-    ToolCall,
     build_task_openrouter_client,
+    parse_json_object_content,
+    run_tool_conversation,
 )
 from devs_utilities.prompts import load_prompt_text
 from devs_utilities.repo_env import get_env, get_int_env, get_llm_model, get_optional_env
@@ -317,7 +316,6 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--verify", action="store_true", help="Execute the live mission.")
     parser.add_argument("--reset", action="store_true", help="Force-reset the board first.")
-    parser.add_argument("--skip-model", action="store_true", help="Disable OpenRouter agents.")
     parser.add_argument("--model", default=None, help=f"Override the OpenRouter model. Default: {DEFAULT_MODEL}.")
     parser.add_argument(
         "--max-attempts",
@@ -544,22 +542,14 @@ def build_cluster_context(cluster: Cluster, map_state: MapState) -> dict[str, An
     }
 
 
-def normalize_json_payload(payload: str) -> dict[str, Any]:
-    try:
-        parsed = json.loads(payload)
-    except json.JSONDecodeError as exc:
-        raise OpenRouterError("OpenRouter returned invalid JSON.") from exc
-    if not isinstance(parsed, dict):
-        raise OpenRouterError("OpenRouter returned a non-object JSON payload.")
-    return parsed
-
-
-def build_openrouter_client(model_override: str | None) -> OpenRouterClient | None:
+def build_openrouter_client(model_override: str | None) -> OpenRouterClient:
     api_key = get_optional_env("OPENROUTER_API_KEY") or get_optional_env("LLM_API_KEY")
     base_url = get_optional_env("OPENROUTER_BASE_URL") or get_optional_env("LLM_BASE_URL")
     if not api_key or not base_url:
-        return None
+        raise RuntimeError("Missing OPENROUTER_API_KEY/LLM_API_KEY or OPENROUTER_BASE_URL/LLM_BASE_URL.")
     model = model_override or DEFAULT_MODEL
+    if not model:
+        raise RuntimeError("Missing DOMATOWO_MODEL or the repository-wide OpenRouter model.")
     configured_timeout = get_int_env("OPENROUTER_TIMEOUT_SECONDS", 120) or 120
     timeout_seconds = float(max(configured_timeout, 1))
     return build_task_openrouter_client(
@@ -634,41 +624,6 @@ LOG_ANALYST_TOOLS: list[dict[str, Any]] = [
         },
     },
 ]
-
-
-def execute_tool_call(tool_call: ToolCall, handlers: dict[str, Any]) -> dict[str, Any]:
-    if tool_call.name not in handlers:
-        raise OpenRouterError(f"Unknown tool requested by OpenRouter: {tool_call.name}")
-    result = handlers[tool_call.name](tool_call.arguments)
-    return {
-        "role": "tool",
-        "tool_call_id": tool_call.id,
-        "name": tool_call.name,
-        "content": json.dumps(result, ensure_ascii=False),
-    }
-
-
-def run_tool_conversation(
-    client: OpenRouterClient,
-    *,
-    messages: list[dict[str, Any]],
-    tools: list[dict[str, Any]],
-    handlers: dict[str, Any],
-    max_steps: int,
-) -> ChatCompletionResult:
-    for _ in range(max_steps):
-        completion = client.create_completion(messages, tools=tools)
-        assistant_message: dict[str, Any] = {"role": "assistant", "content": completion.content or ""}
-        if completion.tool_calls:
-            assistant_message["tool_calls"] = [tool_call.to_message_dict() for tool_call in completion.tool_calls]
-            messages.append(assistant_message)
-            for tool_call in completion.tool_calls:
-                messages.append(execute_tool_call(tool_call, handlers))
-            continue
-        if completion.content:
-            return completion
-        raise OpenRouterError("OpenRouter returned neither content nor tool calls.")
-    raise OpenRouterError("OpenRouter did not finish the tool workflow in time.")
 
 
 def deterministic_planner(clusters: list[Cluster]) -> PlannerDecision:
@@ -749,14 +704,12 @@ def build_planner_handlers(
 
 
 def recommend_plan_with_openrouter(
-    client: OpenRouterClient | None,
+    client: OpenRouterClient,
     clusters: list[Cluster],
     map_state: MapState,
 ) -> PlannerDecision:
-    fallback_plan = deterministic_planner(clusters)
-    if client is None:
-        return fallback_plan
-    handlers = build_planner_handlers(clusters, map_state, fallback_plan)
+    baseline_plan = deterministic_planner(clusters)
+    handlers = build_planner_handlers(clusters, map_state, baseline_plan)
     messages: list[dict[str, Any]] = [
         {
             "role": "system",
@@ -771,8 +724,9 @@ def recommend_plan_with_openrouter(
             tools=PLANNER_TOOLS,
             handlers=handlers,
             max_steps=PLANNER_MAX_STEPS,
+            error_prefix="Unknown Domatowo planner tool",
         )
-        payload = normalize_json_payload(completion.content or "")
+        payload = parse_json_object_content(completion.content or "")
         cluster_order = tuple(str(item) for item in payload.get("cluster_order", []))
         raw_field_order = payload.get("field_order")
         if not isinstance(raw_field_order, dict):
@@ -793,18 +747,25 @@ def recommend_plan_with_openrouter(
             reason=str(payload.get("reason", "")).strip() or "OpenRouter prioritized the cluster search order.",
             source="openrouter",
         )
-    except (OpenRouterError, json.JSONDecodeError) as exc:
+    except OpenRouterError as exc:
         logger.warning("Planner agent failed: {}. Using deterministic fallback.", exc)
-        return fallback_plan
+        return PlannerDecision(
+            cluster_order=baseline_plan.cluster_order,
+            field_order=baseline_plan.field_order,
+            reason=f"{baseline_plan.reason} Fallback activated after planner error: {exc}",
+            source="fallback",
+        )
 
 
-def classify_log_heuristically(message: str) -> LogAssessment:
-    lowered = normalize_text(message)
-    if any(marker in lowered for marker in EMPTY_MARKERS):
-        return LogAssessment("empty", "Heuristics matched a negative search phrase.", "heuristic")
-    if any(marker in lowered for marker in FOUND_MARKERS):
-        return LogAssessment("found", "Heuristics matched a positive survivor phrase.", "heuristic")
-    return LogAssessment("uncertain", "The log text is ambiguous for the local heuristic.", "heuristic")
+def parse_log_assessment_payload(payload: dict[str, Any]) -> LogAssessment:
+    result = str(payload.get("result", "")).strip()
+    if result not in {"found", "empty", "uncertain"}:
+        raise OpenRouterError("Log analyst returned an invalid result.")
+    return LogAssessment(
+        result=result,
+        reason=str(payload.get("reason", "")).strip() or "OpenRouter log analyst classified the message.",
+        source="openrouter",
+    )
 
 
 def build_log_handlers(log_entry: InspectLog) -> dict[str, Any]:
@@ -817,10 +778,28 @@ def build_log_handlers(log_entry: InspectLog) -> dict[str, Any]:
     return {"get_log_context": get_log_context, "validate_result": validate_result}
 
 
-def classify_log_with_openrouter(client: OpenRouterClient | None, log_entry: InspectLog) -> LogAssessment:
-    heuristic = classify_log_heuristically(log_entry.message)
-    if client is None:
-        return heuristic
+def classify_log_deterministically(log_entry: InspectLog) -> LogAssessment:
+    normalized = normalize_text(log_entry.message)
+    if any(marker in normalized for marker in FOUND_MARKERS):
+        return LogAssessment(
+            result="found",
+            reason="Deterministic marker match says the inspect log reports a survivor.",
+            source="fallback",
+        )
+    if any(marker in normalized for marker in EMPTY_MARKERS):
+        return LogAssessment(
+            result="empty",
+            reason="Deterministic marker match says the inspect log reports an empty field.",
+            source="fallback",
+        )
+    return LogAssessment(
+        result="uncertain",
+        reason="Deterministic fallback could not classify the inspect log confidently.",
+        source="fallback",
+    )
+
+
+def classify_log_with_openrouter(client: OpenRouterClient, log_entry: InspectLog) -> LogAssessment:
     handlers = build_log_handlers(log_entry)
     messages: list[dict[str, Any]] = [
         {
@@ -836,19 +815,17 @@ def classify_log_with_openrouter(client: OpenRouterClient | None, log_entry: Ins
             tools=LOG_ANALYST_TOOLS,
             handlers=handlers,
             max_steps=LOG_ANALYST_MAX_STEPS,
+            error_prefix="Unknown Domatowo log-analysis tool",
         )
-        payload = normalize_json_payload(completion.content or "")
-        result = str(payload.get("result", "")).strip()
-        if result not in {"found", "empty", "uncertain"}:
-            raise OpenRouterError("Log analyst returned an invalid result.")
-        return LogAssessment(
-            result,
-            str(payload.get("reason", "")).strip() or "OpenRouter log analyst classified the message.",
-            "openrouter",
+        payload = parse_json_object_content(completion.content or "")
+        return parse_log_assessment_payload(payload)
+    except OpenRouterError as exc:
+        logger.warning(
+            "Log analyst failed for {}: {}. Using deterministic fallback.",
+            log_entry.field,
+            exc,
         )
-    except (OpenRouterError, json.JSONDecodeError) as exc:
-        logger.warning("Log analyst failed for {}: {}. Using heuristics.", log_entry.field, exc)
-        return heuristic
+        return classify_log_deterministically(log_entry)
 
 
 def extract_hex_pairs(text: str) -> str:
@@ -928,7 +905,7 @@ def build_plan_payload(
 
 def prepare_attempt(
     client: DomatowoApiClient,
-    model_client: OpenRouterClient | None,
+    model_client: OpenRouterClient,
     *,
     attempt: int | None = None,
     max_attempts: int | None = None,
@@ -1095,7 +1072,7 @@ def execute_mission(
     client: DomatowoApiClient,
     map_state: MapState,
     planner: PlannerDecision,
-    model_client: OpenRouterClient | None,
+    model_client: OpenRouterClient,
 ) -> dict[str, Any]:
     clusters = build_clusters(map_state, position_list_from_search(client.search_symbol("B3")))
     side_quest: SideQuestResult | None = None
@@ -1167,7 +1144,7 @@ def main() -> int:
         logger.error("Missing AG3NTS_API_KEY in .env.")
         return 1
 
-    model_client = None if args.skip_model else build_openrouter_client(args.model)
+    model_client = build_openrouter_client(args.model)
     client = DomatowoApiClient(api_key)
     try:
         ensure_clean_board(client, reset=args.reset)

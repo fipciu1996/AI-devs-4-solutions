@@ -14,12 +14,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from devs_utilities.bootstrap import resolve_repo_python
 from devs_utilities.logging import configure_logging, logger as shared_logger
 from devs_utilities.repo_env import get_ngrok_auth_token, get_optional_env, load_repo_env
 
 
 REPO_ROOT = Path(__file__).resolve().parent
-PYTHON = sys.executable
+PYTHON = str(resolve_repo_python(__file__))
 DEFAULT_LOG_DIR = REPO_ROOT / "fire_in_the_hole_logs"
 DEFAULT_COST_DIR = REPO_ROOT / "fire_in_the_hole_costs"
 DEFAULT_RAILWAY_PROMPT = "Aktywuj trase X-01"
@@ -232,6 +233,12 @@ def build_single_script_task(
 
 
 def build_people_task() -> TaskSpec:
+    def is_enabled(_args: argparse.Namespace) -> tuple[bool, str | None]:
+        csv_path = REPO_ROOT / "people" / "people.csv"
+        if csv_path.exists():
+            return True, None
+        return False, f"missing private dataset: {csv_path}"
+
     def build_steps(args: argparse.Namespace) -> list[StepSpec]:
         verify_args = maybe_verify(args, True)
         return [
@@ -250,6 +257,7 @@ def build_people_task() -> TaskSpec:
         description="Run the people candidate filter from people/ and then the findhim lookup from findhim/.",
         build_steps=build_steps,
         mode_label="pipeline",
+        is_enabled=is_enabled,
     )
 
 
@@ -1022,6 +1030,9 @@ def main() -> int:
     configure_logging(name="fire_in_the_hole")
     args = parse_args()
     apply_negotiations_defaults(args)
+    current_python = str(Path(sys.executable).resolve())
+    if current_python != PYTHON:
+        logger.info("Using repository interpreter {} instead of current {}.", PYTHON, current_python)
 
     registry = build_task_registry()
     try:

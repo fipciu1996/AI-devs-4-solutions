@@ -8,18 +8,55 @@ from unittest.mock import patch
 import devs_utilities.openrouter as openrouter_module
 from devs_utilities.http import HttpRequestError
 from devs_utilities.openrouter import (
+    ChatCompletionResult,
     OpenRouterError,
     OpenRouterClient,
     OpenRouterConfig,
+    ToolCall,
     build_task_site_name,
     build_task_usage_output_path,
     extract_usage_snapshot,
     extract_completion_result,
     extract_tool_calls,
+    run_tool_conversation,
 )
 
 
 class OpenRouterParsingTests(unittest.TestCase):
+    def test_run_tool_conversation_executes_tool_calls_until_content_is_returned(self) -> None:
+        class StubClient:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def create_completion(self, messages, **_kwargs):  # type: ignore[no-untyped-def]
+                self.calls += 1
+                if self.calls == 1:
+                    return ChatCompletionResult(
+                        content="",
+                        tool_calls=[ToolCall(id="tool-1", name="echo", arguments={"value": "hello"})],
+                    )
+                return ChatCompletionResult(content='{"done":true}', tool_calls=[])
+
+        client = StubClient()
+        messages = [{"role": "user", "content": "run"}]
+        handled: list[dict[str, object]] = []
+
+        def echo(arguments):  # type: ignore[no-untyped-def]
+            handled.append(arguments)
+            return {"echoed": arguments["value"]}
+
+        result = run_tool_conversation(
+            client,  # type: ignore[arg-type]
+            messages=messages,
+            tools=[{"type": "function", "function": {"name": "echo"}}],
+            handlers={"echo": echo},
+            max_steps=2,
+        )
+
+        self.assertEqual(result.content, '{"done":true}')
+        self.assertEqual(handled, [{"value": "hello"}])
+        self.assertEqual(client.calls, 2)
+
     def test_extract_completion_result_reads_string_content(self) -> None:
         result = extract_completion_result(
             {

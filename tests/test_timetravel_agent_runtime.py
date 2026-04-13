@@ -1,8 +1,12 @@
 from __future__ import annotations
 
-from unittest.mock import patch
+import importlib
+import os
 import unittest
+from unittest.mock import patch
 
+import timetravel.openrouter_backend as openrouter_backend_module
+import timetravel.openrouter_frontend as openrouter_frontend_module
 from timetravel.backend_agent import _resolve_agent_runtime as resolve_backend_runtime
 from timetravel.frontend_agent import _resolve_agent_runtime as resolve_frontend_runtime
 from timetravel.openrouter_backend import OPENROUTER_TOOLS as BACKEND_TOOLS
@@ -57,6 +61,18 @@ class TimetravelAgentRuntimeTests(unittest.TestCase):
                 "persist_session",
             ],
         )
+
+    def test_backend_default_model_supports_legacy_timetavel_alias(self) -> None:
+        with patch.dict(os.environ, {"TIMETAVEL_MODEL": "legacy-typo-model"}, clear=True):
+            reloaded = importlib.reload(openrouter_backend_module)
+            self.assertEqual(reloaded.DEFAULT_MODEL, "legacy-typo-model")
+        importlib.reload(openrouter_backend_module)
+
+    def test_frontend_default_model_supports_legacy_timetavel_alias(self) -> None:
+        with patch.dict(os.environ, {"TIMETAVEL_MODEL": "legacy-typo-model"}, clear=True):
+            reloaded = importlib.reload(openrouter_frontend_module)
+            self.assertEqual(reloaded.DEFAULT_MODEL, "legacy-typo-model")
+        importlib.reload(openrouter_frontend_module)
 
 
 if __name__ == "__main__":

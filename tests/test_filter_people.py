@@ -13,14 +13,13 @@ for candidate in (str(REPO_ROOT), str(PEOPLE_DIR)):
     if candidate not in sys.path:
         sys.path.insert(0, candidate)
 
-from devs_utilities.openrouter import ChatCompletionResult, ToolCall
+from devs_utilities.openrouter import ChatCompletionResult, OpenRouterError, ToolCall
 from filter_people import (
     AppConfig,
     Person,
     build_answer,
     classify_all,
     classify_jobs,
-    infer_tags_from_job_title,
     load_config,
     parse_classification_result,
 )
@@ -218,9 +217,31 @@ class PeopleFilterTests(unittest.TestCase):
 
         self.assertEqual(result, {1: ["transport"], 2: ["edukacja"]})
 
-    def test_infer_tags_from_job_title_marks_transport_keywords(self) -> None:
-        self.assertEqual(infer_tags_from_job_title("Kierowca autobusu"), ["transport"])
-        self.assertEqual(infer_tags_from_job_title("Nauczyciel historii"), [])
+    def test_classify_all_raises_when_single_row_cannot_be_classified_without_heuristic_fallback(self) -> None:
+        config = AppConfig(
+            course_api_key="course",
+            llm_api_key="llm",
+            openrouter_model="model",
+            site_url=None,
+            site_name=None,
+            batch_size=10,
+        )
+        candidates = [
+            Person(
+                row_id=1,
+                name="Jan",
+                surname="Kowalski",
+                gender="M",
+                birth_date=date(2000, 1, 1),
+                birth_place="GrudziÄ…dz",
+                birth_country="Poland",
+                job="Kierowca autobusu",
+            )
+        ]
+
+        with patch("filter_people.classify_jobs", side_effect=OpenRouterError("boom")):
+            with self.assertRaises(OpenRouterError):
+                classify_all(candidates, config, openrouter_client=object())
 
 
 if __name__ == "__main__":

@@ -12,7 +12,7 @@ REPO_ROOT_HINT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT_HINT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT_HINT))
 
-from devs_utilities.bootstrap import bootstrap_repo
+from devs_utilities.bootstrap import bootstrap_repo, resolve_repo_python
 from devs_utilities.logging import configure_logging, logger as shared_logger
 
 from timetravel.models import MissionStatus
@@ -21,7 +21,7 @@ from timetravel.store import SharedStateStore
 
 REPO_ROOT = bootstrap_repo(__file__)
 logger = shared_logger.bind(component="timetravel")
-PYTHON = sys.executable
+PYTHON = str(resolve_repo_python(__file__))
 DEFAULT_RUNTIME_DIR = Path(__file__).resolve().parent / "runtime"
 
 
@@ -74,14 +74,30 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def has_module_available(module_name: str) -> bool:
+    if Path(PYTHON).resolve() == Path(sys.executable).resolve():
+        try:
+            __import__(module_name)
+        except ImportError:
+            return False
+        return True
+    result = subprocess.run(
+        [PYTHON, "-c", f"import {module_name}"],
+        cwd=REPO_ROOT,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    return result.returncode == 0
+
+
 def main() -> int:
     args = parse_args()
     configure_logging(name="timetravel", verbose=args.verbose)
-    try:
-        import playwright  # noqa: F401
-    except ImportError:
+    if not has_module_available("playwright"):
         logger.error(
-            "Missing optional dependency `playwright`. Run `.venv\\Scripts\\python.exe -m pip install -e .` first."
+            "Missing optional dependency `playwright` in {}. Run `.venv\\Scripts\\python.exe -m pip install -e .` first.",
+            PYTHON,
         )
         return 1
     args.db_path.parent.mkdir(parents=True, exist_ok=True)

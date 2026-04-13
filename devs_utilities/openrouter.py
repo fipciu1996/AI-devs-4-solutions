@@ -6,6 +6,7 @@ import ast
 import json
 import re
 import time
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -140,6 +141,9 @@ class ToolCall:
 class ChatCompletionResult:
     content: str | None
     tool_calls: list[ToolCall]
+
+
+ToolHandler = Callable[[dict[str, Any]], Any]
 
 
 @dataclass(frozen=True, slots=True)
@@ -515,6 +519,58 @@ class OpenRouterClient:
         if last_error is not None:
             raise last_error
         raise OpenRouterError("OpenRouter completion failed unexpectedly.")
+
+
+def execute_tool_call(
+    tool_call: ToolCall,
+    handlers: Mapping[str, ToolHandler],
+    *,
+    error_prefix: str = "Unknown OpenRouter tool",
+) -> dict[str, Any]:
+    """Execute one model-requested tool call and format the tool response message."""
+
+    handler = handlers.get(tool_call.name)
+    if handler is None:
+        raise OpenRouterError(f"{error_prefix}: {tool_call.name}")
+    result = handler(tool_call.arguments)
+    return {
+        "role": "tool",
+        "tool_call_id": tool_call.id,
+        "name": tool_call.name,
+        "content": json.dumps(result, ensure_ascii=False),
+    }
+
+
+def run_tool_conversation(
+    client: OpenRouterClient,
+    *,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+    handlers: Mapping[str, ToolHandler],
+    max_steps: int,
+    error_prefix: str = "Unknown OpenRouter tool",
+) -> ChatCompletionResult:
+    """Run a bounded OpenRouter tool-calling loop until plain content is returned."""
+
+    for _ in range(max_steps):
+        completion = client.create_completion(messages, tools=tools)
+        assistant_message: dict[str, Any] = {"role": "assistant", "content": completion.content or ""}
+        if completion.tool_calls:
+            assistant_message["tool_calls"] = [tool_call.to_message_dict() for tool_call in completion.tool_calls]
+            messages.append(assistant_message)
+            for tool_call in completion.tool_calls:
+                messages.append(
+                    execute_tool_call(
+                        tool_call,
+                        handlers,
+                        error_prefix=error_prefix,
+                    )
+                )
+            continue
+        if completion.content:
+            return completion
+        raise OpenRouterError("OpenRouter returned neither content nor tool calls.")
+    raise OpenRouterError("OpenRouter did not finish the tool workflow in time.")
 
 
 def strip_code_fences(text: str) -> str:

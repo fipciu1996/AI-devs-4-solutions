@@ -22,6 +22,7 @@ PROMPT_FILES = (
     Path("firmware/system_prompt.txt"),
     Path("mailbox/system_prompt.txt"),
     Path("people/filter_system_prompt.txt"),
+    Path("phonecall/response_analysis_system_prompt.txt"),
     Path("findhim/geocode_legacy_system_prompt.txt"),
     Path("findhim/geocode_system_prompt.txt"),
     Path("railway/system_prompt.txt"),
@@ -47,6 +48,7 @@ MODULE_PROMPT_REFERENCES = {
     Path("firmware/solve_firmware.py"): ("system_prompt.txt",),
     Path("mailbox/solve_mailbox.py"): ("system_prompt.txt",),
     Path("people/filter_people.py"): ("filter_system_prompt.txt",),
+    Path("phonecall/solve_phonecall.py"): ("response_analysis_system_prompt.txt",),
     Path("findhim/solve_findhim.py"): (
         "geocode_legacy_system_prompt.txt",
         "geocode_system_prompt.txt",

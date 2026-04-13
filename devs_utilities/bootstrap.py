@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -23,3 +24,16 @@ def bootstrap_repo(
     if load_env:
         load_repo_env(repo_root, override=override_env)
     return repo_root
+
+
+def resolve_repo_python(start: str | Path) -> Path:
+    """Prefer the repository-local virtualenv interpreter when it exists."""
+
+    repo_root = find_repo_root(Path(start))
+    if os.name == "nt":
+        candidate = repo_root / ".venv" / "Scripts" / "python.exe"
+    else:
+        candidate = repo_root / ".venv" / "bin" / "python"
+    if candidate.exists():
+        return candidate.resolve()
+    return Path(sys.executable).resolve()

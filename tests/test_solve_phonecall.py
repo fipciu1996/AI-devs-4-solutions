@@ -13,8 +13,9 @@ for candidate in (str(REPO_ROOT), str(PHONECALL_DIR)):
 
 from devs_utilities.openrouter import OpenRouterError
 from solve_phonecall import (
+    ResponseAnalysis,
     analyze_response,
-    build_response_text_fallback,
+    parse_response_analysis_payload,
     resolve_edge_tts_voice,
     synthesize_audio,
 )
@@ -39,11 +40,24 @@ class PhonecallTests(unittest.TestCase):
         self.assertEqual(transcript, "Dzien dobry")
         edge_tts_mock.assert_called_once()
 
-    def test_build_response_text_fallback_recovers_known_route_statuses(self) -> None:
-        analysis = build_response_text_fallback("Road status delivered.")
+    def test_parse_response_analysis_payload_reads_route_statuses(self) -> None:
+        analysis = parse_response_analysis_payload(
+            {
+                "summary": "Only RD820 is passable.",
+                "asks_for_password": False,
+                "asks_for_reason": False,
+                "route_statuses": {
+                    "RD224": "nieprzejezdna",
+                    "RD472": "nieprzejezdna",
+                    "RD820": "przejezdna",
+                },
+                "monitoring_disabled": False,
+                "success_signal": False,
+                "failure_signal": False,
+            },
+            transcription="Road status delivered.",
+        )
 
-        self.assertIsNotNone(analysis)
-        assert analysis is not None
         self.assertEqual(analysis.route_statuses["RD224"], "nieprzejezdna")
         self.assertEqual(analysis.route_statuses["RD472"], "nieprzejezdna")
         self.assertEqual(analysis.route_statuses["RD820"], "przejezdna")
@@ -55,6 +69,15 @@ class PhonecallTests(unittest.TestCase):
                 "solve_phonecall.transcribe_audio_text",
                 side_effect=OpenRouterError("No endpoints found that support input audio"),
             ),
+            patch(
+                "solve_phonecall.analyze_operator_response_with_openrouter",
+                return_value=ResponseAnalysis(
+                    transcription="Password required.",
+                    summary="Operator asks for the password.",
+                    asks_for_password=True,
+                    route_statuses={route: "unknown" for route in ("RD224", "RD472", "RD820")},
+                ),
+            ) as analysis_mock,
         ):
             analysis = analyze_response(
                 {"message": "Password required."},
@@ -63,6 +86,7 @@ class PhonecallTests(unittest.TestCase):
 
         self.assertTrue(analysis.asks_for_password)
         self.assertIn("Password required.", analysis.transcription)
+        analysis_mock.assert_called_once()
 
 
 if __name__ == "__main__":

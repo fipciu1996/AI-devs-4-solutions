@@ -25,7 +25,14 @@ from devs_utilities.bootstrap import bootstrap_repo
 from devs_utilities.files import write_json
 from devs_utilities.http import HttpRequestError
 from devs_utilities.logging import configure_logging, logger as shared_logger
-from devs_utilities.openrouter import OpenRouterClient, OpenRouterError, build_task_openrouter_client
+from devs_utilities.openrouter import (
+    OpenRouterClient,
+    OpenRouterError,
+    build_task_openrouter_client,
+    parse_json_object_content,
+    run_tool_conversation,
+)
+from devs_utilities.prompts import load_prompt_text
 from devs_utilities.repo_env import get_env, get_int_env, get_llm_model, get_optional_env
 
 
@@ -39,11 +46,14 @@ VERIFY_TIMEOUT_SECONDS = get_int_env("AG3NTS_TIMEOUT_SECONDS", 60) or 60
 OPENROUTER_TIMEOUT_SECONDS = get_int_env("OPENROUTER_TIMEOUT_SECONDS", 180) or 180
 STT_MODEL = get_llm_model("PHONECALL_STT_MODEL")
 TTS_MODEL = get_llm_model("PHONECALL_TTS_MODEL")
+PHONECALL_ANALYST_MODEL = get_llm_model("PHONECALL_ANALYST_MODEL") or STT_MODEL
 DEFAULT_TTS_VOICE = get_optional_env("PHONECALL_TTS_VOICE") or "pl-PL-MarekNeural"
 OUTPUT_DIR = Path(__file__).resolve().parent
 RUNS_DIR = OUTPUT_DIR / "runs"
 FINAL_RESPONSE_PATH = OUTPUT_DIR / "last_verify_response.json"
 FINAL_STATE_PATH = OUTPUT_DIR / "last_state.json"
+RESPONSE_ANALYSIS_SYSTEM_PROMPT = load_prompt_text(__file__, "response_analysis_system_prompt.txt")
+RESPONSE_ANALYST_MAX_STEPS = 4
 
 INITIAL_MESSAGE = "Dzień dobry, z tej strony Tymon Gajewski."
 PURPOSE_MESSAGE = (
@@ -67,6 +77,7 @@ ROAD_STATUS_FALLBACK_TRANSCRIPT = (
     "Droga RD472 jest nieprzejezdna. Podobnie RD224. "
     "Jedyne co ci zostalo to jechac droga RD820."
 )
+ROUTE_STATUSES = {"przejezdna", "nieprzejezdna", "unknown"}
 
 
 @dataclass(slots=True)
@@ -331,6 +342,136 @@ def transcribe_audio_text(audio_bytes: bytes) -> str:
     return completion.content.strip()
 
 
+RESPONSE_ANALYST_TOOLS: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_response_context",
+            "description": "Return the operator response text, raw endpoint text, and protocol hints.",
+            "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "validate_response_analysis",
+            "description": "Validate the proposed response analysis payload.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "summary": {"type": "string"},
+                    "asks_for_password": {"type": "boolean"},
+                    "asks_for_reason": {"type": "boolean"},
+                    "route_statuses": {
+                        "type": "object",
+                        "additionalProperties": {"type": "string"},
+                    },
+                    "monitoring_disabled": {"type": "boolean"},
+                    "success_signal": {"type": "boolean"},
+                    "failure_signal": {"type": "boolean"},
+                },
+                "required": [
+                    "summary",
+                    "asks_for_password",
+                    "asks_for_reason",
+                    "route_statuses",
+                    "monitoring_disabled",
+                    "success_signal",
+                    "failure_signal",
+                ],
+                "additionalProperties": False,
+            },
+        },
+    },
+]
+
+
+def _normalize_route_statuses(route_statuses: Any) -> dict[str, str]:
+    if not isinstance(route_statuses, dict):
+        raise OpenRouterError("route_statuses must be an object.")
+    normalized = {route: "unknown" for route in ROUTES}
+    for route in ROUTES:
+        value = route_statuses.get(route, "unknown")
+        if not isinstance(value, str) or value not in ROUTE_STATUSES:
+            raise OpenRouterError(f"Invalid route status for {route}: {value!r}")
+        normalized[route] = value
+    return normalized
+
+
+def parse_response_analysis_payload(
+    payload: dict[str, Any],
+    *,
+    transcription: str,
+) -> ResponseAnalysis:
+    return ResponseAnalysis(
+        transcription=transcription,
+        summary=str(payload.get("summary", "")).strip() or transcription,
+        asks_for_password=bool(payload.get("asks_for_password")),
+        asks_for_reason=bool(payload.get("asks_for_reason")),
+        route_statuses=_normalize_route_statuses(payload.get("route_statuses", {})),
+        monitoring_disabled=bool(payload.get("monitoring_disabled")),
+        success_signal=bool(payload.get("success_signal")),
+        failure_signal=bool(payload.get("failure_signal")),
+    )
+
+
+def build_response_analysis_handlers(
+    *,
+    transcription: str,
+    response_text: str,
+) -> dict[str, Any]:
+    def get_response_context(_: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "transcription": transcription,
+            "response_text": response_text,
+            "routes": list(ROUTES),
+            "protocol_hints": [
+                {
+                    "match_response_text": "road status delivered",
+                    "treat_as_transcription": ROAD_STATUS_FALLBACK_TRANSCRIPT,
+                }
+            ],
+        }
+
+    def validate_response_analysis(arguments: dict[str, Any]) -> dict[str, Any]:
+        try:
+            parse_response_analysis_payload(arguments, transcription=transcription)
+        except OpenRouterError as exc:
+            return {"is_valid": False, "message": str(exc)}
+        return {"is_valid": True}
+
+    return {
+        "get_response_context": get_response_context,
+        "validate_response_analysis": validate_response_analysis,
+    }
+
+
+def analyze_operator_response_with_openrouter(
+    *,
+    transcription: str,
+    response_text: str,
+) -> ResponseAnalysis:
+    client = build_openrouter_client(PHONECALL_ANALYST_MODEL, task_name="phonecall-analysis")
+    handlers = build_response_analysis_handlers(
+        transcription=transcription,
+        response_text=response_text,
+    )
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": RESPONSE_ANALYSIS_SYSTEM_PROMPT},
+        {"role": "user", "content": "Analyze the latest operator response and return JSON only."},
+    ]
+    completion = run_tool_conversation(
+        client,
+        messages=messages,
+        tools=RESPONSE_ANALYST_TOOLS,
+        handlers=handlers,
+        max_steps=RESPONSE_ANALYST_MAX_STEPS,
+        error_prefix="Unknown phonecall analysis tool",
+    )
+    payload = parse_json_object_content(completion.content or "")
+    return parse_response_analysis_payload(payload, transcription=transcription)
+
+
 def normalize_text(text: str) -> str:
     return " ".join(text.casefold().split())
 
@@ -428,31 +569,21 @@ def analyze_response(
         if isinstance(value, str) and value.strip()
     ]
     response_text = "\n".join(extra_texts)
-    analysis = (
-        build_response_text_fallback(response_text)
-        or ResponseAnalysis(route_statuses={route: "unknown" for route in ROUTES})
-    )
+    transcription = response_text
     if audio_bytes:
         try:
-            analysis = classify_operator_text(transcribe_audio_text(audio_bytes))
+            transcription = transcribe_audio_text(audio_bytes)
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "Audio transcription failed: {}. Falling back to response text.",
                 exc,
             )
-
-    for extra in extra_texts:
-        if extra not in analysis.transcription:
-            analysis.transcription = "\n".join(
-                part for part in (analysis.transcription, extra) if part
-            )
-        if FLAG_PATTERN.search(extra):
-            analysis.success_signal = True
-
-    if FLAG_PATTERN.search(analysis.transcription):
-        analysis.success_signal = True
-
-    return analysis
+    if not transcription.strip() and not response_text.strip():
+        return ResponseAnalysis(route_statuses={route: "unknown" for route in ROUTES})
+    return analyze_operator_response_with_openrouter(
+        transcription=transcription.strip() or response_text.strip(),
+        response_text=response_text,
+    )
 
 
 def routes_from_statuses(route_statuses: dict[str, str], *, target_status: str) -> list[str]:

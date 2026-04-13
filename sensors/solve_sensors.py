@@ -9,7 +9,7 @@ import sys
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, TypeVar
+from typing import Any, TypeVar
 
 REPO_ROOT_HINT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT_HINT) not in sys.path:
@@ -30,12 +30,11 @@ from devs_utilities.openrouter import (
     build_task_site_name,
     OpenRouterClient,
     OpenRouterError,
-    ToolCall,
+    run_tool_conversation,
 )
 from devs_utilities.prompts import load_prompt_text
 from devs_utilities.repo_env import (
     get_course_api_key,
-    get_env,
     get_int_env,
     get_llm_api_key,
     get_llm_base_url,
@@ -67,8 +66,6 @@ NOTE_CACHE_PATH = OUTPUT_DIR / "note_claim_cache.json"
 FINAL_ANSWER_PATH = OUTPUT_DIR / "final_answer.json"
 VERIFY_RESPONSE_PATH = OUTPUT_DIR / "last_verify_response.json"
 
-NotePolarity = Literal["positive", "negative", "uncertain"]
-
 
 @dataclass(frozen=True, slots=True)
 class MeasurementRule:
@@ -86,127 +83,25 @@ MEASUREMENT_RULES = (
     MeasurementRule("humidity", "humidity_percent", 40.0, 80.0),
 )
 
-NEGATIVE_NOTE_MARKERS = (
-    "looks unstable",
-    "feel inconsistent",
-    "behavior is concerning",
-    "readings look suspicious",
-    "not the pattern i expected",
-    "did not look right",
-    "looks unusual",
-    "raises serious doubts",
-    "seems unreliable",
-    "clear irregularity",
-    "does not look healthy",
-    "visible anomaly",
-    "unexpected pattern",
-    "questionable behavior",
-    "requires attention",
-    "quality is doubtful",
-    "not comfortable with this result",
-    "clearly off",
-    "investigated immediately",
-    "data flow appears compromised",
-    "unstable characteristics",
-    "looks technically doubtful",
-    "does not match healthy history",
-    "suggests a potential fault",
-    "indicates probable degradation",
-    "cannot be treated as normal",
-    "signs of malfunction",
-    "confidence in this report is low",
-    "operating picture is not trustworthy",
-    "strong signs of an issue",
-    "does not pass a safety-minded review",
-    "conflicts with our baseline",
-    "changed in a risky way",
-    "outside expected behavior",
-    "consistency is clearly broken",
-    "too erratic for approval",
-    "root-cause analysis",
-    "engineering analysis",
-    "urgent verification",
-    "replacement assessment",
-    "revalidation",
-    "deeper diagnostic task",
-    "maintenance follow-up",
-    "quality audit",
-    "troubleshooting queue",
-    "investigation is completed",
-    "probable fault",
-    "focused technical review",
-    "on-site inspection",
-)
-
-POSITIVE_NOTE_MARKERS = (
-    "appears nominal",
-    "checks out",
-    "looks reliable",
-    "calm and predictable",
-    "stays normal",
-    "no irregular behavior",
-    "quality is high",
-    "no concerning drift",
-    "fully stable",
-    "diagnostics are positive",
-    "no warning signs",
-    "snapshot is reassuring",
-    "remains healthy",
-    "indicators remain strong",
-    "without surprises",
-    "looks clean",
-    "state is consistent",
-    "picture is solid",
-    "confirms stability",
-    "stay controlled",
-    "stayed balanced",
-    "looks steady",
-    "condition is excellent",
-    "remains coherent",
-    "healthy cycles",
-    "nothing suggests a fault condition",
-    "normal operation continues without drift",
-    "behaves exactly as intended",
-    "pattern remains trustworthy",
-    "align with normal patterns",
-    "consistency is maintained across the board",
-    "all values follow expected distribution",
-    "operating envelope is respected",
-    "everything remains inside expected limits",
-    "baseline behavior is preserved",
-    "all control checks passed cleanly",
-    "safe operating zone",
-    "system response remains predictable",
-    "all measured channels stay in tolerance",
-    "signal quality remains smooth and stable",
-    "there is no sign of abnormal activity",
-    "runtime conditions are comfortably normal",
-    "there are no deviations to flag",
-    "latest sample fits reference behavior",
-    "status stays green",
-    "confirmed regular operation",
-    "approved as-is",
-    "standard pass",
-    "approved the report as normal",
-    "left the setup untouched",
-    "no intervention is necessary",
-    "full approval",
-    "no escalation was triggered",
-    "no corrective steps were needed",
-    "logged it as routine",
-    "signed off this inspection",
-    "case is cleared",
-    "monitoring continues unchanged",
-    "shift can proceed as planned",
-    "only routine observation continues",
-    "kept the system in normal mode",
-    "keep the same operating plan",
-    "cycle as healthy",
-    "looks completely normal",
-)
-
 MODEL_SYSTEM_PROMPT = load_prompt_text(__file__, "system_prompt.txt")
 MODEL_MAX_STEPS = 4
+PROBLEM_NOTE_MARKERS = (
+    "problem",
+    "fault",
+    "issue",
+    "warning",
+    "alert",
+    "error",
+    "anomal",
+    "unstable",
+    "critical",
+    "damage",
+    "fail",
+    "malfunction",
+    "investigat",
+    "repair",
+    "root-cause",
+)
 
 LEGACY_MODEL_ALIASES = {
     "openrouter/healer-alpha": "xiaomi/mimo-v2-omni",
@@ -252,28 +147,15 @@ class SensorRecord:
 class StaticFinding:
     file_id: str
     measurement_reasons: tuple[str, ...]
-    note_polarity: NotePolarity
     note_parts: tuple[str, ...]
 
     @property
     def has_measurement_anomaly(self) -> bool:
         return bool(self.measurement_reasons)
 
-
-@dataclass(frozen=True, slots=True)
-class ModelCandidate:
-    record: SensorRecord
-    finding: StaticFinding
-    candidate_reason: str
-
-    def to_prompt_payload(self) -> dict[str, Any]:
-        return {
-            **self.record.to_prompt_payload(),
-            "measurement_reasons": list(self.finding.measurement_reasons),
-            "heuristic_note_polarity": self.finding.note_polarity,
-            "candidate_reason": self.candidate_reason,
-            "note_cache_key": note_cache_key(self.record.operator_notes),
-        }
+    @property
+    def note_structure(self) -> str:
+        return "standard" if len(self.note_parts) == 3 else "unusual"
 
 
 @dataclass(frozen=True, slots=True)
@@ -374,7 +256,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--skip-model",
         action="store_true",
-        help="Skip OpenRouter review and rely only on deterministic heuristics.",
+        help="Deprecated compatibility flag. The solver now requires OpenRouter review.",
     )
     parser.add_argument(
         "--force-extract",
@@ -442,15 +324,6 @@ def split_note_parts(note: str) -> tuple[str, ...]:
     return tuple(part.strip() for part in note.split(", ") if part.strip())
 
 
-def classify_note_polarity(note: str) -> NotePolarity:
-    lowered = note.casefold()
-    if any(marker in lowered for marker in NEGATIVE_NOTE_MARKERS):
-        return "negative"
-    if any(marker in lowered for marker in POSITIVE_NOTE_MARKERS):
-        return "positive"
-    return "uncertain"
-
-
 def analyze_measurements(record: SensorRecord) -> tuple[str, ...]:
     reasons: list[str] = []
     active = record.active_sensors
@@ -475,64 +348,44 @@ def build_static_findings(records: list[SensorRecord]) -> dict[str, StaticFindin
         findings[record.file_id] = StaticFinding(
             file_id=record.file_id,
             measurement_reasons=analyze_measurements(record),
-            note_polarity=classify_note_polarity(record.operator_notes),
             note_parts=split_note_parts(record.operator_notes),
         )
     return findings
-
-
-def build_note_candidates(
-    records: list[SensorRecord],
-    findings: dict[str, StaticFinding],
-) -> list[ModelCandidate]:
-    candidates: list[ModelCandidate] = []
-
-    for record in records:
-        finding = findings[record.file_id]
-        part_count = len(finding.note_parts)
-
-        if part_count != 3:
-            candidates.append(
-                ModelCandidate(
-                    record=record,
-                    finding=finding,
-                    candidate_reason="unusual_note_structure",
-                )
-            )
-            continue
-
-        data_bad = finding.has_measurement_anomaly
-        note_negative = finding.note_polarity == "negative"
-        note_positive = finding.note_polarity == "positive"
-
-        if data_bad and not note_negative:
-            candidates.append(
-                ModelCandidate(
-                    record=record,
-                    finding=finding,
-                    candidate_reason="measurement_anomaly_with_non_alarm_note",
-                )
-            )
-        elif not data_bad and not note_positive:
-            candidates.append(
-                ModelCandidate(
-                    record=record,
-                    finding=finding,
-                    candidate_reason="healthy_measurements_with_non_normal_note",
-                )
-            )
-
-    return candidates
 
 
 def chunked(items: list[T], size: int) -> list[list[T]]:
     return [items[index : index + size] for index in range(0, len(items), size)]
 
 
+def note_has_problem_markers(note: str) -> bool:
+    normalized = note.casefold()
+    return any(marker in normalized for marker in PROBLEM_NOTE_MARKERS)
+
+
+def select_note_review_candidates(
+    records: list[SensorRecord],
+    findings: dict[str, StaticFinding],
+) -> list[SensorRecord]:
+    candidates: list[SensorRecord] = []
+    for record in records:
+        finding = findings[record.file_id]
+        if finding.has_measurement_anomaly:
+            candidates.append(record)
+            continue
+        if finding.note_structure != "standard":
+            candidates.append(record)
+            continue
+        if note_has_problem_markers(record.operator_notes):
+            candidates.append(record)
+    return candidates
+
+
 def build_openrouter_client(model_override: str | None) -> OpenRouterClient:
     api_key = get_llm_api_key()
     base_url = get_llm_base_url()
     model = model_override or DEFAULT_MODEL
+    if not model:
+        raise SystemExit("Missing SENSORS_MODEL or the repository-wide OpenRouter model.")
     resolved_model = LEGACY_MODEL_ALIASES.get(model, model)
     if resolved_model != model:
         logger.warning(
@@ -674,18 +527,6 @@ def build_sensor_review_handlers(batch: list[dict[str, str]]) -> dict[str, Any]:
     }
 
 
-def execute_sensor_tool_call(tool_call: ToolCall, handlers: dict[str, Any]) -> dict[str, Any]:
-    if tool_call.name not in handlers:
-        raise OpenRouterError(f"Unknown sensor review tool: {tool_call.name!r}")
-    result = handlers[tool_call.name](tool_call.arguments)
-    return {
-        "role": "tool",
-        "tool_call_id": tool_call.id,
-        "name": tool_call.name,
-        "content": json.dumps(result, ensure_ascii=False),
-    }
-
-
 def review_note_batch_with_tool_calling(
     client: OpenRouterClient,
     batch: list[dict[str, str]],
@@ -698,36 +539,29 @@ def review_note_batch_with_tool_calling(
             "content": "Classify the current batch of operator notes and return JSON only.",
         },
     ]
-    for _ in range(MODEL_MAX_STEPS):
-        result = client.create_completion(messages, tools=SENSOR_REVIEW_TOOLS)
-        assistant_message: dict[str, Any] = {
-            "role": "assistant",
-            "content": result.content or "",
-        }
-        if result.tool_calls:
-            assistant_message["tool_calls"] = [
-                tool_call.to_message_dict() for tool_call in result.tool_calls
-            ]
-            messages.append(assistant_message)
-            for tool_call in result.tool_calls:
-                messages.append(execute_sensor_tool_call(tool_call, handlers))
-            continue
-        if not result.content:
-            raise OpenRouterError("OpenRouter returned no content for note review.")
-        return parse_model_review(result.content)
-    raise OpenRouterError("OpenRouter tool calling did not finish for sensor review.")
+    result = run_tool_conversation(
+        client,
+        messages=messages,
+        tools=SENSOR_REVIEW_TOOLS,
+        handlers=handlers,
+        max_steps=MODEL_MAX_STEPS,
+        error_prefix="Unknown sensors review tool",
+    )
+    return parse_model_review(result.content or "")
 
 
 def build_file_decisions(
-    candidates: list[ModelCandidate],
+    records: list[SensorRecord],
+    findings: dict[str, StaticFinding],
     note_reviews: dict[str, NoteReview],
 ) -> list[ModelDecision]:
     decisions: list[ModelDecision] = []
 
-    for candidate in candidates:
-        note_key = note_cache_key(candidate.record.operator_notes)
+    for record in records:
+        note_key = note_cache_key(record.operator_notes)
         review = note_reviews[note_key]
-        measurement_bad = candidate.finding.has_measurement_anomaly
+        finding = findings[record.file_id]
+        measurement_bad = finding.has_measurement_anomaly
 
         if measurement_bad:
             if review.note_claim == "ok":
@@ -748,7 +582,7 @@ def build_file_decisions(
 
         decisions.append(
             ModelDecision(
-                file_id=candidate.record.file_id,
+                file_id=record.file_id,
                 is_anomaly=is_anomaly,
                 note_claim=review.note_claim,
                 reason=reason,
@@ -759,21 +593,42 @@ def build_file_decisions(
     return decisions
 
 
-def review_note_candidates(
+def review_all_notes(
     client: OpenRouterClient,
-    candidates: list[ModelCandidate],
+    records: list[SensorRecord],
+    findings: dict[str, StaticFinding],
     *,
     batch_size: int,
 ) -> tuple[list[ModelDecision], dict[str, int]]:
     cache = load_note_cache(NOTE_CACHE_PATH)
+    candidate_records = select_note_review_candidates(records, findings)
+    candidate_keys = {note_cache_key(record.operator_notes) for record in candidate_records}
     note_reviews: dict[str, NoteReview] = {}
     unique_notes: dict[str, str] = {}
     pending_payloads: list[dict[str, str]] = []
     cache_hits = 0
 
-    for candidate in candidates:
-        note_key = note_cache_key(candidate.record.operator_notes)
-        unique_notes.setdefault(note_key, candidate.record.operator_notes)
+    for record in records:
+        note_key = note_cache_key(record.operator_notes)
+        if note_key in candidate_keys:
+            continue
+        note_reviews.setdefault(
+            note_key,
+            NoteReview(
+                key=note_key,
+                operator_notes=record.operator_notes,
+                note_claim="ok",
+                reason=(
+                    "Measurements and note structure look normal, so this note was kept as "
+                    "a deterministic OK without escalating it to the model."
+                ),
+                source="heuristic",
+            ),
+        )
+
+    for record in candidate_records:
+        note_key = note_cache_key(record.operator_notes)
+        unique_notes.setdefault(note_key, record.operator_notes)
 
     for note_key, operator_notes in unique_notes.items():
         cached = cache.get(note_key)
@@ -819,68 +674,46 @@ def review_note_candidates(
 
     save_note_cache(NOTE_CACHE_PATH, cache)
 
-    return build_file_decisions(candidates, note_reviews), {
-        "candidate_count": len(candidates),
+    return build_file_decisions(records, findings, note_reviews), {
+        "record_count": len(records),
+        "candidate_count": len(candidate_records),
         "unique_note_count": len(unique_notes),
         "cache_hit_count": cache_hits,
         "model_note_count": len(pending_payloads),
     }
 
 
-def heuristic_candidate_decisions(candidates: list[ModelCandidate]) -> list[ModelDecision]:
-    note_reviews: dict[str, NoteReview] = {}
-    for candidate in candidates:
-        note_key = note_cache_key(candidate.record.operator_notes)
-        if note_key in note_reviews:
-            continue
-        note_claim_map = {
-            "positive": "ok",
-            "negative": "problem",
-            "uncertain": "uncertain",
-        }
-        note_reviews[note_key] = NoteReview(
-            key=note_key,
-            operator_notes=candidate.record.operator_notes,
-            note_claim=note_claim_map[candidate.finding.note_polarity],
-            reason=candidate.candidate_reason,
-            source="heuristic",
-        )
-    return build_file_decisions(candidates, note_reviews)
-
-
 def build_static_report(
     records: list[SensorRecord],
     findings: dict[str, StaticFinding],
-    candidates: list[ModelCandidate],
 ) -> dict[str, Any]:
+    candidate_records = select_note_review_candidates(records, findings)
     measurement_anomalies = [
         {
             "id": finding.file_id,
             "measurement_reasons": list(finding.measurement_reasons),
-            "note_polarity": finding.note_polarity,
+            "note_structure": finding.note_structure,
         }
         for finding in findings.values()
         if finding.has_measurement_anomaly
     ]
-    note_candidate_payload = [
+    note_review_payload = [
         {
-            "id": candidate.record.file_id,
-            "note_cache_key": note_cache_key(candidate.record.operator_notes),
-            "candidate_reason": candidate.candidate_reason,
-            "note_polarity": candidate.finding.note_polarity,
-            "measurement_reasons": list(candidate.finding.measurement_reasons),
+            "id": record.file_id,
+            "note_cache_key": note_cache_key(record.operator_notes),
+            "note_structure": findings[record.file_id].note_structure,
+            "measurement_reasons": list(findings[record.file_id].measurement_reasons),
         }
-        for candidate in candidates
+        for record in candidate_records
     ]
     return {
         "record_count": len(records),
         "measurement_anomaly_count": len(measurement_anomalies),
         "measurement_anomalies": measurement_anomalies,
-        "note_candidate_count": len(note_candidate_payload),
-        "note_candidate_unique_note_count": len(
-            {candidate.record.operator_notes for candidate in candidates}
-        ),
-        "note_candidates": note_candidate_payload,
+        "note_candidate_count": len(note_review_payload),
+        "note_candidate_unique_note_count": len({record.operator_notes for record in candidate_records}),
+        "note_skipped_without_model_count": len(records) - len(candidate_records),
+        "note_candidates": note_review_payload,
     }
 
 
@@ -933,13 +766,14 @@ def verify_answer(payload: dict[str, Any]) -> Any:
 def main() -> int:
     configure_logging(name="sensors")
     args = parse_args()
+    if args.skip_model:
+        raise SystemExit("Heuristic mode has been removed. This solver now requires OpenRouter review.")
 
     ensure_dataset(skip_download=args.skip_download, force_extract=args.force_extract)
     records = load_records(DATASET_DIR)
     findings = build_static_findings(records)
-    candidates = build_note_candidates(records, findings)
 
-    static_report = build_static_report(records, findings, candidates)
+    static_report = build_static_report(records, findings)
     write_json(STATIC_ANALYSIS_PATH, static_report)
     write_json(NOTE_CANDIDATES_PATH, static_report["note_candidates"])
 
@@ -949,37 +783,22 @@ def main() -> int:
         static_report["note_candidate_count"],
     )
 
-    decisions: list[ModelDecision] = []
-    cache_stats: dict[str, int] = {}
-    if candidates and not args.skip_model:
-        client = build_openrouter_client(args.model)
-        decisions, cache_stats = review_note_candidates(
-            client,
-            candidates,
-            batch_size=max(1, args.batch_size),
-        )
-        logger.info(
-            "Note cache stats: {} candidate files, {} unique notes, {} cache hits, {} model calls.",
-            cache_stats["candidate_count"],
-            cache_stats["unique_note_count"],
-            cache_stats["cache_hit_count"],
-            cache_stats["model_note_count"],
-        )
-        write_json(MODEL_REVIEW_PATH, build_model_report(decisions, cache_stats))
-    else:
-        if candidates:
-            logger.warning(
-                "Skipping OpenRouter review; using heuristic decisions for {} candidate notes.",
-                len(candidates),
-            )
-            decisions = heuristic_candidate_decisions(candidates)
-            cache_stats = {
-                "candidate_count": len(candidates),
-                "unique_note_count": len({candidate.record.operator_notes for candidate in candidates}),
-                "cache_hit_count": 0,
-                "model_note_count": 0,
-            }
-        write_json(MODEL_REVIEW_PATH, build_model_report(decisions, cache_stats))
+    client = build_openrouter_client(args.model)
+    decisions, cache_stats = review_all_notes(
+        client,
+        records,
+        findings,
+        batch_size=max(1, args.batch_size),
+    )
+    logger.info(
+        "Note cache stats: {} total files, {} model-review candidates, {} unique candidate notes, {} cache hits, {} model calls.",
+        cache_stats["record_count"],
+        cache_stats["candidate_count"],
+        cache_stats["unique_note_count"],
+        cache_stats["cache_hit_count"],
+        cache_stats["model_note_count"],
+    )
+    write_json(MODEL_REVIEW_PATH, build_model_report(decisions, cache_stats))
 
     final_payload = build_final_answer(findings, decisions)
     write_json(FINAL_ANSWER_PATH, final_payload)
